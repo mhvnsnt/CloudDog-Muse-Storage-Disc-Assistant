@@ -1520,3 +1520,45 @@ def test_xxh3_file_matches_and_differs():
 def test_xxh3_available():
     # Should be True on this VM (pip installed); just check it doesn't crash
     assert isinstance(cloud_dog._xxhash_available(), bool)
+
+
+# --------------------------------------------------- zfec shard tests
+def test_shard_unshard_roundtrip():
+    import tempfile, shutil
+    d = tempfile.mkdtemp(prefix="cdshard-", dir=os.path.expanduser("~/workspace"))
+    try:
+        src = os.path.join(d, "data.bin")
+        with open(src, "wb") as f:
+            f.write(b"shard-test-payload-" * 100)
+        sdir = os.path.join(d, "shards")
+        rc = cloud_dog.cmd_shard(type("A", (), {
+            "file": src, "k": 2, "m": 4, "out": sdir})())
+        assert rc == 0
+        # 4 shards + meta
+        shards = [f for f in os.listdir(sdir)
+                  if ".shard-" in f and not f.endswith(".json")]
+        assert len(shards) == 4, shards
+        # Delete 2 shards (any 2 of 4 reconstruct)
+        os.unlink(os.path.join(sdir, "data.bin.shard-2-of-4"))
+        os.unlink(os.path.join(sdir, "data.bin.shard-3-of-4"))
+        out = os.path.join(d, "restored.bin")
+        rc = cloud_dog.cmd_unshard(type("A", (), {
+            "dir": sdir, "out": out})())
+        assert rc == 0
+        with open(src, "rb") as f:
+            orig = f.read()
+        with open(out, "rb") as f:
+            rest = f.read()
+        assert orig == rest, "reconstructed bytes must match original"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_shard_needs_zfec():
+    old = _patch(cloud_dog, "_zfec_available", lambda: False)
+    try:
+        rc = cloud_dog.cmd_shard(type("A", (), {
+            "file": "/tmp/x", "k": 2, "m": 4, "out": ""})())
+        assert rc == 1
+    finally:
+        _patch(cloud_dog, "_zfec_available", old)
