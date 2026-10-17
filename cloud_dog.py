@@ -79,7 +79,8 @@ def run(cmd, timeout=60):
 
 
 def disk_usage_percent(path="/home/hatch"):
-    st = shutil.disk_usage(path)
+    target = path if os.path.exists(path) else (HOME if os.path.exists(HOME) else "/")
+    st = shutil.disk_usage(target)
     return st.used / st.total * 100.0, st.used, st.total
 
 
@@ -101,6 +102,8 @@ def sha256_file(path, chunk=1 << 20):
 
 def is_sacred(path):
     ap = os.path.abspath(path)
+    if "agent-ops/checkpoints" in ap or ("agent-ops" + os.sep + "checkpoints") in ap:
+        return True
     for s in SACRED_PATHS:
         if ap == s or ap.startswith(s + os.sep):
             return True
@@ -166,6 +169,7 @@ def load_registry():
 
 
 def save_registry(reg):
+    os.makedirs(os.path.dirname(REGISTRY_PATH), exist_ok=True)
     tmp = REGISTRY_PATH + ".tmp"
     with open(tmp, "w") as f:
         json.dump(reg, f, indent=2, sort_keys=True)
@@ -174,6 +178,7 @@ def save_registry(reg):
 
 
 def log_action(text):
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
     line = f"- [{now_stamp()}] {text}\n"
     with open(LOG_PATH, "a") as f:
         f.write(line)
