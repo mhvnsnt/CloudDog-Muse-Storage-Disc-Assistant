@@ -200,6 +200,75 @@ async function startServer() {
     res.json({ success: true, log: '# Disk Cleanup Log\n\nNo entries logged yet.' });
   });
 
+  app.post('/api/cloud-dog/verify', (req, res) => {
+    const file = req.body.file;
+    if (!file) return res.status(400).json({ success: false, error: 'file is required' });
+    const cmd = `python3 cloud_dog.py verify --file "${file.replace(/"/g, '\\"')}"`;
+    exec(cmd, { cwd: __dirname }, (err, stdout, stderr) => {
+      res.json({
+        success: !err,
+        output: stdout,
+        error: stderr,
+      });
+    });
+  });
+
+  app.post('/api/cloud-dog/register', (req, res) => {
+    const { file, store, repo, release, asset, remoteDir, dataset, sha256, note } = req.body;
+    if (!file || !store) return res.status(400).json({ success: false, error: 'file and store are required' });
+    let cmd = `python3 cloud_dog.py register --file "${file.replace(/"/g, '\\"')}" --store ${store}`;
+    if (repo) cmd += ` --repo "${repo.replace(/"/g, '\\"')}"`;
+    if (release) cmd += ` --release "${release.replace(/"/g, '\\"')}"`;
+    if (asset) cmd += ` --asset "${asset.replace(/"/g, '\\"')}"`;
+    if (remoteDir) cmd += ` --remote-dir "${remoteDir.replace(/"/g, '\\"')}"`;
+    if (dataset) cmd += ` --dataset "${dataset.replace(/"/g, '\\"')}"`;
+    if (sha256) cmd += ` --sha256 "${sha256.replace(/"/g, '\\"')}"`;
+    if (note) cmd += ` --note "${note.replace(/"/g, '\\"')}"`;
+    exec(cmd, { cwd: __dirname }, (err, stdout, stderr) => {
+      res.json({
+        success: !err,
+        output: stdout,
+        error: stderr,
+      });
+    });
+  });
+
+  app.get('/api/cloud-dog/audit', (req, res) => {
+    const home = os.homedir();
+    const auditPath = path.join(home, 'workspace', 'agent-ops', 'cloud-dog-audit.jsonl');
+    if (fs.existsSync(auditPath)) {
+      try {
+        const lines = fs.readFileSync(auditPath, 'utf8').trim().split('\n').filter(Boolean);
+        const entries = lines.map((l) => {
+          try {
+            return JSON.parse(l);
+          } catch {
+            return { raw: l };
+          }
+        });
+        return res.json({ success: true, count: entries.length, entries });
+      } catch (e: any) {
+        return res.json({ success: false, error: e.message });
+      }
+    }
+    res.json({ success: true, count: 0, entries: [] });
+  });
+
+  app.get('/api/cloud-dog/daemon/status', (req, res) => {
+    const home = os.homedir();
+    const pidfile = path.join(home, 'workspace', 'agent-ops', 'cloud-dog-daemon.pid');
+    if (fs.existsSync(pidfile)) {
+      try {
+        const pid = parseInt(fs.readFileSync(pidfile, 'utf8').trim(), 10);
+        process.kill(pid, 0); // test if running
+        return res.json({ running: true, pid });
+      } catch {
+        return res.json({ running: false, stalePid: true });
+      }
+    }
+    res.json({ running: false });
+  });
+
   // 5. REAL SHELL SCRIPT EXPORTER / BUNDLER
   app.get('/api/download-cli', (req, res) => {
     const cliPath = path.join(__dirname, 'cloud_dog.py');
