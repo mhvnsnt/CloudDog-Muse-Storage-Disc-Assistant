@@ -1289,6 +1289,125 @@ def cmd_mirror(args):
     return 0
 
 
+# ============================================================ mirror-search: Internet Archive link finder
+IA_SEARCH_URL = "https://archive.org/advancedsearch.php"
+IA_METADATA_URL = "https://archive.org/metadata"
+IA_DOWNLOAD_BASE = "https://archive.org/download"
+IA_USER_AGENT = ("CloudDog/1.0 (mirror-search; "
+                 "+https://github.com/mhvnsnt/CloudDog-Muse-Storage-Disc-Assistant)")
+
+
+def ia_search(query, rows=10, timeout=60):
+    """Search the Internet Archive (public advancedsearch API, no key needed).
+
+    Returns (ok, docs|detail). docs: [{identifier, title, mediatype}, ...].
+    """
+    import urllib.request
+    import urllib.error
+    import urllib.parse
+    params = [("q", query),
+              ("fl[]", "identifier"), ("fl[]", "title"), ("fl[]", "mediatype"),
+              ("rows", str(max(1, rows))),
+              ("output", "json")]
+    url = IA_SEARCH_URL + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"User-Agent": IA_USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return False, f"IA search HTTP {e.code}"
+    except Exception as e:
+        return False, f"IA search error: {e}"
+    try:
+        docs = data["response"]["docs"]
+    except (KeyError, TypeError):
+        return False, "IA search returned unexpected JSON"
+    return True, docs
+
+
+def ia_item_files(identifier, timeout=60):
+    """Fetch an item's file list via the public IA metadata API.
+
+    Returns (ok, files|detail). files: [{name, size, ...}, ...].
+    """
+    import urllib.request
+    import urllib.error
+    import urllib.parse
+    url = f"{IA_METADATA_URL}/{urllib.parse.quote(identifier, safe='')}"
+    req = urllib.request.Request(url, headers={"User-Agent": IA_USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return False, f"IA metadata HTTP {e.code} for {identifier}"
+    except Exception as e:
+        return False, f"IA metadata error for {identifier}: {e}"
+    files = data.get("files")
+    if not isinstance(files, list):
+        return False, f"IA metadata has no file list for {identifier}"
+    return True, files
+
+
+def ia_download_url(identifier, filename):
+    """Direct download URL for one item file (no API key needed)."""
+    import urllib.parse
+    return (f"{IA_DOWNLOAD_BASE}/{urllib.parse.quote(identifier, safe='')}"
+            f"/{urllib.parse.quote(filename, safe='/')}")
+
+
+def cmd_mirror_search(args):
+    """Find mirror links on the Internet Archive for QUERY.
+
+    Prints each matching item's title, identifier, and direct download URLs
+    (https://archive.org/download/<id>/<file>). Pure stdlib, IA only —
+    no pirate-site scrapers.
+    """
+    limit = max(1, getattr(args, "limit", 10) or 10)
+    as_json = getattr(args, "json", False)
+    ok, docs = ia_search(args.query, rows=limit)
+    if not ok:
+        print(f"mirror-search: {docs}", file=sys.stderr)
+        return 1
+    results = []
+    for doc in docs:
+        ident = doc.get("identifier") or ""
+        title = doc.get("title") or ""
+        if isinstance(title, list):
+            title = "; ".join(str(t) for t in title)
+        entry = {"identifier": ident, "title": title, "downloads": []}
+        if ident:
+            ok2, files = ia_item_files(ident)
+            if not ok2:
+                entry["error"] = files
+            else:
+                for f in files:
+                    name = f.get("name") or ""
+                    if not name:
+                        continue
+                    size = f.get("size")
+                    try:
+                        size = int(size) if size is not None else 0
+                    except (TypeError, ValueError):
+                        size = 0
+                    entry["downloads"].append({
+                        "file": name,
+                        "size": size,
+                        "url": ia_download_url(ident, name),
+                    })
+        results.append(entry)
+    if as_json:
+        print(json.dumps(results, indent=2))
+    else:
+        for e in results:
+            print(f"= {e['title'] or '(no title)'}")
+            print(f"  identifier: {e['identifier']}")
+            if e.get("error"):
+                print(f"  file list unavailable: {e['error']}")
+            for dl in e["downloads"]:
+                print(f"  - {dl['url']} ({human(dl['size'])})")
+    return 0
+
+
 # ============================================================ v2: daemon command
 def cmd_daemon(args):
     """Run the enforce loop continuously (guardian cadence without cron).
@@ -1667,6 +1786,15 @@ def main(argv=None):
     p.add_argument("--poll-secs", type=int, default=60,
                    help="torbox completion poll interval")
 
+    p = sub.add_parser("mirror-search",
+                       help="find mirror links on the Internet Archive")
+    p.add_argument("query",
+                   help="IA advancedsearch query, e.g. 'shakespeare'")
+    p.add_argument("--limit", type=int, default=10,
+                   help="max items to list (default 10)")
+    p.add_argument("--json", action="store_true",
+                   help="machine-readable output")
+
     p = sub.add_parser("daemon",
                        help="run the enforce loop continuously")
     p.add_argument("--interval", type=int, default=600,
@@ -1690,6 +1818,8 @@ def main(argv=None):
             return cmd_dedup(args)
         elif args.cmd == "mirror":
             return cmd_mirror(args)
+        elif args.cmd == "mirror-search":
+            return cmd_mirror_search(args)
         elif args.cmd == "daemon":
             return cmd_daemon(args)
         elif args.cmd == "enforce":
