@@ -59,6 +59,10 @@ def test_registry_roundtrip(tmp_path=None):
     if os.path.exists(reg_path):
         backup = reg_path + ".test-bak"
         os.replace(reg_path, backup)
+    # keep test register events out of the production audit journal
+    audit_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
+    audit_tmp.close()
+    old_audit = _patch(cloud_dog, "AUDIT_PATH", audit_tmp.name)
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".dat") as f:
             path = f.name
@@ -76,6 +80,9 @@ def test_registry_roundtrip(tmp_path=None):
         finally:
             os.unlink(path)
     finally:
+        _patch(cloud_dog, "AUDIT_PATH", old_audit)
+        if os.path.exists(audit_tmp.name):
+            os.unlink(audit_tmp.name)
         if os.path.exists(reg_path):
             os.unlink(reg_path)
         if backup and os.path.exists(backup):
