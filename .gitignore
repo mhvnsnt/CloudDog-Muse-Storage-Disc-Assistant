@@ -7,8 +7,7 @@ coverage/
 .env*
 !.env.example
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 .pytest_cache/
 *.egg-info/
 .coverage

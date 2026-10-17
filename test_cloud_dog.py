@@ -51,14 +51,22 @@ def test_sha256_file():
 
 
 def test_registry_roundtrip(tmp_path=None):
-    # register + load must preserve the entry (uses real registry path;
-    # cleans up after itself)
+    # register + load must preserve the entry (uses real registry paths;
+    # cleans up after itself). Backs up BOTH the legacy JSON and the
+    # sqlite DB so the production registry is never polluted.
     import json
     reg_path = cloud_dog.REGISTRY_PATH
-    backup = None
-    if os.path.exists(reg_path):
-        backup = reg_path + ".test-bak"
-        os.replace(reg_path, backup)
+    db_path = cloud_dog.REGISTRY_DB_PATH
+    backups = []
+    for p in (reg_path, db_path, db_path + "-wal", db_path + "-shm"):
+        if os.path.exists(p):
+            bak = p + ".test-bak"
+            os.replace(p, bak)
+            backups.append((p, bak))
+    # keep test register events out of the production audit journal
+    audit_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
+    audit_tmp.close()
+    old_audit = _patch(cloud_dog, "AUDIT_PATH", audit_tmp.name)
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".dat") as f:
             path = f.name
@@ -76,10 +84,84 @@ def test_registry_roundtrip(tmp_path=None):
         finally:
             os.unlink(path)
     finally:
-        if os.path.exists(reg_path):
-            os.unlink(reg_path)
-        if backup and os.path.exists(backup):
-            os.replace(backup, reg_path)
+        _patch(cloud_dog, "AUDIT_PATH", old_audit)
+        if os.path.exists(audit_tmp.name):
+            os.unlink(audit_tmp.name)
+        for p in (reg_path, db_path, db_path + "-wal", db_path + "-shm",
+                  db_path + ".test-bak-wal", db_path + ".test-bak-shm"):
+            if os.path.exists(p):
+                os.unlink(p)
+        for p, bak in backups:
+            if os.path.exists(bak):
+                os.replace(bak, p)
+
+
+def test_registry_sqlite_migration():
+    # legacy JSON entries migrate into sqlite exactly once
+    import json
+    db_path = cloud_dog.REGISTRY_DB_PATH
+    reg_path = cloud_dog.REGISTRY_PATH
+    backups = []
+    for p in (reg_path, db_path, db_path + "-wal", db_path + "-shm"):
+        if os.path.exists(p):
+            bak = p + ".test-bak"
+            os.replace(p, bak)
+            backups.append((p, bak))
+    try:
+        legacy = {"version": 1, "entries": {
+            "/tmp/fake-a": {"store": "github", "status": "registered"},
+            "/tmp/fake-b": {"store": "terabox", "status": "reaped"},
+        }}
+        with open(reg_path, "w") as f:
+            json.dump(legacy, f)
+        reg = cloud_dog.load_registry()  # triggers migration
+        assert "/tmp/fake-a" in reg["entries"]
+        assert reg["entries"]["/tmp/fake-b"]["store"] == "terabox"
+        # second load must not duplicate or wipe
+        reg2 = cloud_dog.load_registry()
+        assert len(reg2["entries"]) == 2
+        # sqlite file now exists and holds the rows
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        n = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+        conn.close()
+        assert n == 2
+    finally:
+        for p in (reg_path, db_path, db_path + "-wal", db_path + "-shm"):
+            if os.path.exists(p):
+                os.unlink(p)
+        for p, bak in backups:
+            if os.path.exists(bak):
+                os.replace(bak, p)
+
+
+def test_registry_export_json(tmp_path):
+    # export reproduces the legacy JSON shape from sqlite
+    import json
+    db_path = cloud_dog.REGISTRY_DB_PATH
+    reg_path = cloud_dog.REGISTRY_PATH
+    backups = []
+    for p in (reg_path, db_path, db_path + "-wal", db_path + "-shm"):
+        if os.path.exists(p):
+            bak = p + ".test-bak"
+            os.replace(p, bak)
+            backups.append((p, bak))
+    try:
+        cloud_dog.save_registry({"version": 3, "entries": {
+            "/tmp/x": {"store": "github", "status": "registered"}}})
+        dest = str(tmp_path / "export.json")
+        out = cloud_dog.registry_export_json(dest)
+        assert out == dest
+        with open(dest) as f:
+            data = json.load(f)
+        assert "/tmp/x" in data["entries"]
+    finally:
+        for p in (reg_path, db_path, db_path + "-wal", db_path + "-shm"):
+            if os.path.exists(p):
+                os.unlink(p)
+        for p, bak in backups:
+            if os.path.exists(bak):
+                os.replace(bak, p)
 
 
 if __name__ == "__main__":
@@ -326,3 +408,249 @@ def test_daemon_stale_pidfile_taken_over(tmp_path=None):
         _patch(cloud_dog, "log_action", o1)
         _patch(cloud_dog, "audit_log", o2)
     assert not os.path.exists(pf), "pidfile must be removed on exit"
+
+
+def test_enforce_uses_v2_reaper():
+    """enforce must reap via the v2 dispatcher (all stores), and must not
+    crash when args has no .path (the enforce parser never defines --path)."""
+    calls = []
+
+    def fake_scan():
+        return {"over_ceiling": True}
+
+    def fake_reap_v2(args):
+        calls.append("v2")
+        # must tolerate missing .path
+        _ = getattr(args, "path", "")
+        return 0
+
+    o1 = _patch(cloud_dog, "cmd_scan", fake_scan)
+    o2 = _patch(cloud_dog, "cmd_reap_v2", fake_reap_v2)
+    o3 = _patch(cloud_dog, "disk_usage_percent", lambda p="/home/hatch": (80.0, 1, 2))
+    o4 = _patch(cloud_dog, "log_action", lambda *a, **k: None)
+    try:
+        args = type("A", (), {"apply": True})()  # NO .path attribute
+        rc = cloud_dog.cmd_enforce(args)
+        assert rc == 0
+        assert calls == ["v2"], "enforce must dispatch to cmd_reap_v2"
+    finally:
+        _patch(cloud_dog, "cmd_scan", o1)
+        _patch(cloud_dog, "cmd_reap_v2", o2)
+        _patch(cloud_dog, "disk_usage_percent", o3)
+        _patch(cloud_dog, "log_action", o4)
+
+
+def test_reap_v2_tolerates_missing_path_arg():
+    """cmd_reap_v2 directly with an args object lacking .path (enforce path)."""
+    o1 = _patch(cloud_dog, "reap_candidates", lambda root=None: iter([]))
+    try:
+        args = type("A", (), {"apply": False})()
+        rc = cloud_dog.cmd_reap_v2(args)
+        assert rc == 0
+    finally:
+        _patch(cloud_dog, "reap_candidates", o1)
+
+
+# ------------------------------------------------- policy-gate wiring tests
+def _policy_test_setup():
+    """Back up the real registry and isolate the audit journal."""
+    import shutil
+    reg_path = cloud_dog.REGISTRY_PATH
+    backup = None
+    if os.path.exists(reg_path):
+        backup = reg_path + ".test-bak"
+        os.replace(reg_path, backup)
+    d = tempfile.mkdtemp(prefix="cdtest-",
+                        dir=os.path.expanduser("~/workspace"))
+    old_audit = _patch(cloud_dog, "AUDIT_PATH", os.path.join(d, "audit.jsonl"))
+
+    def cleanup():
+        _patch(cloud_dog, "AUDIT_PATH", old_audit)
+        shutil.rmtree(d, ignore_errors=True)
+        if os.path.exists(reg_path):
+            os.unlink(reg_path)
+        if backup and os.path.exists(backup):
+            os.replace(backup, reg_path)
+    return d, cleanup
+
+
+def _old_file(directory, name, content=b"data"):
+    """Create a file with mtime old enough to pass the in-flight filter."""
+    import time
+    p = os.path.join(directory, name)
+    with open(p, "wb") as f:
+        f.write(content)
+    old = time.time() - 600
+    os.utime(p, (old, old))
+    return p
+
+
+def _register(path, store="terabox"):
+    return cloud_dog.cmd_register(type("A", (), {
+        "file": path, "store": store, "repo": "", "release": "",
+        "asset": "", "sha256": "", "size": 0, "note": "test",
+    })())
+
+
+def _reap_dry(args):
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cloud_dog.cmd_reap_v2(args)
+    return rc, buf.getvalue()
+
+
+def test_policy_gate_blocks_protected_game_file():
+    """A .iso with a claimed store is BLOCKED by decide_delete (rule 3),
+    before any live verify runs. The file must survive."""
+    d, cleanup = _policy_test_setup()
+    try:
+        iso = _old_file(d, "game.iso")
+        assert _register(iso) == 0
+        rc, out = _reap_dry(type("A", (), {
+            "apply": True, "path": "", "owner_approved": False})())
+        assert rc == 0
+        assert "blocked-policy=1" in out, out
+        assert "BLOCKED (policy)" in out, out
+        assert "protected game file" in out, out
+        assert os.path.exists(iso), "policy-blocked file must never be deleted"
+    finally:
+        cleanup()
+
+
+def test_policy_gate_passes_ordinary_file_to_verify():
+    """An ordinary file with a claimed store passes the gate and reaches
+    live verification (fails locally without creds — no network)."""
+    d, cleanup = _policy_test_setup()
+    try:
+        dat = _old_file(d, "ordinary.dat")
+        assert _register(dat) == 0
+        rc, out = _reap_dry(type("A", (), {
+            "apply": False, "path": "", "owner_approved": False})())
+        assert rc == 0
+        assert "blocked-policy=0" in out, out
+        assert "failed-verify=1" in out, out
+        assert os.path.exists(dat)
+    finally:
+        cleanup()
+
+
+def test_policy_gate_owner_approved_allows_game_file_past_gate():
+    """With --owner-approved, a protected game file passes the POLICY gate
+    (rule 3 satisfied) and proceeds to live verification."""
+    d, cleanup = _policy_test_setup()
+    try:
+        iso = _old_file(d, "game2.iso")
+        assert _register(iso) == 0
+        rc, out = _reap_dry(type("A", (), {
+            "apply": False, "path": "", "owner_approved": True})())
+        assert rc == 0
+        assert "blocked-policy=0" in out, out
+        assert os.path.exists(iso)
+    finally:
+        cleanup()
+
+
+def test_policy_unavailable_fails_closed():
+    """If the law engine cannot import, reap refuses to run at all."""
+    import io, contextlib
+    old = _patch(cloud_dog, "_POLICY_AVAILABLE", False)
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            rc = cloud_dog.cmd_reap_v2(type("A", (), {"apply": True})())
+        assert rc == 1
+        assert "fail-closed" in buf.getvalue()
+    finally:
+        _patch(cloud_dog, "_POLICY_AVAILABLE", old)
+
+
+# ---------------------------------------------------- dust scan wiring tests
+def test_parse_dust_size():
+    assert cloud_dog._parse_dust_size("2.1M") == int(2.1 * 1024 ** 2)
+    assert cloud_dog._parse_dust_size("272K") == 272 * 1024
+    assert cloud_dog._parse_dust_size("512B") == 512
+    assert cloud_dog._parse_dust_size("1.5G") == int(1.5 * 1024 ** 3)
+    assert cloud_dog._parse_dust_size("nonsense") == 0
+    assert cloud_dog._parse_dust_size("") == 0
+
+
+def _fake_dust_script(directory, payload):
+    """Write a fake `dust` executable that prints payload for -j."""
+    import stat
+    p = os.path.join(directory, "dust")
+    with open(p, "w") as f:
+        f.write("#!/bin/sh\nprintf '%s' '" + payload.replace("'", "'\"'\"'") + "'\n")
+    os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
+    return p
+
+
+def test_dust_largest_parses_json():
+    import json, tempfile
+    d = tempfile.mkdtemp(prefix="cdtest-", dir=os.path.expanduser("~/workspace"))
+    try:
+        payload = json.dumps({"size": "3.0M", "name": "/root",
+                              "children": [
+                                  {"size": "2.0M", "name": "/root/aaa", "children": []},
+                                  {"size": "1.0M", "name": "/root/bbb", "children": []},
+                              ]})
+        _fake_dust_script(d, payload)
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = d + os.pathsep + old_path
+        try:
+            out = cloud_dog._dust_largest("/root")
+        finally:
+            os.environ["PATH"] = old_path
+        assert out is not None
+        by_name = dict(out)
+        assert by_name["aaa"] == 2 * 1024 ** 2
+        assert by_name["bbb"] == 1 * 1024 ** 2
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_dust_largest_bad_output_falls_back():
+    import tempfile
+    d = tempfile.mkdtemp(prefix="cdtest-", dir=os.path.expanduser("~/workspace"))
+    try:
+        _fake_dust_script(d, "this is not json{{{")
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = d + os.pathsep + old_path
+        try:
+            assert cloud_dog._dust_largest("/root") is None
+        finally:
+            os.environ["PATH"] = old_path
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_scan_uses_dust_when_present():
+    import json, tempfile
+    d = tempfile.mkdtemp(prefix="cdtest-", dir=os.path.expanduser("~/workspace"))
+    try:
+        payload = json.dumps({"size": "9.9M", "name": "ws", "children": [
+            {"size": "9.9M", "name": "ws/fakedir", "children": []}]})
+        _fake_dust_script(d, payload)
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = d + os.pathsep + old_path
+        try:
+            report = cloud_dog.cmd_scan(as_json=True)
+        finally:
+            os.environ["PATH"] = old_path
+        names = [i["name"] for i in report["largest"]]
+        assert "fakedir" in names, report["largest"]
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_scan_falls_back_without_dust():
+    old = _patch(cloud_dog, "_dust_binary", lambda: None)
+    try:
+        report = cloud_dog.cmd_scan(as_json=True)
+        assert report["largest"], "stdlib fallback must still list entries"
+        assert all("bytes" in i and i["bytes"] >= 0 for i in report["largest"])
+    finally:
+        _patch(cloud_dog, "_dust_binary", old)

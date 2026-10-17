@@ -132,6 +132,95 @@ export const RealDiskBridge: React.FC = () => {
     }
   };
 
+  const runCloudDogEnforce = async (apply: boolean) => {
+    setIsCloudDogRunning(true);
+    try {
+      const res = await fetch('/api/cloud-dog/enforce', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apply }),
+      });
+      const data = await res.json();
+      setCloudDogOutput(data.output || data.error || 'Enforce cycle finished.');
+      fetchServerDisk();
+    } catch (e: any) {
+      setCloudDogOutput(`Error executing enforce: ${e.message}`);
+    } finally {
+      setIsCloudDogRunning(false);
+    }
+  };
+
+  const [auditEntries, setAuditEntries] = useState<any[]>([]);
+  const runCloudDogAudit = async () => {
+    setIsCloudDogRunning(true);
+    try {
+      const res = await fetch('/api/cloud-dog/audit');
+      const data = await res.json();
+      if (data.success) {
+        setAuditEntries(data.entries || []);
+        setCloudDogOutput(JSON.stringify(data.entries, null, 2));
+      } else {
+        setCloudDogOutput(data.error || 'Failed to fetch audit journal');
+      }
+    } catch (e: any) {
+      setCloudDogOutput(`Error fetching audit journal: ${e.message}`);
+    } finally {
+      setIsCloudDogRunning(false);
+    }
+  };
+
+  const [verifyFilePath, setVerifyFilePath] = useState('/tmp/sample.dat');
+  const runCloudDogVerify = async (path: string) => {
+    setIsCloudDogRunning(true);
+    try {
+      const res = await fetch('/api/cloud-dog/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ file: path }),
+      });
+      const data = await res.json();
+      setCloudDogOutput(data.output || data.error || 'Verification command executed.');
+    } catch (e: any) {
+      setCloudDogOutput(`Error verifying file: ${e.message}`);
+    } finally {
+      setIsCloudDogRunning(false);
+    }
+  };
+
+  const [regFile, setRegFile] = useState('/tmp/sample.dat');
+  const [regStore, setRegStore] = useState<'github' | 'terabox' | 'kaggle'>('github');
+  const [regRepo, setRegRepo] = useState('mhvnsnt/muse-vault');
+  const [regRelease, setRegRelease] = useState('v1.0.0');
+  const [regAsset, setRegAsset] = useState('part-aa');
+  const [regRemoteDir, setRegRemoteDir] = useState('/MuseSounds/Vault');
+  const [regDataset, setRegDataset] = useState('marsfmmg/muse-dataset');
+
+  const runCloudDogRegister = async () => {
+    setIsCloudDogRunning(true);
+    try {
+      const res = await fetch('/api/cloud-dog/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          file: regFile,
+          store: regStore,
+          repo: regStore === 'github' ? regRepo : undefined,
+          release: regStore === 'github' ? regRelease : undefined,
+          asset: regAsset,
+          remoteDir: regStore === 'terabox' ? regRemoteDir : undefined,
+          dataset: regStore === 'kaggle' ? regDataset : undefined,
+          note: 'Registered via Cloud Dog Real Disk Bridge',
+        }),
+      });
+      const data = await res.json();
+      setCloudDogOutput(data.output || data.error || 'Registration finished.');
+    } catch (e: any) {
+      setCloudDogOutput(`Error registering entry: ${e.message}`);
+    } finally {
+      setIsCloudDogRunning(false);
+    }
+  };
+
   // Browser Native File System Access API
   const handlePickRealDirectory = async () => {
     if (!('showDirectoryPicker' in window)) {
@@ -395,6 +484,20 @@ export const RealDiskBridge: React.FC = () => {
               Apply Reap
             </button>
             <button
+              onClick={() => runCloudDogEnforce(false)}
+              disabled={isCloudDogRunning}
+              className="px-3 py-1.5 text-xs font-medium text-amber-300 bg-amber-950/60 hover:bg-amber-900/60 border border-amber-800/60 rounded-md transition-colors cursor-pointer"
+            >
+              Enforce Cycle
+            </button>
+            <button
+              onClick={runCloudDogAudit}
+              disabled={isCloudDogRunning}
+              className="px-3 py-1.5 text-xs font-medium text-purple-300 bg-purple-950/60 hover:bg-purple-900/60 border border-purple-800/60 rounded-md transition-colors cursor-pointer"
+            >
+              Audit Journal
+            </button>
+            <button
               onClick={runCloudDogRegistry}
               disabled={isCloudDogRunning}
               className="px-3 py-1.5 text-xs font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-md transition-colors cursor-pointer"
@@ -423,8 +526,132 @@ export const RealDiskBridge: React.FC = () => {
             )}
           </div>
           <pre className="p-4 bg-slate-950 border border-slate-800 rounded-lg font-mono text-xs text-cyan-200/90 overflow-x-auto max-h-64 leading-relaxed">
-            {cloudDogOutput || 'Click "Scan Workspace" or "Dry-Run Reap" to execute cloud_dog.py'}
+            {cloudDogOutput || 'Click "Scan Workspace", "Dry-Run Reap", or "Audit Journal" to inspect cloud_dog.py'}
           </pre>
+        </div>
+
+        {/* Interactive Store Register & Verify Subpanel */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-3 border-t border-slate-800">
+          {/* 1. Verify Entry */}
+          <div className="p-4 bg-slate-950/70 border border-slate-800 rounded-lg space-y-3">
+            <div className="text-xs font-semibold text-cyan-300 flex items-center gap-1.5">
+              <ShieldCheck className="w-4 h-4 text-cyan-400" />
+              <span>Verify File Against Remote Store</span>
+            </div>
+            <p className="text-[11px] text-slate-400">
+              Dispatches on registered store: GitHub releases API, TeraBox ls check, or Kaggle dataset view.
+            </p>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={verifyFilePath}
+                onChange={(e) => setVerifyFilePath(e.target.value)}
+                placeholder="/abs/path/to/file"
+                className="flex-1 px-3 py-1.5 text-xs bg-slate-900 border border-slate-700 rounded-md text-white font-mono placeholder:text-slate-500"
+              />
+              <button
+                onClick={() => runCloudDogVerify(verifyFilePath)}
+                disabled={isCloudDogRunning}
+                className="px-3 py-1.5 text-xs font-medium text-cyan-300 bg-cyan-950 hover:bg-cyan-900 border border-cyan-800 rounded-md transition-colors cursor-pointer shrink-0"
+              >
+                Verify Live
+              </button>
+            </div>
+          </div>
+
+          {/* 2. Register Store */}
+          <div className="p-4 bg-slate-950/70 border border-slate-800 rounded-lg space-y-3">
+            <div className="text-xs font-semibold text-purple-300 flex items-center gap-1.5">
+              <HardDrive className="w-4 h-4 text-purple-400" />
+              <span>Register Verified Upload</span>
+            </div>
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              <select
+                value={regStore}
+                onChange={(e) => setRegStore(e.target.value as any)}
+                className="px-2 py-1 bg-slate-900 border border-slate-700 rounded text-slate-200 font-mono"
+              >
+                <option value="github">Store: GitHub</option>
+                <option value="terabox">Store: TeraBox</option>
+                <option value="kaggle">Store: Kaggle</option>
+              </select>
+              <input
+                type="text"
+                value={regFile}
+                onChange={(e) => setRegFile(e.target.value)}
+                placeholder="Local path"
+                className="px-2 py-1 bg-slate-900 border border-slate-700 rounded text-slate-200 font-mono text-[11px]"
+              />
+            </div>
+            {regStore === 'github' && (
+              <div className="grid grid-cols-3 gap-2 text-[11px]">
+                <input
+                  type="text"
+                  value={regRepo}
+                  onChange={(e) => setRegRepo(e.target.value)}
+                  placeholder="owner/repo"
+                  className="px-2 py-1 bg-slate-900 border border-slate-700 rounded text-slate-200 font-mono"
+                />
+                <input
+                  type="text"
+                  value={regRelease}
+                  onChange={(e) => setRegRelease(e.target.value)}
+                  placeholder="tag"
+                  className="px-2 py-1 bg-slate-900 border border-slate-700 rounded text-slate-200 font-mono"
+                />
+                <input
+                  type="text"
+                  value={regAsset}
+                  onChange={(e) => setRegAsset(e.target.value)}
+                  placeholder="asset name"
+                  className="px-2 py-1 bg-slate-900 border border-slate-700 rounded text-slate-200 font-mono"
+                />
+              </div>
+            )}
+            {regStore === 'terabox' && (
+              <div className="grid grid-cols-2 gap-2 text-[11px]">
+                <input
+                  type="text"
+                  value={regRemoteDir}
+                  onChange={(e) => setRegRemoteDir(e.target.value)}
+                  placeholder="/Remote/Dir"
+                  className="px-2 py-1 bg-slate-900 border border-slate-700 rounded text-slate-200 font-mono"
+                />
+                <input
+                  type="text"
+                  value={regAsset}
+                  onChange={(e) => setRegAsset(e.target.value)}
+                  placeholder="remote filename"
+                  className="px-2 py-1 bg-slate-900 border border-slate-700 rounded text-slate-200 font-mono"
+                />
+              </div>
+            )}
+            {regStore === 'kaggle' && (
+              <div className="grid grid-cols-2 gap-2 text-[11px]">
+                <input
+                  type="text"
+                  value={regDataset}
+                  onChange={(e) => setRegDataset(e.target.value)}
+                  placeholder="owner/slug"
+                  className="px-2 py-1 bg-slate-900 border border-slate-700 rounded text-slate-200 font-mono"
+                />
+                <input
+                  type="text"
+                  value={regAsset}
+                  onChange={(e) => setRegAsset(e.target.value)}
+                  placeholder="filename"
+                  className="px-2 py-1 bg-slate-900 border border-slate-700 rounded text-slate-200 font-mono"
+                />
+              </div>
+            )}
+            <button
+              onClick={runCloudDogRegister}
+              disabled={isCloudDogRunning}
+              className="w-full py-1 text-xs font-semibold text-purple-300 bg-purple-950/80 hover:bg-purple-900/80 border border-purple-800 rounded transition-colors cursor-pointer"
+            >
+              Register in cloud-dog-registry.json
+            </button>
+          </div>
         </div>
       </div>
 

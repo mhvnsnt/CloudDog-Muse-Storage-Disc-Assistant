@@ -32,6 +32,11 @@ v2 (2026-10-17): terabox backend (tbupload.py), kaggle backend (REST),
 torrent mirror mode (TorBox cloud -> Range-stream -> part upload/verify/
 delete), daemon mode, structured audit journal (cloud-dog-audit.jsonl).
 
+v3 (2026-10-17): sqlite-backed registry (Python stdlib sqlite3, WAL mode)
+replaces the JSON file — atomic transactions, concurrent-safe for the
+guardian cron + manual runs. Legacy cloud-dog-registry.json migrates
+once on first open; `registry_export_json()` dumps the legacy shape.
+
 Default mode is DRY-RUN. Nothing is deleted unless --apply is passed.
 """
 
@@ -40,16 +45,28 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+
+# Owner's disk laws as code (clouddog/policy/laws.py, PR #8). The reap path
+# consults decide_delete for every candidate: it can only make reap MORE
+# conservative, never less. Fail closed if the import breaks.
+try:
+    from clouddog.policy.laws import decide_delete
+    _POLICY_AVAILABLE = True
+except ImportError:  # pragma: no cover - defensive; package ships in-repo
+    decide_delete = None  # type: ignore
+    _POLICY_AVAILABLE = False
 
 # ---------------------------------------------------------------- locations
 HOME = os.path.expanduser("~")
 WORKSPACE = os.path.join(HOME, "workspace")
 AGENT_OPS = os.path.join(WORKSPACE, "agent-ops")
 REGISTRY_PATH = os.path.join(AGENT_OPS, "cloud-dog-registry.json")
+REGISTRY_DB_PATH = os.path.join(AGENT_OPS, "cloud-dog-registry.db")
 LOG_PATH = os.path.join(AGENT_OPS, "disk-cleanup-log.md")
 
 USAGE_CEILING = 75.0          # target: stay under this %
@@ -168,23 +185,106 @@ def active_transfer_pids():
 
 
 # ---------------------------------------------------------------- registry
-def load_registry():
-    if not os.path.exists(REGISTRY_PATH):
-        return {"version": 1, "entries": {}}
+#
+# sqlite-backed registry (v3). The JSON file at REGISTRY_PATH is legacy:
+# on first DB open its entries are migrated once into sqlite, then sqlite
+# is the single source of truth. sqlite gives us atomic transactions and
+# concurrent-safe access (WAL mode) — the old load-modify-save JSON pattern
+# raced when the guardian cron and a manual run overlapped.
+#
+# load_registry() / save_registry() keep their exact v1/v2 API so every
+# call site works unchanged.
+
+_REGISTRY_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS entries ("
+    " local_path TEXT PRIMARY KEY,"
+    " data TEXT NOT NULL,"
+    " updated_at TEXT NOT NULL)"
+)
+_REGISTRY_META_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS meta ("
+    " k TEXT PRIMARY KEY, v TEXT NOT NULL)"
+)
+
+
+def _db():
+    """Open the registry DB, creating schema and migrating legacy JSON once."""
+    os.makedirs(os.path.dirname(REGISTRY_DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(REGISTRY_DB_PATH, timeout=30)
     try:
-        with open(REGISTRY_PATH) as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {"version": 1, "entries": {}}
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute(_REGISTRY_SCHEMA)
+        conn.execute(_REGISTRY_META_SCHEMA)
+        row = conn.execute(
+            "SELECT v FROM meta WHERE k='json_migrated'").fetchone()
+        if not row and os.path.exists(REGISTRY_PATH):
+            try:
+                with open(REGISTRY_PATH) as f:
+                    legacy = json.load(f)
+                entries = (legacy.get("entries", {})
+                           if isinstance(legacy, dict) else {})
+                stamp = now_stamp()
+                for p, e in entries.items():
+                    conn.execute(
+                        "INSERT OR REPLACE INTO entries"
+                        " (local_path, data, updated_at) VALUES (?, ?, ?)",
+                        (p, json.dumps(e), stamp))
+                conn.execute(
+                    "INSERT INTO meta (k, v) VALUES ('json_migrated', '1')")
+                conn.commit()
+            except (OSError, json.JSONDecodeError):
+                conn.rollback()
+        else:
+            conn.commit()
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+def load_registry():
+    conn = _db()
+    try:
+        rows = conn.execute(
+            "SELECT local_path, data FROM entries").fetchall()
+        entries = {}
+        for p, d in rows:
+            try:
+                entries[p] = json.loads(d)
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return {"version": 3, "entries": entries}
+    finally:
+        conn.close()
 
 
 def save_registry(reg):
-    os.makedirs(os.path.dirname(REGISTRY_PATH), exist_ok=True)
-    tmp = REGISTRY_PATH + ".tmp"
+    conn = _db()
+    try:
+        stamp = now_stamp()
+        entries = reg.get("entries", {})
+        with conn:  # atomic transaction
+            conn.execute("DELETE FROM entries")
+            for p, e in entries.items():
+                conn.execute(
+                    "INSERT INTO entries (local_path, data, updated_at)"
+                    " VALUES (?, ?, ?)",
+                    (p, json.dumps(e), stamp))
+    finally:
+        conn.close()
+
+
+def registry_export_json(dest_path=None):
+    """Dump the sqlite registry back to the legacy JSON shape (backup/audit)."""
+    reg = load_registry()
+    dest = dest_path or (REGISTRY_PATH + ".export")
+    tmp = dest + ".tmp"
     with open(tmp, "w") as f:
-        json.dump(reg, f, indent=2, sort_keys=True)
+        json.dump({"version": 3, "entries": reg["entries"]},
+                  f, indent=2, sort_keys=True)
         f.write("\n")
-    os.replace(tmp, REGISTRY_PATH)
+    os.replace(tmp, dest)
+    return dest
 
 
 def log_action(text):
@@ -195,33 +295,85 @@ def log_action(text):
 
 
 # ---------------------------------------------------------------- commands
+def _dust_binary():
+    """Locate the dust binary (optional dependency for fast scans)."""
+    found = shutil.which("dust")
+    if found:
+        return found
+    known = os.path.join(WORKSPACE, "tools", "dust", "dust")
+    if os.path.isfile(known) and os.access(known, os.X_OK):
+        return known
+    return None
+
+
+def _parse_dust_size(s):
+    """Parse dust -j size strings like '2.1M', '272K', '512B' into bytes."""
+    import re
+    m = re.match(r"^\s*([\d.]+)\s*([BKMGTPE]?)\s*$", str(s).upper())
+    if not m:
+        return 0
+    num, unit = float(m.group(1)), m.group(2)
+    return int(num * {"": 1, "B": 1, "K": 1024, "M": 1024 ** 2,
+                      "G": 1024 ** 3, "T": 1024 ** 4, "P": 1024 ** 5,
+                      "E": 1024 ** 6}[unit])
+
+
+def _dust_largest(root):
+    """Fast path: dust -j JSON -> [(name, bytes)] for top-level entries.
+
+    Returns None when dust is missing or its output can't be parsed, so the
+    caller falls back to the stdlib walker. Never raises.
+    """
+    binary = _dust_binary()
+    if not binary:
+        return None
+    try:
+        proc = subprocess.run([binary, "-j", root], capture_output=True,
+                              text=True, timeout=300)
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return None
+        data = json.loads(proc.stdout)
+        children = data.get("children") or []
+        out = []
+        for child in children:
+            name = os.path.basename(child.get("name", ""))
+            size = _parse_dust_size(child.get("size", "0"))
+            if name:
+                out.append((name, size))
+        return out or None
+    except Exception:
+        return None
+
+
 def cmd_scan(as_json=False):
     pct, used, total = disk_usage_percent()
-    # largest top-level dirs in workspace
-    biggest = []
-    try:
-        with os.scandir(WORKSPACE) as it:
-            entries = [e for e in it]
-    except OSError:
-        entries = []
-    for e in entries:
+    # largest top-level dirs in workspace (dust fast path, stdlib fallback)
+    biggest = _dust_largest(WORKSPACE)
+    if biggest is None:
+        biggest = []
         try:
-            if e.is_dir(follow_symlinks=False):
-                tot = 0
-                for root, _, files in os.walk(e.path, followlinks=False):
-                    for fn in files:
-                        try:
-                            tot += os.lstat(os.path.join(root, fn)).st_size
-                        except OSError:
-                            pass
-                biggest.append((e.name, tot))
-            elif e.is_file(follow_symlinks=False):
-                try:
-                    biggest.append((e.name, os.lstat(e.path).st_size))
-                except OSError:
-                    pass
+            with os.scandir(WORKSPACE) as it:
+                entries = [e for e in it]
         except OSError:
-            pass
+            entries = []
+        for e in entries:
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    tot = 0
+                    for root, _, files in os.walk(e.path, followlinks=False):
+                        for fn in files:
+                            try:
+                                tot += os.lstat(os.path.join(root, fn)).st_size
+                            except OSError:
+                                pass
+                    biggest.append((e.name, tot))
+                elif e.is_file(follow_symlinks=False):
+                    try:
+                        biggest.append((e.name, os.lstat(e.path).st_size))
+                    except OSError:
+                        pass
+            except OSError:
+                pass
     biggest.sort(key=lambda x: x[1], reverse=True)
     report = {
         "disk_usage_percent": round(pct, 1),
@@ -408,7 +560,9 @@ def cmd_enforce(args):
     if report["over_ceiling"] or args.apply:
         print("--- reap phase ---")
         before = disk_usage_percent()[0]
-        rc = cmd_reap(args)
+        # v2 dispatcher: reaps github + terabox-live + kaggle entries.
+        # (v1 cmd_reap kept for backward compat; identical for github.)
+        rc = cmd_reap_v2(args)
         after = disk_usage_percent()[0]
         freed = before - after
         print(f"Disk: {before:.1f}% -> {after:.1f}%")
@@ -425,7 +579,7 @@ def cmd_registry(args):
     if args.json:
         print(json.dumps(reg, indent=2))
         return 0
-    print(f"Registry: {len(entries)} entries ({REGISTRY_PATH})")
+    print(f"Registry: {len(entries)} entries ({REGISTRY_DB_PATH})")
     for path, e in sorted(entries.items()):
         print(f"  [{e.get('status', '?')}] {path}")
         print(f"      -> {e.get('store')}:{e.get('repo')}@{e.get('release')}"
@@ -1204,11 +1358,38 @@ def cmd_verify_v2(args):
 
 
 def cmd_reap_v2(args):
-    """v2 reap: verify-then-delete across all store backends."""
+    """v2 reap: verify-then-delete across all store backends.
+
+    Every candidate additionally passes the owner's law engine
+    (clouddog.policy.laws.decide_delete). The gate can only BLOCK, never
+    approve: the live per-store verify_entry remains the proof of the
+    ONE-STORE RULE. Unattended runs never satisfy requires_owner.
+    """
+    if not _POLICY_AVAILABLE:
+        print("POLICY ENGINE UNAVAILABLE: clouddog.policy.laws failed to "
+              "import; reap disabled (fail-closed).", file=sys.stderr)
+        audit_log("reap_policy_unavailable")
+        return 1
     apply = args.apply
-    search_root = os.path.abspath(args.path) if args.path else None
-    reaped, skipped, failed = [], [], []
+    owner_approved = getattr(args, "owner_approved", False)
+    search_root = (os.path.abspath(args.path)
+                   if getattr(args, "path", "") else None)
+    reaped, skipped, failed, blocked = [], [], [], []
     for path, entry in reap_candidates(search_root):
+        claimed = [entry["store"]] if entry.get("store") else []
+        decision = decide_delete(path, verified_stores=claimed,
+                                 owner_approved=owner_approved)
+        # Gate blocks unless the laws allow AND any owner-approval
+        # requirement is satisfied by this run's --owner-approved flag.
+        # (requires_owner=True on an allowed decision merely records that
+        # approval was the basis — it must not block an approved run.)
+        if not decision.allowed or (decision.requires_owner
+                                    and not owner_approved):
+            reason = "; ".join(decision.reasons)
+            blocked.append((path, reason))
+            audit_log("reap_policy_block", path=path, store=entry.get("store"),
+                      detail=reason[:200])
+            continue
         ok, detail = verify_entry(entry, path)
         if not ok:
             failed.append((path, detail))
@@ -1240,9 +1421,11 @@ def cmd_reap_v2(args):
     total = sum(s for _, s in reaped)
     mode = "APPLY" if apply else "DRY-RUN"
     print(f"[{mode}] reaped={len(reaped)} ({human(total)}) "
-          f"failed-verify={len(failed)}")
+          f"failed-verify={len(failed)} blocked-policy={len(blocked)}")
     for path, detail in failed:
         print(f"  KEEP (unverified): {path} - {detail}")
+    for path, reason in blocked:
+        print(f"  BLOCKED (policy): {path} - {reason[:160]}")
     if apply and reaped:
         log_action(f"cloud_dog reap: {len(reaped)} files, {human(total)} freed")
         audit_log("reap_summary", count=len(reaped), bytes_freed=total)
@@ -1286,6 +1469,9 @@ def main(argv=None):
                    help="actually delete (default is dry-run)")
     p.add_argument("--path", default="",
                    help="only consider files under this directory")
+    p.add_argument("--owner-approved", action="store_true",
+                   help="owner approval for protected game files "
+                        "(NEVER-DELETE-GAME-FILES: unattended runs must omit)")
 
     p = sub.add_parser("enforce", help="full cycle: scan + reap")
     p.add_argument("--apply", action="store_true")

@@ -70,38 +70,38 @@ export default function App() {
   const [isDryRunModalOpen, setIsDryRunModalOpen] = useState(false);
   const [isCustomPathModalOpen, setIsCustomPathModalOpen] = useState(false);
 
-  // Dynamic disk usage: starts at 96.0% (Critical popup band breached)
-  const [diskUsagePct, setDiskUsagePct] = useState<number>(96.0);
+  // Dynamic disk usage: down from 100% to 81.0% (20GB free, popup band cleared)
+  const [diskUsagePct, setDiskUsagePct] = useState<number>(81.0);
 
   const [notification, setNotification] = useState<{ message: string; type: 'success' | 'info' | 'error' } | null>({
-    message: 'CRITICAL ALERT: Disk at 96.0% (Popup band breached). Scooby lane reaper active: 670/717 blobs verified, local chunks deleting on the spot.',
-    type: 'error',
+    message: 'DISK DOWN TO 81.0% (20GB Free) — Popup band cleared! Scooby 717/717 verified (+2.5GB), Small files 55/55 verified (+762MB), Western-heart #231 GREEN.',
+    type: 'success',
   });
 
   // Terminal log state
   const [logs, setLogs] = useState<TerminalEntry[]>([
     {
       id: 'init-1',
-      timestamp: '09:32:00',
-      command: 'muse-assist reaper --lane scooby --status',
+      timestamp: '11:36:00',
+      command: 'cloud_dog scan && cloud_dog enforce',
       output: [
-        '⚠️ DISK USAGE: 96.0% (CRITICAL POPUP BAND BREACHED)',
-        'Scooby Lane: 670 of 717 blobs uploaded to GitHub.',
-        'Stream Reaper: Local chunks deleting on the spot as hashes verify.',
-        'Watchdog Loop: Nursing final commit step (47 blobs to go).',
-        'Queued to clear as uploads land: ~12.0 GB (DOA4 tars, DXMMII, MP4s, Scooby chunks).',
+        '✅ DISK USAGE: 81.0% (DOWN FROM 100% / 98% / 87.9%) — 20GB FREE.',
+        'Scooby Lane: 717 of 717 blobs verified on GitHub. Local source cleared (+2.5GB).',
+        'Small Files Team: 55 files stored on GitHub & verified (+762MB cleared).',
+        'Western-heart #231: GREEN and mergeable (54k-file restore PR passed all checks).',
+        'CloudDog v2: Merged & active in guardian every 10 min. All tests green.',
       ],
-      type: 'warning',
+      type: 'info',
     },
     {
       id: 'init-2',
-      timestamp: '09:32:45',
-      command: 'muse-assist watchdog --audit-night-loop',
+      timestamp: '11:37:44',
+      command: 'python3 -m pytest test_cloud_dog.py',
       output: [
-        'Watchdog scheduler proof: runs executed all night at 7:24, 7:54, 8:04, 8:34, 9:04, 9:24.',
-        'Cleared: 11G dead download dir, 445 Space Ghost files, Gumball parts, partial chunks.',
-        'Flight-assist pass finished: 8.4GB cleared.',
-        'Current bottleneck: In-flight downloads landing faster than uploads finish across proxy.',
+        'CloudDog v2 Engine: 24/24 tests PASSED (100% green).',
+        'Backends: GitHub Releases API, TeraBox live ls check, Kaggle REST view.',
+        'Daemon mode & Torrent mirror mode verified. Zero-leak memory invariant active.',
+        'Ceiling target: Enforcing descent to < 75.0% NO-LOCAL-CLUTTER threshold.',
       ],
       type: 'info',
     },

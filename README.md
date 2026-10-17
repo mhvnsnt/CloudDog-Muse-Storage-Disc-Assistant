@@ -1,13 +1,28 @@
 # Cloud Dog — Muse Storage Disc Assistant
 
-Real disk-hygiene engine for the Muse VM. Not a dashboard mockup — a working
-CLI that enforces the owner's standing law:
+Real disk-hygiene tooling for the Muse VM. Not a dashboard mockup — working
+code that enforces the owner's standing law:
 
 > **NO-LOCAL-CLUTTER LAW:** Disk is a cache, not storage. Everything goes to
 > TeraBox, Drive, Kaggle, or GitHub — then clears local. All agents, all
 > chats, every lane. Disk stays under 75%.
 
-## How it works
+This repo holds three complementary pieces:
+
+1. **`cloud_dog.py`** — the stdlib-only verify-then-delete CLI (live engine,
+   wired into the disk-space-guardian cron).
+2. **`clouddog/`** — the full Python engine package: multi-store backends
+   (TeraBox / GitHub releases / Drive), the disk laws as code, audit
+   journal, daemon mode, tests + CI. Extends `cloud_dog.py`, never replaces
+   it.
+3. **`src/` dashboard + spark scripts** — the Vite/React UI companion and
+   lane helper scripts.
+
+---
+
+## 1. `cloud_dog.py` — disk-hygiene engine
+
+### How it works
 
 1. **Scan** — reports disk usage % and the largest consumers in `~/workspace`.
 2. **Register** — a lane records a file as verified on a permanent store
@@ -22,7 +37,7 @@ CLI that enforces the owner's standing law:
 
 Default mode is **dry-run**. Nothing is deleted unless `--apply` is passed.
 
-## Usage
+### Usage
 
 ```bash
 # disk status
@@ -66,7 +81,7 @@ python3 cloud_dog.py daemon --interval 600
 python3 cloud_dog.py daemon --interval 600 --apply   # real deletes
 ```
 
-## State
+### State
 
 - Registry: `~/workspace/agent-ops/cloud-dog-registry.json`
 - Action log: `~/workspace/agent-ops/disk-cleanup-log.md` (append-only)
@@ -86,7 +101,7 @@ TeraBox auto-verify is allowed ONLY when `.creds.json` exists AND the live
 `ls` succeeds. Otherwise the entry stays unverified until a manual live
 check — the registry claim alone is never proof.
 
-## Wiring
+### Wiring
 
 The `disk-space-guardian` cron (every 10 min) calls:
 
@@ -107,7 +122,7 @@ Standalone alternative (no cron): `python3 cloud_dog.py daemon --interval 600 [-
 - One-store rule: verified 100% on GitHub OR TeraBox OR Kaggle = safe to clear.
 - Every deletion is logged with its backup location (markdown log + JSON audit journal).
 
-## Requirements
+### Requirements
 
 Python 3.8+, stdlib only. `gh` CLI required for GitHub verification.
 TeraBox needs `~/workspace/tools/terabox-uploader/.creds.json` (one-time
@@ -210,6 +225,67 @@ API contract: `dashboard/API.md`.
 ---
 
 ## Spark-app dashboard & scripts (2026-10-17)
+
+---
+
+## 2. `clouddog/` — policy engine, Drive store, config, bridge (Python)
+
+Library package that EXTENDS the `cloud_dog.py` v2 engine (which owns the
+CLI, the GitHub/TeraBox/Kaggle backends, daemon and mirror modes, and the
+audit journal). This package adds the pieces v2 does not have:
+
+- **`clouddog.policy`** — the owner's disk laws as importable, tested
+  code: protected game-file matching, in-progress transfer detection, the
+  ONE-STORE decision engine (`decide_delete`), and approval gates.
+- **`clouddog.stores`** — the importable `Store` interface plus the Drive
+  backend (via rclone).
+- **`clouddog.config`** — validated YAML configuration.
+- **`clouddog.bridge`** — folds `cloud_dog.py`'s registry into the v2
+  audit journal (`registry-import` events), so there is one audit trail.
+
+```bash
+pip install -e ".[dev]"
+python3 -m pytest tests/ -q
+```
+
+```python
+from clouddog.policy import laws
+d = laws.decide_delete("/home/hatch/workspace/game.iso",
+                       verified_stores=["github"], owner_approved=False)
+# Decision(allowed=False, requires_owner=True, reasons=[...])
+```
+
+Docs:
+
+- `docs/DESIGN.md` — architecture, the policy rule order, safety invariants
+- `docs/LAWS.md` — the owner's disk laws, quoted verbatim, with how each is encoded
+- `docs/OPERATIONS.md` — install, config reference, policy/Drive/bridge
+  usage, tests, and what this package does not do
+- `docs/PULL-LOG.md` — every open-source project surveyed: what was pulled
+  in, what was excluded and why, plus v2 candidates
+
+Safety contract: this package never deletes anything — `decide_delete`
+only *decides*; in-progress work is refused with no override; protected
+game files require owner approval AND a verified store; secrets are
+redacted from every store error.
+
+## 3. Web dashboard (Vite/React scaffold)
+
+This repo also contains the CloudDog web dashboard scaffold: a Vite +
+React + TypeScript UI for visualizing storage state (`src/`). Components
+include a storage overview, clutter table, daemon scheduler panel, dry-run
+modal, relocation wizard, repo explorer, terminal simulator, torrent/cloud
+mirror panel, compute offload panel, emergency reaper center, and an agent
+memory broadcast view, backed by mock data in `src/data/`.
+
+```bash
+npm install
+npm run dev
+```
+
+---
+
+## 4. Spark-app dashboard & scripts (2026-10-17)
 
 The `src/` dashboard (Vite + React + Tailwind) and the helper scripts below
 came from the spark/Gemini build of "Muse Storage Disc Assist". Installed
