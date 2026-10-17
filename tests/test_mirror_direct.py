@@ -33,7 +33,7 @@ def test_split_file_to_parts_round_trip(tmp_path):
         str(src), staging, part_bytes=part_bytes, chunk=256 << 10))
 
     assert len(parts) == 3
-    idxs, sizes, digests = zip(
+    idxs, sizes, _digests = zip(
         *[(p[0], p[2], p[3]) for p in parts])
     assert list(idxs) == [0, 1, 2]
     assert sum(sizes) == len(data)
@@ -45,7 +45,8 @@ def test_split_file_to_parts_round_trip(tmp_path):
     # reassembled content is byte-identical; per-part digests verify
     reassembled = b""
     for idx, ppath, size, digest in parts:
-        blob = open(ppath, "rb").read()
+        with open(ppath, "rb") as f:
+            blob = f.read()
         assert len(blob) == size
         assert hashlib.sha256(blob).hexdigest() == digest
         reassembled += blob
@@ -64,7 +65,11 @@ def test_split_file_to_parts_exact_multiple(tmp_path):
 
     assert len(parts) == 2
     assert sum(p[2] for p in parts) == len(data)
-    assert b"".join(open(p[1], "rb").read() for p in parts) == data
+    body = b""
+    for p in parts:
+        with open(p[1], "rb") as f:
+            body += f.read()
+    assert body == data
 
 
 def test_split_file_to_parts_hasher_factory(tmp_path):
