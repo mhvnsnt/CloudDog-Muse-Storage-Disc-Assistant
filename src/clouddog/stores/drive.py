@@ -127,7 +127,7 @@ class DriveBackend(StoreBackend):
                 extra={"dry_run": True},
             )
 
-        if shutil.which("rclone") is None:
+        if self._rclone_bin() is None:
             raise StoreDegraded(self.name, "rclone not installed")
 
         proc = self._run_rclone(["copyto", local_path, target, "--checksum"])

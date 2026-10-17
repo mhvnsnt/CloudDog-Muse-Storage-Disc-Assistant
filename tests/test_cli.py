@@ -430,3 +430,116 @@ def test_dashboard_missing_module_returns_3(monkeypatch, capsys):
 
     assert rc == 3
     assert "dashboard" in capsys.readouterr().err.lower()
+
+
+# ------------------------------------------------------- external tools
+
+def test_find_tool_prefers_managed_install(monkeypatch, tmp_path):
+    import clouddog.cli as cli_mod
+
+    fake_bin = tmp_path / "dust"
+    fake_bin.write_text("#!/bin/sh\n")
+    fake_bin.chmod(0o755)
+    monkeypatch.setitem(cli_mod.MANAGED_TOOLS, "dust", str(fake_bin))
+    monkeypatch.setattr(cli_mod.shutil, "which", lambda _n: None)
+
+    assert cli_mod.find_tool("dust") == str(fake_bin)
+
+
+def test_find_tool_missing_returns_none(monkeypatch):
+    import clouddog.cli as cli_mod
+
+    monkeypatch.setitem(cli_mod.MANAGED_TOOLS, "nosuchtool", "/nonexistent/x")
+    monkeypatch.setattr(cli_mod.shutil, "which", lambda _n: None)
+
+    assert cli_mod.find_tool("nosuchtool") is None
+
+
+def test_du_missing_tool_returns_3(monkeypatch, capsys):
+    import clouddog.cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "find_tool", lambda _n: None)
+
+    rc = main(["du", "--path", "/tmp"])
+    assert rc == 3
+    assert "dust" in capsys.readouterr().err.lower()
+
+
+def test_du_runs_dust(monkeypatch):
+    import clouddog.cli as cli_mod
+    import subprocess as sp
+
+    calls = []
+
+    class FakeProc:
+        returncode = 0
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(cli_mod, "find_tool", lambda _n: "/fake/dust")
+    monkeypatch.setattr(cli_mod.subprocess, "run", fake_run)
+
+    rc = main(["du", "--path", "/tmp", "--depth", "2"])
+    assert rc == 0
+    assert calls[0][:3] == ["/fake/dust", "-d", "2"]
+
+
+def test_dedupe_reports_groups_and_never_deletes(monkeypatch, capsys, tmp_path):
+    import clouddog.cli as cli_mod
+
+    payload = {
+        "groups": [
+            {"file_len": 2000, "file_hash": "abc",
+             "files": ["/a/x.bin", "/b/x.bin"]},
+            {"file_len": 100, "file_hash": "def",
+             "files": ["/a/y.bin"]},  # single file -> not a group
+        ]
+    }
+
+    class FakeProc:
+        returncode = 0
+        stdout = json.dumps(payload)
+        stderr = ""
+
+    seen = []
+
+    def fake_run(cmd, **kwargs):
+        seen.append(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(cli_mod, "find_tool", lambda _n: "/fake/fclones")
+    monkeypatch.setattr(cli_mod.subprocess, "run", fake_run)
+
+    rc = main(["--journal", str(tmp_path / "audit.jsonl"),
+               "dedupe", "--path", "/tmp", "--json"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["wasted_bytes"] == 2000
+    assert len(out["groups"]) == 1
+    assert out["groups"][0]["count"] == 2
+    # report only: the fclones command has no delete/remove flag
+    assert not any("delete" in c or "remove" in c for c in seen[0])
+
+
+def test_dedupe_dict_style_files_parsed(monkeypatch, capsys, tmp_path):
+    import clouddog.cli as cli_mod
+
+    payload = {"groups": [{"file_len": 50, "files": [{"path": "/a/1"},
+                                                     {"path": "/b/1"}]}]}
+
+    class FakeProc:
+        returncode = 0
+        stdout = json.dumps(payload)
+        stderr = ""
+
+    monkeypatch.setattr(cli_mod, "find_tool", lambda _n: "/fake/fclones")
+    monkeypatch.setattr(cli_mod.subprocess, "run",
+                        lambda cmd, **kw: FakeProc())
+
+    rc = main(["--journal", str(tmp_path / "audit.jsonl"),
+               "dedupe", "--path", "/tmp", "--json"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert len(out["groups"]) == 1

@@ -28,6 +28,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -56,6 +57,10 @@ GH_TIMEOUT_S = 30
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# In-flight sweep jobs: job_id -> {status, started, dry_run, report, error}.
+_SWEEP_JOBS: dict = {}
 
 
 def _send_json(handler: BaseHTTPRequestHandler, obj: object, status: int = 200) -> None:
@@ -144,10 +149,11 @@ def _sha256_file(path: str) -> str:
 # --------------------------------------------------------------------------
 
 def _disk_info() -> dict:
-    usage = shutil.disk_usage("/")
+    # The data volume is /home/hatch (100G); "/" is a different mount.
+    usage = shutil.disk_usage(os.path.expanduser("/home/hatch"))
     pct = round(usage.used / usage.total * 100, 2) if usage.total else 0.0
     return {
-        "path": "/",
+        "path": "/home/hatch",
         "total_bytes": usage.total,
         "used_bytes": usage.used,
         "free_bytes": usage.free,
@@ -389,7 +395,59 @@ def _lanes() -> list:
                 "note": "; ".join(note_parts) if note_parts else None,
             }
         )
+    lanes.extend(_cloud_dog_registry_lane())
     return lanes
+
+
+def _cloud_dog_registry_lane() -> list:
+    """Surface cloud_dog.py's registry (the single-file engine) in the lanes
+    view. Read-only; never modifies the registry. Returns [] when absent."""
+    reg_path = os.path.join(
+        os.path.expanduser("~/workspace"), "agent-ops", "cloud-dog-registry.json"
+    )
+    try:
+        with open(reg_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    entries = data.get("entries", {}) if isinstance(data, dict) else {}
+    if not entries:
+        return [{
+            "lane": "cloud-dog:registry",
+            "manifest_path": reg_path,
+            "uploaded": 0,
+            "total": 0,
+            "pct": None,
+            "alive": None,
+            "log_tail": [],
+            "log_path": None,
+            "note": "cloud_dog.py registry present, 0 entries",
+        }]
+    by_status: dict[str, int] = {}
+    total_bytes = 0
+    for e in entries.values():
+        if not isinstance(e, dict):
+            continue
+        by_status[e.get("status", "unknown")] = by_status.get(e.get("status", "unknown"), 0) + 1
+        try:
+            total_bytes += int(e.get("size", 0) or 0)
+        except (ValueError, TypeError):
+            pass
+    verified = by_status.get("verified", 0) + by_status.get("reaped", 0)
+    total = len(entries)
+    return [{
+        "lane": "cloud-dog:registry",
+        "manifest_path": reg_path,
+        "uploaded": verified,
+        "total": total,
+        "pct": round(verified / total * 100, 1) if total else None,
+        "alive": None,
+        "log_tail": [],
+        "log_path": None,
+        "note": "from cloud_dog.py registry: "
+                + ", ".join(f"{k}={v}" for k, v in sorted(by_status.items()))
+                + f"; {total_bytes} bytes tracked",
+    }]
 
 
 # --------------------------------------------------------------------------
@@ -755,6 +813,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._handle_policy_scan(query)
             elif path == "/api/lanes":
                 _send_json(self, _lanes())
+            elif path == "/api/sweep/status":
+                self._handle_sweep_status()
             elif path == "/api/audit":
                 self._handle_audit(query)
             elif path == "/api/repos":
@@ -1083,6 +1143,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             _send_json(self, {"ok": True, "result": report})
 
     def _handle_sweep(self) -> None:
+        # Async: a full-workspace tick takes minutes; run it in a background
+        # thread and return a job id immediately. Poll /api/sweep/status.
         body, err = _read_json_body(self)
         if err:
             _send_error(self, err, 400)
@@ -1092,20 +1154,41 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if merr:
             _send_error(self, merr, 503)
             return
-        try:
-            if hasattr(mod, "Daemon"):
-                daemon = mod.Daemon(
-                    roots=[os.path.expanduser("~/workspace")], dry_run=dry_run
-                )
-                report = _report_to_dict(daemon.tick())
-            else:
-                report = mod.tick(
-                    roots=[os.path.expanduser("~/workspace")], dry_run=dry_run
-                )
-        except Exception as exc:  # noqa: BLE001
-            _send_error(self, f"daemon tick failed: {exc}", 500)
+        job_id = "sweep-%d" % int(time.time() * 1000)
+        _SWEEP_JOBS[job_id] = {"status": "running", "started": _utcnow(),
+                               "dry_run": dry_run, "report": None,
+                               "error": None}
+
+        def _run():
+            try:
+                if hasattr(mod, "Daemon"):
+                    daemon = mod.Daemon(
+                        roots=[os.path.expanduser("~/workspace")],
+                        dry_run=dry_run,
+                    )
+                    report = _report_to_dict(daemon.tick())
+                else:
+                    report = mod.tick(
+                        roots=[os.path.expanduser("~/workspace")],
+                        dry_run=dry_run,
+                    )
+                _SWEEP_JOBS[job_id].update({"status": "done", "report": report})
+            except Exception as exc:  # noqa: BLE001
+                _SWEEP_JOBS[job_id].update({"status": "error",
+                                            "error": str(exc)[:500]})
+
+        threading.Thread(target=_run, daemon=True).start()
+        _send_json(self, {"ok": True, "job_id": job_id, "status": "running"},
+                   status=202)
+
+    def _handle_sweep_status(self) -> None:
+        query = urllib.parse.urlparse(self.path).query
+        job_id = urllib.parse.parse_qs(query).get("job", [None])[0]
+        job = _SWEEP_JOBS.get(job_id) if job_id else None
+        if job is None:
+            _send_error(self, "unknown sweep job", 404)
             return
-        _send_json(self, {"ok": True, "report": report})
+        _send_json(self, {"ok": True, "job_id": job_id, **job})
 
     def _handle_daemon_install(self) -> None:
         body, err = _read_json_body(self)

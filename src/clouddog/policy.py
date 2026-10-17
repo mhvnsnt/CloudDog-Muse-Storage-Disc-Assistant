@@ -193,6 +193,12 @@ def evaluate(path: str, scan_root: str | None = None) -> Decision:
     over everything, then NEVER-DELETE-GAME-FILES, then KEEP_LOCAL (tooling /
     hot small files), then the size-based default.
     """
+    if not path or not str(path).strip():
+        return Decision(
+            Action.KEEP_LOCAL,
+            None,
+            "keep_local: empty path; never act on what you cannot see",
+        )
     p = Path(path)
     info = _stat_info(p)
     if info is None:

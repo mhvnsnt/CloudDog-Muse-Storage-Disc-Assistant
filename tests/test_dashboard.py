@@ -67,7 +67,9 @@ def test_health(base_url):
 def test_disk_matches_shutil(base_url):
     status, body = get(base_url, "/api/disk")
     assert status == 200
-    usage = shutil.disk_usage("/")
+    # The data volume is /home/hatch, not "/" (different mount on this VM).
+    usage = shutil.disk_usage(os.path.expanduser("/home/hatch"))
+    assert body["path"] == os.path.expanduser("/home/hatch")
     assert body["total_bytes"] == usage.total
     assert body["used_bytes"] == usage.used
     assert body["free_bytes"] == usage.free
@@ -228,3 +230,27 @@ def test_relocate_dry_run_touches_nothing(base_url, tmp_path):
         assert body["ok"] is False
         assert body["error"]
     assert src.is_dir()  # dry_run must never delete
+
+
+def test_sweep_returns_job_immediately(base_url):
+    # Sweep must not block: 202 + job id, pollable via /api/sweep/status.
+    import urllib.request
+
+    data = json.dumps({"dry_run": True}).encode()
+    req = urllib.request.Request(
+        base_url + "/api/sweep", data=data,
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=30) as r:
+        assert r.status == 202
+        body = json.loads(r.read())
+    assert body["ok"] is True
+    assert body["status"] == "running"
+    job_id = body["job_id"]
+
+    status, st = get(base_url, f"/api/sweep/status?job={job_id}")
+    assert status == 200
+    assert st["job_id"] == job_id
+    assert st["status"] in ("running", "done", "error")
+
+    status, _ = get(base_url, "/api/sweep/status?job=nope")
+    assert status == 404

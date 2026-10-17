@@ -389,6 +389,10 @@ def patch_drive(monkeypatch, which, run):
     monkeypatch.setattr(
         "clouddog.stores.drive.MANAGED_RCLONE_BIN", "/nonexistent/rclone"
     )
+    # Hide the CloudDog-managed install so `which` fully controls resolution.
+    monkeypatch.setattr(
+        "clouddog.stores.drive.MANAGED_RCLONE_BIN", "/nonexistent/rclone"
+    )
 
 
 # ---------------------------------------------------------------------- #

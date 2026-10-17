@@ -217,9 +217,29 @@ async function runSweep() {
     method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({ dry_run: document.getElementById("sweep-dry").checked })
   });
+  if (status >= 400 || !body.ok) {
+    setOut("reaper-out", `<div class="sub">engine sweep (not the live disk-space-guardian)</div>` + errHtml(body));
+    return;
+  }
+  // Async sweep: poll for completion.
+  const jobId = body.job_id;
   setOut("reaper-out", `<div class="sub">engine sweep (not the live disk-space-guardian)</div>` +
-    (status >= 400 || !body.ok ? errHtml(body)
-      : `<div class="ok">sweep ok</div><pre class="out">${esc(JSON.stringify(body.report, null, 2))}</pre>`));
+    `<div class="ok">sweep started — polling job ${esc(jobId)}…</div>`);
+  for (let i = 0; i < 120; i++) {
+    await new Promise(r => setTimeout(r, 5000));
+    const poll = await api(`/api/sweep/status?job=${encodeURIComponent(jobId)}`);
+    const st = poll.body;
+    if (!st.ok || st.status === "error") {
+      setOut("reaper-out", errHtml(st));
+      return;
+    }
+    if (st.status === "done") {
+      setOut("reaper-out", `<div class="sub">engine sweep (not the live disk-space-guardian)</div>` +
+        `<div class="ok">sweep ok</div><pre class="out">${esc(JSON.stringify(st.report, null, 2))}</pre>`);
+      return;
+    }
+  }
+  setOut("reaper-out", `<div class="warn">sweep still running after 10 min — job ${esc(jobId)} continues in background</div>`);
 }
 
 /* ---------- Broadcast ---------- */

@@ -1,6 +1,6 @@
 """CloudDog command-line interface.
 
-Subcommands: scan, store, reap, daemon, verify, dashboard.
+Subcommands: scan, store, reap, daemon, verify, dashboard, du, dedupe.
 
 Global flags:
   --dry-run   no destructive action anywhere (store/reap/daemon all honor it)
@@ -18,6 +18,8 @@ import argparse
 import dataclasses
 import json
 import os
+import shutil
+import subprocess
 import sys
 from datetime import datetime, timezone
 
@@ -25,6 +27,22 @@ from clouddog.errors import CloudDogError
 
 DEFAULT_JOURNAL = os.path.expanduser("~/.clouddog/audit.jsonl")
 TIERS = ("github", "terabox", "drive")
+
+# CloudDog-managed open-source tool installs (pulled in 2026-10-17).
+TOOLS_DIR = os.path.expanduser("~/workspace/tools")
+MANAGED_TOOLS = {
+    "dust": os.path.join(TOOLS_DIR, "dust", "dust"),       # disk visualization
+    "fclones": os.path.join(TOOLS_DIR, "fclones", "fclones"),  # duplicate finder
+    "rclone": os.path.join(TOOLS_DIR, "rclone", "rclone"),  # multi-cloud (drive backend)
+}
+
+
+def find_tool(name: str) -> str | None:
+    """Resolve an external tool: managed install first, then PATH."""
+    managed = MANAGED_TOOLS.get(name)
+    if managed and os.path.isfile(managed) and os.access(managed, os.X_OK):
+        return managed
+    return shutil.which(name)
 
 
 # ---------------------------------------------------------------- helpers
@@ -315,6 +333,84 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- external tools
+
+
+def cmd_du(args: argparse.Namespace) -> int:
+    """Visual disk usage via `dust` (pulled in 2026-10-17). Read-only."""
+    exe = find_tool("dust")
+    if exe is None:
+        print("[clouddog] dust not found. Install: see README 'Open-source "
+              "tooling' section.", file=sys.stderr)
+        return 3
+    cmd = [exe, "-d", str(args.depth), args.path]
+    try:
+        proc = subprocess.run(cmd, timeout=300)
+    except subprocess.TimeoutExpired:
+        print("[clouddog] dust timed out", file=sys.stderr)
+        return 3
+    except OSError as exc:
+        print(f"[clouddog] dust failed: {exc}", file=sys.stderr)
+        return 3
+    return proc.returncode
+
+
+def cmd_dedupe(args: argparse.Namespace) -> int:
+    """Find duplicate files via `fclones` (pulled in 2026-10-17).
+
+    REPORT ONLY — never deletes. Duplicate groups are candidates for the
+    normal store -> verify -> clear flow.
+    """
+    exe = find_tool("fclones")
+    if exe is None:
+        print("[clouddog] fclones not found. Install: see README "
+              "'Open-source tooling' section.", file=sys.stderr)
+        return 3
+    cmd = [exe, "group", "--format", "json", "--min", args.min_size, args.path]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        print("[clouddog] fclones timed out", file=sys.stderr)
+        return 3
+    except OSError as exc:
+        print(f"[clouddog] fclones failed: {exc}", file=sys.stderr)
+        return 3
+    if proc.returncode != 0:
+        print(f"[clouddog] fclones error: {proc.stderr.strip()[:300]}",
+              file=sys.stderr)
+        return 3
+    try:
+        data = json.loads(proc.stdout)
+    except ValueError:
+        print("[clouddog] fclones returned unparseable JSON", file=sys.stderr)
+        return 3
+    groups = []
+    wasted = 0
+    for g in data.get("groups", []):
+        raw_files = g.get("files", []) or []
+        files = [f if isinstance(f, str) else f.get("path")
+                 for f in raw_files]
+        files = [f for f in files if f]
+        size = int(g.get("file_len", 0) or 0)
+        if len(files) > 1 and size > 0:
+            groups.append({"size": size, "count": len(files), "files": files})
+            wasted += size * (len(files) - 1)
+    groups.sort(key=lambda g: g["size"] * g["count"], reverse=True)
+    if args.json:
+        print(json.dumps({"groups": groups, "wasted_bytes": wasted,
+                          "path": args.path}, indent=2))
+    else:
+        print(f"[clouddog] {len(groups)} duplicate groups, "
+              f"~{wasted / 1e9:.2f} GB reclaimable (report only, nothing deleted)")
+        for g in groups[:20]:
+            print(f"  {g['size'] / 1e6:.1f} MB x{g['count']}: {g['files'][0]}")
+            for f in g["files"][1:4]:
+                print(f"      = {f}")
+    _journal(_get_journal(args.journal), "skipped", args.path, wasted,
+             "dedupe-report", f"{len(groups)} duplicate groups found")
+    return 0
+
+
 # ---------------------------------------------------------------- parser / entry
 
 def _add_common_flags(sp: argparse.ArgumentParser) -> None:
@@ -398,6 +494,21 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_flags(db)
     db.add_argument("--port", type=int, default=8899)
     db.set_defaults(func=cmd_dashboard)
+
+    du = sub.add_parser("du", help="visual disk usage via dust (read-only)")
+    _add_common_flags(du)
+    du.add_argument("--path", required=True, help="root path to visualize")
+    du.add_argument("--depth", type=int, default=1,
+                    help="tree depth (default 1)")
+    du.set_defaults(func=cmd_du)
+
+    dd = sub.add_parser("dedupe",
+                        help="find duplicate files via fclones (report only)")
+    _add_common_flags(dd)
+    dd.add_argument("--path", required=True, help="root path to scan")
+    dd.add_argument("--min-size", default="1M",
+                    help="minimum file size to consider (default 1M)")
+    dd.set_defaults(func=cmd_dedupe)
 
     return p
 

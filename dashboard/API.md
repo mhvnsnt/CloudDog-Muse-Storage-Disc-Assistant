@@ -30,7 +30,8 @@ Security rules (all enforced server-side):
 | POST | /api/store | {path, tier, remote_ref, dry_run} | {ok, stored:{...} or dry_run preview} |
 | POST | /api/verify | {path, stored} | {ok, match, detail} |
 | POST | /api/reap | {manifest, src_dir, dry_run} | {ok, reaped, freed_bytes, mismatches, halted} — one reaper pass |
-| POST | /api/sweep | {dry_run} | {ok, report} — ONE clouddog daemon tick (the engine's own loop). This is NOT the live disk-space-guardian; label it as such in the UI. |
+| POST | /api/sweep | {dry_run} | {ok, job_id, status:"running"} — 202 immediately; the tick runs in background. Poll below. |
+| GET | /api/sweep/status | ?job=<id> | {ok, job_id, status: running\|done\|error, report?, error?} |
 | GET | /api/audit | ?limit=100 | [{ts, kind, path, size, locator, note}] — real audit journal |
 | POST | /api/daemon/install | {os: linux\|macos\|windows, interval_minutes} | {ok, filename, content} — REAL generated config: systemd timer+service (linux), LaunchAgent plist (macos), Task Scheduler PS1 (windows), running `clouddog daemon --interval N` |
 | GET | /api/repos | ?owner=mhvnsnt | [{name, description}] via `gh api` |
