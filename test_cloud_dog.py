@@ -305,11 +305,11 @@ def test_kaggle_request_sends_basic_auth():
 
 
 def test_verify_kaggle_entry_found_and_sized():
-    def fake_view(owner_slug):
-        return True, {"files": [
-            {"ref": "u/ds/a.bin", "name": "a.bin", "totalBytes": 500},
+    def fake_list(owner_slug):
+        return True, {"datasetFiles": [
+            {"name": "a.bin", "totalBytes": 500},
         ]}
-    old = _patch(cloud_dog, "kaggle_dataset_view", fake_view)
+    old = _patch(cloud_dog, "kaggle_dataset_list_files", fake_list)
     try:
         e = {"dataset": "u/ds", "asset": "a.bin", "size": 500}
         ok, detail = cloud_dog.verify_kaggle_entry(e, "/tmp/a.bin")
@@ -321,7 +321,67 @@ def test_verify_kaggle_entry_found_and_sized():
         ok, detail = cloud_dog.verify_kaggle_entry(e3, "/tmp/a.bin")
         assert ok is False and "not found" in detail
     finally:
-        _patch(cloud_dog, "kaggle_dataset_view", old)
+        _patch(cloud_dog, "kaggle_dataset_list_files", old)
+
+
+def test_verify_kaggle_entry_live_readonly():
+    """Live read-only check against a real dataset (no writes)."""
+    e = {"dataset": "marsfmmg/cj-living-room-setup",
+         "asset": "dvd_stack_ref.png", "size": 4848}
+    ok, detail = cloud_dog.verify_kaggle_entry(e, "/tmp/dvd_stack_ref.png")
+    assert ok is True and "verified" in detail, detail
+    e2 = {"dataset": "marsfmmg/cj-living-room-setup",
+          "asset": "does-not-exist.bin"}
+    ok, detail = cloud_dog.verify_kaggle_entry(e2, "/tmp/x.bin")
+    assert ok is False and "not found" in detail
+
+
+def test_kaggle_dataset_upload_new_no_cli():
+    old_which = _patch(cloud_dog.shutil, "which", lambda *a, **k: None)
+    old_isfile = _patch(cloud_dog.os.path, "isfile", lambda p: False)
+    try:
+        ok, detail = cloud_dog.kaggle_dataset_upload_new(
+            "u", "someslug", "Some Title", "/tmp/x.zip")
+        assert ok is False and "kaggle CLI not found" in detail
+    finally:
+        _patch(cloud_dog.shutil, "which", old_which)
+        _patch(cloud_dog.os.path, "isfile", old_isfile)
+
+
+def test_kaggle_dataset_upload_new_validates():
+    old = _patch(cloud_dog.shutil, "which", lambda *a, **k: "/usr/bin/kaggle")
+    try:
+        ok, detail = cloud_dog.kaggle_dataset_upload_new(
+            "u", "abc", "Some Title", "/tmp/x.zip")
+        assert ok is False and "6-50 chars" in detail
+        ok, detail = cloud_dog.kaggle_dataset_upload_new(
+            "u", "validslug", "x", "/tmp/x.zip")
+        assert ok is False and "6-50 chars" in detail
+        ok, detail = cloud_dog.kaggle_dataset_upload_new(
+            "u", "validslug", "Valid Title", "/tmp/does-not-exist.zip")
+        assert ok is False and "not found" in detail
+    finally:
+        _patch(cloud_dog.shutil, "which", old)
+
+
+def test_kaggle_dataset_upload_new_cli_success():
+    import tempfile
+    old_which = _patch(cloud_dog.shutil, "which", lambda *a, **k: "/usr/bin/kaggle")
+    old_run = _patch(cloud_dog, "run",
+                     lambda cmd, timeout=60: (0, "Dataset URL: ...", ""))
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as f:
+            f.write(b"PK fake")
+            zp = f.name
+        try:
+            ok, detail = cloud_dog.kaggle_dataset_upload_new(
+                "marsfmmg", "testslug123", "Test Title Here", zp)
+            assert ok is True and "marsfmmg/testslug123" in detail
+        finally:
+            os.unlink(zp)
+    finally:
+        _patch(cloud_dog.shutil, "which", old_which)
+        _patch(cloud_dog, "run", old_run)
 
 
 def test_verify_entry_dispatches_on_store():
