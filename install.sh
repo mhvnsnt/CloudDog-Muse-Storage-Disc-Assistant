@@ -16,8 +16,8 @@ if [ -f "${SCRIPT_DIR}/cloud_dog.py" ]; then
   chmod +x "${INSTALL_DIR}/cloud_dog" "${INSTALL_DIR}/muse-assist"
 else
   # Remote curl installation fallback
-  curl -fsSL https://raw.githubusercontent.com/muse-community/muse-storage-disc-assist/main/cloud_dog.py -o "${INSTALL_DIR}/cloud_dog"
-  curl -fsSL https://raw.githubusercontent.com/muse-community/muse-storage-disc-assist/main/muse-assist.sh -o "${INSTALL_DIR}/muse-assist"
+  curl -fsSL https://raw.githubusercontent.com/mhvnsnt/CloudDog-Muse-Storage-Disc-Assistant/main/cloud_dog.py -o "${INSTALL_DIR}/cloud_dog"
+  curl -fsSL https://raw.githubusercontent.com/mhvnsnt/CloudDog-Muse-Storage-Disc-Assistant/main/muse-assist.sh -o "${INSTALL_DIR}/muse-assist"
   chmod +x "${INSTALL_DIR}/cloud_dog" "${INSTALL_DIR}/muse-assist"
 fi
 
