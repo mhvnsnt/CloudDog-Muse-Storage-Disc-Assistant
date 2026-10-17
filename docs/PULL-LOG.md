@@ -459,3 +459,12 @@ order, each gets its own researched, tested patch.
   dependency — heavy to build, heavy to test, ~0 payoff for v1/v2 scope.
   Revisit only if a torrent-based *acquisition* lane (PULL-STRAIGHT-TO-STORE
   for the gaps-first pulls) ever becomes a real requirement.
+
+### xxHash3 — WIRED (2026-10-17)
+- URL: https://github.com/Cyan4973/xxHash — License: **BSD-2-Clause**
+  (verified via PyPI). 31 GB/s non-cryptographic hash.
+- Wired as a pre-filter in the dedup kept-vs-candidate check: xxh3 runs
+  first (cheap); if it differs, files differ and the slow BLAKE3 is
+  skipped. If it matches, BLAKE3 still confirms (xxh3 is not
+  collision-safe). New `xxh3_file()` + `_xxhash_available()`.
+- 2 new tests (match/differ, availability check).

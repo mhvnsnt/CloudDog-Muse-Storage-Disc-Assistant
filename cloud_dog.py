@@ -144,6 +144,34 @@ def _b3sum_bin():
     return cand if os.path.isfile(cand) and os.access(cand, os.X_OK) else None
 
 
+def _xxhash_available():
+    """True when the optional xxhash pip package is importable."""
+    try:
+        import xxhash  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def xxh3_file(path, chunk=1 << 20):
+    """Fast NON-cryptographic hash (xxHash3) for pre-filtering.
+
+    31 GB/s — use as a cheap first pass before the cryptographic
+    fast_hash_file(). If xxh3 differs, files differ (skip the slow hash).
+    If xxh3 matches, MUST confirm with fast_hash_file() (not collision-safe).
+    Returns None if the xxhash package is not installed.
+    """
+    try:
+        import xxhash
+    except ImportError:
+        return None
+    h = xxhash.xxh3_64()
+    with open(path, "rb") as f:
+        for blk in iter(lambda: f.read(chunk), b""):
+            h.update(blk)
+    return h.hexdigest()
+
+
 def _blake3_available():
     """True when the optional blake3 pip package is importable."""
     try:
@@ -2280,6 +2308,8 @@ def cmd_dedup(args):
             continue
         try:
             kept_hash = fast_hash_file(kept)
+            # xxHash3 pre-filter: cheap first pass before the crypto hash
+            kept_xxh3 = xxh3_file(kept)
         except OSError:
             continue
         for path in files[1:]:
@@ -2289,6 +2319,12 @@ def cmd_dedup(args):
                 skipped.append((path, "inside git working tree"))
                 continue
             try:
+                # Fast path: if xxh3 differs, files differ — skip slow hash
+                if kept_xxh3 is not None:
+                    path_xxh3 = xxh3_file(path)
+                    if path_xxh3 is not None and path_xxh3 != kept_xxh3:
+                        failed.append((path, "xxh3 mismatch vs kept copy"))
+                        continue
                 if fast_hash_file(path) != kept_hash:
                     failed.append((path, "hash mismatch vs kept copy"))
                     continue

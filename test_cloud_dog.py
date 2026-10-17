@@ -1488,3 +1488,35 @@ def test_cmd_agent_audit_json(tmp_path, capsys):
         for p, bak in backups:
             if os.path.exists(bak):
                 os.replace(bak, p)
+
+
+# --------------------------------------------------- xxhash3 tests
+def test_xxh3_file_matches_and_differs():
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".dat") as f:
+        f.write(b"xxh3-test-bytes")
+        p1 = f.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".dat") as f:
+        f.write(b"xxh3-test-bytes")
+        p2 = f.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".dat") as f:
+        f.write(b"different-bytes-here")
+        p3 = f.name
+    try:
+        h1 = cloud_dog.xxh3_file(p1)
+        h2 = cloud_dog.xxh3_file(p2)
+        h3 = cloud_dog.xxh3_file(p3)
+        if h1 is None:
+            import pytest
+            pytest.skip("xxhash not installed")
+        assert h1 == h2, "identical files must match"
+        assert h1 != h3, "different files must differ"
+        assert len(h1) == 16, "xxh3_64 hex is 16 chars"
+    finally:
+        for p in (p1, p2, p3):
+            os.unlink(p)
+
+
+def test_xxh3_available():
+    # Should be True on this VM (pip installed); just check it doesn't crash
+    assert isinstance(cloud_dog._xxhash_available(), bool)
