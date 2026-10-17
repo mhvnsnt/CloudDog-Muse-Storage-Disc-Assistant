@@ -32,6 +32,11 @@ v2 (2026-10-17): terabox backend (tbupload.py), kaggle backend (REST),
 torrent mirror mode (TorBox cloud -> Range-stream -> part upload/verify/
 delete), daemon mode, structured audit journal (cloud-dog-audit.jsonl).
 
+v3 (2026-10-17): sqlite-backed registry (Python stdlib sqlite3, WAL mode)
+replaces the JSON file — atomic transactions, concurrent-safe for the
+guardian cron + manual runs. Legacy cloud-dog-registry.json migrates
+once on first open; `registry_export_json()` dumps the legacy shape.
+
 Default mode is DRY-RUN. Nothing is deleted unless --apply is passed.
 """
 
@@ -40,6 +45,7 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -50,6 +56,7 @@ HOME = os.path.expanduser("~")
 WORKSPACE = os.path.join(HOME, "workspace")
 AGENT_OPS = os.path.join(WORKSPACE, "agent-ops")
 REGISTRY_PATH = os.path.join(AGENT_OPS, "cloud-dog-registry.json")
+REGISTRY_DB_PATH = os.path.join(AGENT_OPS, "cloud-dog-registry.db")
 LOG_PATH = os.path.join(AGENT_OPS, "disk-cleanup-log.md")
 
 USAGE_CEILING = 75.0          # target: stay under this %
@@ -168,23 +175,106 @@ def active_transfer_pids():
 
 
 # ---------------------------------------------------------------- registry
-def load_registry():
-    if not os.path.exists(REGISTRY_PATH):
-        return {"version": 1, "entries": {}}
+#
+# sqlite-backed registry (v3). The JSON file at REGISTRY_PATH is legacy:
+# on first DB open its entries are migrated once into sqlite, then sqlite
+# is the single source of truth. sqlite gives us atomic transactions and
+# concurrent-safe access (WAL mode) — the old load-modify-save JSON pattern
+# raced when the guardian cron and a manual run overlapped.
+#
+# load_registry() / save_registry() keep their exact v1/v2 API so every
+# call site works unchanged.
+
+_REGISTRY_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS entries ("
+    " local_path TEXT PRIMARY KEY,"
+    " data TEXT NOT NULL,"
+    " updated_at TEXT NOT NULL)"
+)
+_REGISTRY_META_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS meta ("
+    " k TEXT PRIMARY KEY, v TEXT NOT NULL)"
+)
+
+
+def _db():
+    """Open the registry DB, creating schema and migrating legacy JSON once."""
+    os.makedirs(os.path.dirname(REGISTRY_DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(REGISTRY_DB_PATH, timeout=30)
     try:
-        with open(REGISTRY_PATH) as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {"version": 1, "entries": {}}
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute(_REGISTRY_SCHEMA)
+        conn.execute(_REGISTRY_META_SCHEMA)
+        row = conn.execute(
+            "SELECT v FROM meta WHERE k='json_migrated'").fetchone()
+        if not row and os.path.exists(REGISTRY_PATH):
+            try:
+                with open(REGISTRY_PATH) as f:
+                    legacy = json.load(f)
+                entries = (legacy.get("entries", {})
+                           if isinstance(legacy, dict) else {})
+                stamp = now_stamp()
+                for p, e in entries.items():
+                    conn.execute(
+                        "INSERT OR REPLACE INTO entries"
+                        " (local_path, data, updated_at) VALUES (?, ?, ?)",
+                        (p, json.dumps(e), stamp))
+                conn.execute(
+                    "INSERT INTO meta (k, v) VALUES ('json_migrated', '1')")
+                conn.commit()
+            except (OSError, json.JSONDecodeError):
+                conn.rollback()
+        else:
+            conn.commit()
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+def load_registry():
+    conn = _db()
+    try:
+        rows = conn.execute(
+            "SELECT local_path, data FROM entries").fetchall()
+        entries = {}
+        for p, d in rows:
+            try:
+                entries[p] = json.loads(d)
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return {"version": 3, "entries": entries}
+    finally:
+        conn.close()
 
 
 def save_registry(reg):
-    os.makedirs(os.path.dirname(REGISTRY_PATH), exist_ok=True)
-    tmp = REGISTRY_PATH + ".tmp"
+    conn = _db()
+    try:
+        stamp = now_stamp()
+        entries = reg.get("entries", {})
+        with conn:  # atomic transaction
+            conn.execute("DELETE FROM entries")
+            for p, e in entries.items():
+                conn.execute(
+                    "INSERT INTO entries (local_path, data, updated_at)"
+                    " VALUES (?, ?, ?)",
+                    (p, json.dumps(e), stamp))
+    finally:
+        conn.close()
+
+
+def registry_export_json(dest_path=None):
+    """Dump the sqlite registry back to the legacy JSON shape (backup/audit)."""
+    reg = load_registry()
+    dest = dest_path or (REGISTRY_PATH + ".export")
+    tmp = dest + ".tmp"
     with open(tmp, "w") as f:
-        json.dump(reg, f, indent=2, sort_keys=True)
+        json.dump({"version": 3, "entries": reg["entries"]},
+                  f, indent=2, sort_keys=True)
         f.write("\n")
-    os.replace(tmp, REGISTRY_PATH)
+    os.replace(tmp, dest)
+    return dest
 
 
 def log_action(text):
@@ -427,7 +517,7 @@ def cmd_registry(args):
     if args.json:
         print(json.dumps(reg, indent=2))
         return 0
-    print(f"Registry: {len(entries)} entries ({REGISTRY_PATH})")
+    print(f"Registry: {len(entries)} entries ({REGISTRY_DB_PATH})")
     for path, e in sorted(entries.items()):
         print(f"  [{e.get('status', '?')}] {path}")
         print(f"      -> {e.get('store')}:{e.get('repo')}@{e.get('release')}"
