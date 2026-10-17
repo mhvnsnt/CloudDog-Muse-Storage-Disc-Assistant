@@ -1,0 +1,47 @@
+{
+  "version": "2.1.0",
+  "engine": "cloud_dog",
+  "law": "NO-LOCAL-CLUTTER LAW (stay under 75%)",
+  "diskLimits": {
+    "usageCeilingPct": 75.0,
+    "hardCeilingPct": 88.0,
+    "inflightMtimeSecs": 300
+  },
+  "sacredPaths": [
+    "/tmp/cj-canon",
+    "~/workspace/agent-ops/checkpoints",
+    "~/.ssh",
+    "~/.gnupg"
+  ],
+  "vetoMarkers": [
+    ".DO_NOT_DELETE"
+  ],
+  "inflightSuffixes": [
+    ".part",
+    ".aria2",
+    ".tmp",
+    ".kaggle-partial",
+    ".crdownload"
+  ],
+  "cleanRules": {
+    "purgeStagedDownloads": true,
+    "purgeInterruptedTorrents": true,
+    "purgeCrashDumps": true,
+    "purgeTempAudioBounces": true,
+    "purgeAutosavesOlderThanDays": 30,
+    "protectActiveSoundbanks": true
+  },
+  "stores": {
+    "github": {
+      "enabled": true,
+      "autoVerify": true
+    },
+    "terabox": {
+      "enabled": true,
+      "autoVerify": false,
+      "note": "TeraBox requires manual live check before delete"
+    }
+  },
+  "registryPath": "~/workspace/agent-ops/cloud-dog-registry.json",
+  "logPath": "~/workspace/agent-ops/disk-cleanup-log.md"
+}

@@ -90,3 +90,239 @@ if __name__ == "__main__":
     test_human()
     test_sha256_file()
     print("smoke tests passed")
+
+
+# ------------------------------------------------------- v2 feature tests
+import io as _io
+import json as _json
+
+
+def _patch(obj, name, value):
+    """Save/restore a module attribute (works with and without pytest)."""
+    old = getattr(obj, name)
+    setattr(obj, name, value)
+    return old
+
+
+def test_audit_log_writes_jsonl(tmp_path=None):
+    import tempfile
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "audit.jsonl")
+    old = _patch(cloud_dog, "AUDIT_PATH", p)
+    try:
+        ev = cloud_dog.audit_log("test_event", path="/x", ok=True)
+        assert ev["action"] == "test_event" and ev["ok"] is True
+        with open(p) as f:
+            line = f.readline()
+        back = _json.loads(line)
+        assert back["action"] == "test_event" and "ts" in back
+    finally:
+        _patch(cloud_dog, "AUDIT_PATH", old)
+
+
+def test_iter_file_parts_exact():
+    data = b"abcdefghij" * 50  # 500 bytes
+    parts = list(cloud_dog.iter_file_parts(_io.BytesIO(data), 200))
+    assert [len(b) for _, b in parts] == [200, 200, 100]
+    assert b"".join(b for _, b in parts) == data
+    assert [i for i, _ in parts] == [0, 1, 2]
+
+
+def test_iter_file_parts_empty():
+    assert list(cloud_dog.iter_file_parts(_io.BytesIO(b""), 100)) == []
+
+
+def test_multipart_encode_shape():
+    body, ctype = cloud_dog.multipart_encode(
+        {"title": "T"}, {"file": ("a.zip", b"DATA", "application/zip")})
+    assert ctype.startswith("multipart/form-data; boundary=")
+    assert b'name="title"' in body and b"\r\n\r\nT\r\n" in body
+    assert b'filename="a.zip"' in body and b"DATA" in body
+    assert body.endswith(b"--\r\n")
+
+
+def test_terabox_upload_no_creds():
+    old = _patch(cloud_dog, "terabox_creds_present", lambda: False)
+    try:
+        ok, detail = cloud_dog.terabox_upload("/tmp/x", "/remote")
+        assert ok is False and "creds" in detail
+    finally:
+        _patch(cloud_dog, "terabox_creds_present", old)
+
+
+def test_terabox_list_parses_ls_output():
+    def fake_run(cmd, timeout=60):
+        out = "f        12345 photo.png\nd         4096 subdir\nf       999 a b.bin\n"
+        return 0, out, ""
+    old_run = _patch(cloud_dog, "run", fake_run)
+    old_creds = _patch(cloud_dog, "terabox_creds_present", lambda: True)
+    try:
+        ok, entries = cloud_dog.terabox_list("/dir")
+        assert ok is True
+        assert entries[0] == {"isdir": False, "size": 12345, "name": "photo.png"}
+        assert entries[1]["isdir"] is True
+        assert entries[2]["name"] == "a b.bin"  # spaces survive
+    finally:
+        _patch(cloud_dog, "run", old_run)
+        _patch(cloud_dog, "terabox_creds_present", old_creds)
+
+
+def test_verify_terabox_entry_size_mismatch():
+    def fake_list(remote_dir):
+        return True, [{"isdir": False, "size": 100, "name": "f.bin"}]
+    old = _patch(cloud_dog, "terabox_list", fake_list)
+    try:
+        ok, detail = cloud_dog.verify_terabox_entry(
+            {"remote_dir": "/d", "asset": "f.bin", "size": 999}, "/tmp/f.bin")
+        assert ok is False and "size mismatch" in detail
+        ok, detail = cloud_dog.verify_terabox_entry(
+            {"remote_dir": "/d", "asset": "f.bin", "size": 100}, "/tmp/f.bin")
+        assert ok is True and "verified" in detail
+        ok, detail = cloud_dog.verify_terabox_entry(
+            {"remote_dir": "/d", "asset": "missing.bin"}, "/tmp/f.bin")
+        assert ok is False and "not found" in detail
+    finally:
+        _patch(cloud_dog, "terabox_list", old)
+
+
+def test_kaggle_request_no_creds():
+    old = _patch(cloud_dog, "kaggle_creds", lambda: (None, None))
+    try:
+        ok, detail = cloud_dog.kaggle_request("GET", "/datasets/list")
+        assert ok is False and "kaggle.json" in detail
+    finally:
+        _patch(cloud_dog, "kaggle_creds", old)
+
+
+def test_kaggle_request_sends_basic_auth():
+    import urllib.request
+    seen = {}
+
+    class FakeResp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b'{"ok": true}'
+
+    def fake_urlopen(req, timeout=120):
+        seen["auth"] = req.get_header("Authorization")
+        seen["url"] = req.full_url
+        return FakeResp()
+
+    old_creds = _patch(cloud_dog, "kaggle_creds", lambda: ("marsfmmg", "KEY123"))
+    old_open = _patch(urllib.request, "urlopen", fake_urlopen)
+    try:
+        ok, payload = cloud_dog.kaggle_request("GET", "/datasets/list")
+        assert ok is True and payload == {"ok": True}
+        import base64
+        expect = "Basic " + base64.b64encode(b"marsfmmg:KEY123").decode()
+        assert seen["auth"] == expect
+        assert seen["url"] == "https://www.kaggle.com/api/v1/datasets/list"
+    finally:
+        _patch(cloud_dog, "kaggle_creds", old_creds)
+        _patch(urllib.request, "urlopen", old_open)
+
+
+def test_verify_kaggle_entry_found_and_sized():
+    def fake_view(owner_slug):
+        return True, {"files": [
+            {"ref": "u/ds/a.bin", "name": "a.bin", "totalBytes": 500},
+        ]}
+    old = _patch(cloud_dog, "kaggle_dataset_view", fake_view)
+    try:
+        e = {"dataset": "u/ds", "asset": "a.bin", "size": 500}
+        ok, detail = cloud_dog.verify_kaggle_entry(e, "/tmp/a.bin")
+        assert ok is True and "verified" in detail
+        e2 = {"dataset": "u/ds", "asset": "a.bin", "size": 501}
+        ok, _ = cloud_dog.verify_kaggle_entry(e2, "/tmp/a.bin")
+        assert ok is False
+        e3 = {"dataset": "u/ds", "asset": "nope.bin"}
+        ok, detail = cloud_dog.verify_kaggle_entry(e3, "/tmp/a.bin")
+        assert ok is False and "not found" in detail
+    finally:
+        _patch(cloud_dog, "kaggle_dataset_view", old)
+
+
+def test_verify_entry_dispatches_on_store():
+    calls = []
+
+    def fake_gh(repo, release, asset, size=0, sha=""):
+        calls.append("github")
+        return True, "gh-ok"
+
+    def fake_tb(entry, path):
+        calls.append("terabox")
+        return True, "tb-ok"
+
+    def fake_kg(entry, path):
+        calls.append("kaggle")
+        return True, "kg-ok"
+
+    o1 = _patch(cloud_dog, "verify_github_asset", fake_gh)
+    o2 = _patch(cloud_dog, "verify_terabox_entry", fake_tb)
+    o3 = _patch(cloud_dog, "verify_kaggle_entry", fake_kg)
+    try:
+        assert cloud_dog.verify_entry({"store": "github"}, "/p")[0]
+        assert cloud_dog.verify_entry({"store": "terabox"}, "/p")[0]
+        assert cloud_dog.verify_entry({"store": "kaggle"}, "/p")[0]
+        assert calls == ["github", "terabox", "kaggle"]
+        ok, detail = cloud_dog.verify_entry({"store": "nope"}, "/p")
+        assert ok is False and "unknown store" in detail
+    finally:
+        _patch(cloud_dog, "verify_github_asset", o1)
+        _patch(cloud_dog, "verify_terabox_entry", o2)
+        _patch(cloud_dog, "verify_kaggle_entry", o3)
+
+
+def test_upload_to_store_unknown():
+    ok, detail = cloud_dog.upload_to_store("nope", "/tmp/x", {})
+    assert ok is False and "unknown store" in detail
+
+
+def test_daemon_refuses_second_instance(tmp_path=None):
+    import tempfile
+    d = tempfile.mkdtemp()
+    pf = os.path.join(d, "cd.pid")
+    with open(pf, "w") as f:
+        f.write(str(os.getpid()))  # this process IS alive
+    o1 = _patch(cloud_dog, "log_action", lambda *a, **k: None)
+    o2 = _patch(cloud_dog, "audit_log", lambda *a, **k: {})
+    try:
+        args = type("A", (), {"pidfile": pf, "interval": 600, "apply": False})()
+        rc = cloud_dog.cmd_daemon(args)
+        assert rc == 1
+    finally:
+        _patch(cloud_dog, "log_action", o1)
+        _patch(cloud_dog, "audit_log", o2)
+
+
+def test_daemon_stale_pidfile_taken_over(tmp_path=None):
+    import tempfile, threading
+    d = tempfile.mkdtemp()
+    pf = os.path.join(d, "cd.pid")
+    with open(pf, "w") as f:
+        f.write("999999999")  # no such pid -> stale
+    stopped = []
+
+    real_sleep = __import__("time").sleep
+
+    def fast_sleep(s):
+        stopped.append(s)
+        raise KeyboardInterrupt()
+
+    import time as _t
+    old_sleep = _patch(_t, "sleep", fast_sleep)
+    old_enforce = _patch(cloud_dog, "cmd_enforce",
+                         lambda a: (_ for _ in ()).throw(KeyboardInterrupt()))
+    o1 = _patch(cloud_dog, "log_action", lambda *a, **k: None)
+    o2 = _patch(cloud_dog, "audit_log", lambda *a, **k: {})
+    args = type("A", (), {"pidfile": pf, "interval": 600, "apply": False})()
+    try:
+        rc = cloud_dog.cmd_daemon(args)
+    except KeyboardInterrupt:
+        rc = 130
+    finally:
+        _patch(_t, "sleep", old_sleep)
+        _patch(cloud_dog, "cmd_enforce", old_enforce)
+        _patch(cloud_dog, "log_action", o1)
+        _patch(cloud_dog, "audit_log", o2)
+    assert not os.path.exists(pf), "pidfile must be removed on exit"

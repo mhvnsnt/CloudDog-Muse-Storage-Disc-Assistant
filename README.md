@@ -47,7 +47,16 @@ python3 cloud_dog.py scan
 python3 cloud_dog.py register --file /path/to/part-aa --store github \
     --repo mhvnsnt/some-repo --release some-tag --asset part-aa
 
-# verify one file against its store
+# TeraBox backend (wraps tbupload.py; needs .creds.json activated,
+# see agent-ops/TERABOX-SESSION-KEEPER.md)
+python3 cloud_dog.py register --file /path/to/video.mp4 --store terabox \
+    --remote-dir /CN-Gigaleak/show --asset video.mp4
+
+# Kaggle backend (REST via ~/.kaggle/kaggle.json)
+python3 cloud_dog.py register --file /path/to/data.zip --store kaggle \
+    --dataset marsfmmg/my-dataset --asset data.zip
+
+# verify one file against its store (github | terabox | kaggle)
 python3 cloud_dog.py verify --file /path/to/part-aa
 
 # dry-run: show what WOULD be reaped
@@ -61,12 +70,36 @@ python3 cloud_dog.py enforce [--apply]
 
 # inspect the registry
 python3 cloud_dog.py registry
+
+# torrent -> cloud store with bounded local disk (TorBox cloud torrent,
+# Range-stream into rolling parts, upload+verify+delete each part)
+python3 cloud_dog.py mirror --magnet 'magnet:?xt=...' --store github \
+    --repo mhvnsnt/some-repo --release some-tag --part-mb 100
+
+# continuous enforce loop (pidfile, SIGTERM-clean, journals every cycle)
+python3 cloud_dog.py daemon --interval 600
+python3 cloud_dog.py daemon --interval 600 --apply   # real deletes
 ```
 
 ### State
 
 - Registry: `~/workspace/agent-ops/cloud-dog-registry.json`
 - Action log: `~/workspace/agent-ops/disk-cleanup-log.md` (append-only)
+- Audit journal: `~/workspace/agent-ops/cloud-dog-audit.jsonl`
+  (structured JSON, one event per line: register, verify, reap,
+  mirror_part, mirror_complete, daemon_cycle, ...)
+
+## Store backends (v2)
+
+| Store    | Upload path                  | Verify path                     |
+|----------|------------------------------|---------------------------------|
+| github   | `gh release upload`          | release asset API (name+size+sha256 digest) |
+| terabox  | `tbupload.py` (needs `.creds.json`) | `tbupload.py ls` + size match |
+| kaggle   | REST `POST /datasets/create/new` (multipart, `~/.kaggle/kaggle.json`) | REST `GET /datasets/view/{owner/slug}` + size match |
+
+TeraBox auto-verify is allowed ONLY when `.creds.json` exists AND the live
+`ls` succeeds. Otherwise the entry stays unverified until a manual live
+check — the registry claim alone is never proof.
 
 ### Wiring
 
@@ -79,17 +112,36 @@ python3 /path/to/cloud_dog.py enforce
 in dry-run evaluation mode, and with `--apply` when usage is over 75%.
 See `~/workspace/cron.d/minutely/disk-space-guardian__interval@10m.md`.
 
-### Laws
+Standalone alternative (no cron): `python3 cloud_dog.py daemon --interval 600 [--apply]`
+
+## Laws
 
 - NEVER delete anything unverified. Verify-then-delete only.
 - NEVER kill in-progress downloads/uploads. In-flight work is sacred.
 - Never touch `/tmp/cj-canon`.
-- One-store rule: verified 100% on GitHub OR TeraBox = safe to clear.
-- Every deletion is logged with its backup location.
+- One-store rule: verified 100% on GitHub OR TeraBox OR Kaggle = safe to clear.
+- Every deletion is logged with its backup location (markdown log + JSON audit journal).
 
 ### Requirements
 
 Python 3.8+, stdlib only. `gh` CLI required for GitHub verification.
+TeraBox needs `~/workspace/tools/terabox-uploader/.creds.json` (one-time
+browser-cookie setup). Kaggle needs `~/.kaggle/kaggle.json`. Mirror mode
+needs the TorBox connector credential (`custom.torbox` in the Secure Vault).
+
+## Open-source tooling survey (2026-10-17)
+
+Candidates evaluated for the mission; wired only where genuinely useful:
+
+- **rclone** — not installed; no native TeraBox/GitHub-release/Kaggle backends,
+  so it does not serve the current stores. Revisit if a store gains an rclone remote.
+- **dust / fclones** — not installed; `scan`'s stdlib walker is fast enough
+  at this tree size. Revisit if scan becomes a bottleneck.
+- **libtorrent** — not installed; mirror mode uses TorBox cloud torrenting
+  instead (zero local footprint by design). A direct libtorrent source is a
+  future option for non-cached torrents.
+- **sqlite3** — present (stdlib + CLI). JSON registry + JSONL journal are
+  sufficient today; sqlite is the candidate if concurrent writers appear.
 
 ---
 

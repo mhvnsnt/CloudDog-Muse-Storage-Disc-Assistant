@@ -20,13 +20,37 @@ cron (every 10 min).
 3. Never touch `/tmp/cj-canon` (aider lane's files).
 4. Never delete inside `agent-ops/checkpoints/` — lane manifests are sacred.
 5. Respect `.DO_NOT_DELETE*` markers — they veto deletion for the whole tree.
-6. TeraBox entries are NEVER auto-verified (API path down). They need a
-   manual live check before any delete.
+6. TeraBox entries auto-verify ONLY when `.creds.json` exists AND the live
+   `tbupload.py ls` succeeds. Otherwise they need a manual live check
+   before any delete. (v2; v1 never auto-verified TeraBox at all.)
 7. Every deletion logs to `~/workspace/agent-ops/disk-cleanup-log.md` with
-   the backup location.
+   the backup location, plus a structured event in
+   `~/workspace/agent-ops/cloud-dog-audit.jsonl`.
 8. Branch → PR → merge (merge commit, never squash). CI must be green.
-9. Test before commit: `python3 cloud_dog.py scan` and a dry-run `reap`
-   must both run clean.
+9. Test before commit: `python3 -m pytest test_cloud_dog.py` must be green,
+   and a live `python3 cloud_dog.py scan` + dry-run `reap` must run clean.
+10. Mirror mode (`mirror` cmd) never holds more than one part locally
+    (default 100MB); each part is uploaded, verified, and deleted before
+    the next streams. The manifest (`agent-ops/mirror-manifest-*.json`)
+    is the reassembly record — never delete it.
+11. Daemon mode (`daemon` cmd) is the standalone alternative to the
+    guardian cron. One instance only (pidfile); SIGTERM/SIGINT stops it
+    cleanly. Default is dry-run; `--apply` enables real deletes.
+
+## v2 commands (2026-10-17)
+- `mirror --magnet URI|--torrent-id ID --store github|terabox|kaggle ...`
+  TorBox cloud torrent -> CDN link -> Range-stream into rolling part files
+  -> per-part upload + verify + immediate local delete. Needs the
+  `custom.torbox` Secure Vault credential. Store dest flags: github needs
+  `--repo` + `--release`; terabox needs `--remote-dir`; kaggle needs
+  `--dataset owner/slug`.
+- `daemon [--interval 600] [--apply] [--pidfile PATH]`
+  Continuous enforce loop with pidfile, signal handling, per-cycle audit
+  events. Refuses a second instance.
+- `register --store` now accepts `github | terabox | kaggle`, with
+  `--remote-dir` (terabox) and `--dataset` (kaggle) flags.
+- `verify` / `reap` dispatch on the entry's store: github (release asset
+  API), terabox (`tbupload.py ls` + size), kaggle (`/datasets/view` + size).
 
 ## Registry contract
 `~/workspace/agent-ops/cloud-dog-registry.json`:
@@ -35,10 +59,12 @@ cron (every 10 min).
   "version": 1,
   "entries": {
     "/abs/local/path": {
-      "store": "github",
+      "store": "github|terabox|kaggle",
       "repo": "mhvnsnt/some-repo",
       "release": "some-tag",
       "asset": "part-aa",
+      "remote_dir": "/CN-Gigaleak/show",
+      "dataset": "marsfmmg/my-dataset",
       "sha256": "<hex>",
       "size": 104857600,
       "status": "registered|reaped",
