@@ -654,3 +654,209 @@ def test_scan_falls_back_without_dust():
         assert all("bytes" in i and i["bytes"] >= 0 for i in report["largest"])
     finally:
         _patch(cloud_dog, "_dust_binary", old)
+
+
+# -------------------------------------------------- fclones dedup wiring tests
+def _fake_fclones_script(directory, groups):
+    """Write a fake `fclones` that prints canned group JSON."""
+    import json, stat
+    payload = json.dumps({"header": {"version": "0.34.0",
+                                     "stats": {"group_count": len(groups)}},
+                          "groups": groups})
+    p = os.path.join(directory, "fclones")
+    with open(p, "w") as f:
+        f.write("#!/bin/sh\nprintf '%s' '" + payload.replace("'", "'\"'\"'") + "'\n")
+    os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
+    return p
+
+
+def _dedup_test_dir():
+    import shutil
+    d = tempfile.mkdtemp(prefix="cddedup-", dir=os.path.expanduser("~/workspace"))
+    return d
+
+
+def _with_fake_fclones(d, groups):
+    _fake_fclones_script(d, groups)
+    old_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = d + os.pathsep + old_path
+    return old_path
+
+
+def test_fclones_groups_parses_json():
+    import shutil
+    d = _dedup_test_dir()
+    try:
+        old_path = _with_fake_fclones(d, [
+            {"file_len": 6, "file_hash": "abc",
+             "files": ["/a/f1.txt", "/b/f2.txt"]}])
+        try:
+            groups, err = cloud_dog._fclones_groups(["/root"], [])
+        finally:
+            os.environ["PATH"] = old_path
+        assert err is None
+        assert len(groups) == 1
+        assert groups[0]["files"] == ["/a/f1.txt", "/b/f2.txt"]
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_fclones_groups_bad_json_errors():
+    import shutil, stat
+    d = _dedup_test_dir()
+    try:
+        p = os.path.join(d, "fclones")
+        with open(p, "w") as f:
+            f.write("#!/bin/sh\necho 'not json{{{' \n")
+        os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = d + os.pathsep + old_path
+        try:
+            groups, err = cloud_dog._fclones_groups(["/root"], [])
+        finally:
+            os.environ["PATH"] = old_path
+        assert groups is None
+        assert "JSON" in err
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_dedup_dry_run_lists_duplicates():
+    import shutil, io, contextlib
+    d = _dedup_test_dir()
+    try:
+        f1 = os.path.join(d, "f1.txt")
+        f2 = os.path.join(d, "f2.txt")
+        for p in (f1, f2):
+            with open(p, "w") as f:
+                f.write("same-content")
+        old_audit = _patch(cloud_dog, "AUDIT_PATH", os.path.join(d, "a.jsonl"))
+        old_path = _with_fake_fclones(d, [
+            {"file_len": 12, "file_hash": "abc", "files": [f1, f2]}])
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cloud_dog.cmd_dedup(type("A", (), {
+                    "apply": False, "path": d, "owner_approved": False,
+                    "exclude": []})())
+            out = buf.getvalue()
+        finally:
+            os.environ["PATH"] = old_path
+            _patch(cloud_dog, "AUDIT_PATH", old_audit)
+        assert rc == 0
+        assert "WOULD-DEDUP" in out, out
+        assert "reaped=1" in out, out
+        assert os.path.exists(f1) and os.path.exists(f2), "dry-run deletes nothing"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_dedup_apply_deletes_duplicate_keeps_one():
+    import shutil, io, contextlib
+    d = _dedup_test_dir()
+    try:
+        f1 = os.path.join(d, "a1.txt")
+        f2 = os.path.join(d, "a2.txt")
+        for p in (f1, f2):
+            with open(p, "w") as f:
+                f.write("identical-bytes")
+        old_audit = _patch(cloud_dog, "AUDIT_PATH", os.path.join(d, "a.jsonl"))
+        old_path = _with_fake_fclones(d, [
+            {"file_len": 15, "file_hash": "abc", "files": [f1, f2]}])
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cloud_dog.cmd_dedup(type("A", (), {
+                    "apply": True, "path": d, "owner_approved": False,
+                    "exclude": []})())
+        finally:
+            os.environ["PATH"] = old_path
+            _patch(cloud_dog, "AUDIT_PATH", old_audit)
+        assert rc == 0
+        # sorted order: a1.txt kept, a2.txt deleted
+        assert os.path.exists(f1), "kept copy must survive"
+        assert not os.path.exists(f2), "duplicate must be deleted"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_dedup_skips_git_tree():
+    import shutil, io, contextlib
+    d = _dedup_test_dir()
+    try:
+        os.makedirs(os.path.join(d, ".git"))
+        f1 = os.path.join(d, "g1.txt")
+        f2 = os.path.join(d, "g2.txt")
+        for p in (f1, f2):
+            with open(p, "w") as f:
+                f.write("same")
+        old_audit = _patch(cloud_dog, "AUDIT_PATH", os.path.join(d, "a.jsonl"))
+        old_path = _with_fake_fclones(d, [
+            {"file_len": 4, "file_hash": "abc", "files": [f1, f2]}])
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cloud_dog.cmd_dedup(type("A", (), {
+                    "apply": True, "path": d, "owner_approved": False,
+                    "exclude": []})())
+            out = buf.getvalue()
+        finally:
+            os.environ["PATH"] = old_path
+            _patch(cloud_dog, "AUDIT_PATH", old_audit)
+        assert rc == 0
+        assert "git working tree" in out, out
+        assert os.path.exists(f1) and os.path.exists(f2)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_dedup_blocks_game_file_without_approval():
+    import shutil, io, contextlib
+    d = _dedup_test_dir()
+    try:
+        f1 = os.path.join(d, "h1.iso")
+        f2 = os.path.join(d, "h2.iso")
+        for p in (f1, f2):
+            with open(p, "w") as f:
+                f.write("iso-bytes")
+        old_audit = _patch(cloud_dog, "AUDIT_PATH", os.path.join(d, "a.jsonl"))
+        old_path = _with_fake_fclones(d, [
+            {"file_len": 9, "file_hash": "abc", "files": [f1, f2]}])
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cloud_dog.cmd_dedup(type("A", (), {
+                    "apply": True, "path": d, "owner_approved": False,
+                    "exclude": []})())
+            out = buf.getvalue()
+        finally:
+            os.environ["PATH"] = old_path
+            _patch(cloud_dog, "AUDIT_PATH", old_audit)
+        assert rc == 0
+        assert "protected game file" in out, out
+        assert os.path.exists(f1) and os.path.exists(f2)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_dedup_fails_closed_without_policy():
+    import io, contextlib
+    old = _patch(cloud_dog, "_POLICY_AVAILABLE", False)
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            rc = cloud_dog.cmd_dedup(type("A", (), {"apply": True})())
+        assert rc == 1
+        assert "fail-closed" in buf.getvalue()
+    finally:
+        _patch(cloud_dog, "_POLICY_AVAILABLE", old)
+
+
+def test_dedup_no_binary_errors():
+    old = _patch(cloud_dog, "_fclones_binary", lambda: None)
+    try:
+        rc = cloud_dog.cmd_dedup(type("A", (), {
+            "apply": False, "path": "", "owner_approved": False, "exclude": []})())
+        assert rc == 1
+    finally:
+        _patch(cloud_dog, "_fclones_binary", old)
