@@ -343,7 +343,7 @@ def reap_candidates(search_root=None):
 
 def cmd_reap(args):
     apply = args.apply
-    search_root = os.path.abspath(args.path) if args.path else None
+    search_root = os.path.abspath(args.path) if getattr(args, "path", "") else None
     reaped, skipped, failed = [], [], []
     for path, entry in reap_candidates(search_root):
         if entry["store"] == "github":
