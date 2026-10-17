@@ -1,0 +1,23 @@
+[project]
+name = "clouddog"
+version = "0.1.0"
+description = "Disk-as-cache storage assistant"
+requires-python = ">=3.10"
+dependencies = ["requests", "pyyaml"]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+clouddog = "clouddog.cli:main"
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["clouddog*"]
+
+[tool.ruff]
+line-length = 100
