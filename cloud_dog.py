@@ -27,6 +27,11 @@ Usage:
         [--part-mb 100]                   # torrent -> store, bounded disk
     cloud_dog.py daemon [--interval 600] [--apply]
         # continuous enforce loop (pidfile, SIGTERM-clean)
+    cloud_dog.py hash --file PATH [--json]
+        # fast file digest (BLAKE3 when available), prints backend + rate
+    cloud_dog.py agent-audit [--quota 20G] [--json]
+        # per-agent workdir sizes + registry coverage (AGENT DISK PUSH LAW;
+        # read-only, never deletes)
 
 v2 (2026-10-17): terabox backend (tbupload.py), kaggle backend (REST),
 torrent mirror mode (TorBox cloud -> Range-stream -> part upload/verify/
@@ -370,9 +375,14 @@ def _dust_binary():
 
 
 def _parse_dust_size(s):
-    """Parse dust -j size strings like '2.1M', '272K', '512B' into bytes."""
+    """Parse dust -j size strings like '2.1M', '272K', '512B', '1.0Mi'.
+
+    dust >= 1.2.x emits IEC suffixes ('1.0Mi'); older releases emit 'M'.
+    Both mean the same binary multiplier. (Without the 'i' handling, the
+    bundled dust 1.2.6's sizes all parse to 0 — scan/audit go blind.)
+    """
     import re
-    m = re.match(r"^\s*([\d.]+)\s*([BKMGTPE]?)\s*$", str(s).upper())
+    m = re.match(r"^\s*([\d.]+)\s*([BKMGTPE]?)(I?)\s*$", str(s).upper())
     if not m:
         return 0
     num, unit = float(m.group(1)), m.group(2)
@@ -456,6 +466,217 @@ def cmd_scan(as_json=False):
         for item in report["largest"]:
             print(f"  {item['size']:>10}  {item['name']}")
     return report
+
+
+def cmd_hash(args):
+    """Hash one file with the fast-hash engine; print backend + digest + rate.
+
+    Uses fast_hash_file() (PR #17: blake3 module -> bundled b3sum ->
+    sha256) and reports which backend actually ran, so lanes can see what
+    speed they are getting. Local comparisons only — never for store
+    verification (registry/GitHub digests stay sha256).
+    """
+    path = os.path.abspath(args.file)
+    if not os.path.isfile(path):
+        print(f"not a file: {path}", file=sys.stderr)
+        return 1
+    if _blake3_available():
+        backend = "blake3/pip-module"
+    elif _b3sum_bin() is not None:
+        backend = "blake3/bundled-b3sum"
+    else:
+        backend = "sha256/stdlib"
+    size = os.path.getsize(path)
+    t0 = time.monotonic()
+    try:
+        hexd = fast_hash_file(path)
+    except OSError as e:
+        print(f"hash failed: {e}", file=sys.stderr)
+        return 1
+    dt = max(time.monotonic() - t0, 1e-9)
+    rate = size / dt / (1 << 20)
+    if args.json:
+        print(json.dumps({"path": path, "backend": backend, "digest": hexd,
+                          "bytes": size, "mb_per_s": round(rate, 1)}))
+    else:
+        print(f"{backend}: {hexd}  {path}  ({human(size)}, {rate:.1f} MB/s)")
+    return 0
+
+
+def _parse_size(s):
+    """Parse '20G', '500M', '1024' into bytes. Raises ValueError."""
+    s = str(s).strip().upper()
+    mult = {"B": 1, "K": 1 << 10, "KB": 1 << 10,
+            "M": 1 << 20, "MB": 1 << 20,
+            "G": 1 << 30, "GB": 1 << 30,
+            "T": 1 << 40, "TB": 1 << 40}
+    for suffix in sorted(mult, key=len, reverse=True):
+        if s.endswith(suffix) and len(s) > len(suffix):
+            return int(float(s[:-len(suffix)]) * mult[suffix])
+    return int(float(s))
+
+
+def _dir_tree_size(path):
+    """Walk a tree (no symlink follow, sacred dirs pruned). Returns (bytes, files)."""
+    total, count = 0, 0
+    if os.path.islink(path):
+        return 0, 0
+    if os.path.isfile(path):
+        try:
+            return os.lstat(path).st_size, 1
+        except OSError:
+            return 0, 0
+    for root, dirs, files in os.walk(path, followlinks=False):
+        # prune sacred subtrees and symlinked dirs: never descend, never count
+        dirs[:] = [d for d in dirs
+                   if not os.path.islink(os.path.join(root, d))
+                   and not is_sacred(os.path.join(root, d))]
+        if is_sacred(root):
+            dirs[:] = []
+            continue
+        for fn in files:
+            fp = os.path.join(root, fn)
+            try:
+                if os.path.islink(fp):
+                    continue
+                total += os.lstat(fp).st_size
+                count += 1
+            except OSError:
+                pass
+    return total, count
+
+
+def _topdir_sizes(root):
+    """[(name, bytes)] for top-level entries of root: dust fast path first,
+    stdlib walk fallback. Returns (sizes, file_counts) where file_counts is
+    a dict on the walk path or None when dust served sizes (dust reports
+    bytes only; counting files would cost the walk we just avoided)."""
+    biggest = _dust_largest(root)
+    if biggest is not None:
+        return biggest, None
+    sizes, counts = [], {}
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return [], {}
+    for name in names:
+        if name.startswith("."):
+            continue
+        p = os.path.join(root, name)
+        if is_sacred(p):
+            continue
+        total, count = _dir_tree_size(p)
+        sizes.append((name, total))
+        counts[name] = count
+    return sizes, counts
+
+
+def agent_audit_report(root=None, quota_bytes=0, registry=None, top=20,
+                       min_uncovered_bytes=100 << 20):
+    """Per-agent-directory disk report for the AGENT DISK PUSH LAW.
+
+    Every agent lane keeps work under ~/workspace/<lane>/; everything on
+    local disk must also live on GitHub or TeraBox. This read-only report
+    shows, per top-level dir: bytes on disk, registry coverage (bytes with
+    a live registered entry = claimed on a store), cleared bytes, and
+    flags: over_quota, uncovered_big (sizeable dir with NOTHING registered),
+    mostly_unregistered.
+
+    root: directory to audit (default ~/workspace). registry: loaded
+    registry dict (default load_registry()). quota_bytes: per-dir quota;
+    0 = no quota enforcement.
+    """
+    root = os.path.abspath(root or WORKSPACE)
+    if registry is None:
+        registry = load_registry()
+    entries = registry.get("entries", {})
+    # index registry bytes by directory prefix for O(1) lookups
+    covered, cleared = {}, {}
+    for path, e in entries.items():
+        if e.get("store") not in STORES:
+            continue
+        size = e.get("size", 0) or 0
+        topdir = path if os.path.isdir(path) else os.path.dirname(path)
+        # attribute to the immediate child of root
+        rel = os.path.relpath(topdir, root)
+        key = rel.split(os.sep, 1)[0] if not rel.startswith("..") else None
+        if not key or key == ".":
+            key = os.path.basename(path) if os.path.isfile(path) else None
+        if not key:
+            continue
+        bucket = cleared if e.get("status") == "reaped" else covered
+        bucket[key] = bucket.get(key, 0) + size
+    rows = []
+    sizes, file_counts = _topdir_sizes(root)
+    for name, total in sizes:
+        if name.startswith("."):
+            continue
+        p = os.path.join(root, name)
+        if is_sacred(p):
+            continue
+        count = file_counts[name] if file_counts else None
+        cov = covered.get(name, 0)
+        clr = cleared.get(name, 0)
+        unreg = max(total - cov, 0)
+        cov_pct = round(100.0 * cov / total, 1) if total else 100.0
+        flags = []
+        if quota_bytes and total > quota_bytes:
+            flags.append("over_quota")
+        if total >= min_uncovered_bytes and cov == 0:
+            flags.append("uncovered_big")
+        elif total >= min_uncovered_bytes and cov_pct < 10.0:
+            flags.append("mostly_unregistered")
+        rows.append({"name": name, "bytes": total, "files": count,
+                     "covered_bytes": cov, "cleared_bytes": clr,
+                     "unregistered_bytes": unreg,
+                     "coverage_pct": cov_pct, "flags": flags})
+    rows.sort(key=lambda r: r["bytes"], reverse=True)
+    return rows[:top] if top else rows
+
+
+def cmd_agent_audit(args):
+    """Audit per-agent workdirs: size, registry coverage, quota flags.
+
+    Read-only: never deletes anything. Serves the AGENT DISK PUSH LAW —
+    every agent's local disk must also live on GitHub/TeraBox.
+    """
+    try:
+        quota = _parse_size(args.quota) if getattr(args, "quota", "") else 0
+    except ValueError:
+        print(f"bad --quota value: {args.quota!r}", file=sys.stderr)
+        return 1
+    rows = agent_audit_report(
+        root=getattr(args, "root", "") or None,
+        quota_bytes=quota,
+        top=getattr(args, "top", 20),
+        min_uncovered_bytes=_parse_size(getattr(args, "min_uncovered", "100M")),
+    )
+    total = sum(r["bytes"] for r in rows)
+    if args.json:
+        print(json.dumps({"rows": rows,
+                          "quota_bytes": quota,
+                          "total_bytes": total}, indent=2))
+        return 0
+    print(f"Agent-dir audit of ~/workspace (quota "
+          f"{human(quota) if quota else 'none'}):")
+    for r in rows:
+        flag = f"  [{','.join(r['flags'])}]" if r["flags"] else ""
+        nfiles = f"{r['files']} files" if r["files"] is not None else "files n/a"
+        print(f"  {human(r['bytes']):>10}  {r['name']:<36}"
+              f"  covered {r['coverage_pct']:>5}% "
+              f"({nfiles}){flag}")
+    uncovered = sum(r["unregistered_bytes"] for r in rows)
+    print(f"Total audited: {human(total)}; "
+          f"unregistered on disk: {human(uncovered)}")
+    flagged = [r for r in rows if r["flags"]]
+    if flagged:
+        print("Flagged dirs (need store backup before any reap):")
+        for r in flagged:
+            print(f"  {r['name']}: {','.join(r['flags'])} "
+                  f"({human(r['unregistered_bytes'])} unregistered)")
+    audit_log("agent_audit", dirs=len(rows), total_bytes=total,
+              flagged=[r["name"] for r in flagged])
+    return 0
 
 
 def cmd_register(args):
@@ -1263,13 +1484,18 @@ def iter_file_parts(fobj, part_bytes, chunk=1 << 20):
 
 
 def stream_url_to_parts(url, staging_dir, part_bytes, chunk=8 << 20,
-                        progress_cb=None):
+                        progress_cb=None, hasher_factory=None):
     """Stream a URL into rolling part files on disk.
 
-    Yields (index, part_path, size, sha256) as each part fills. Disk never
+    Yields (index, part_path, size, hexdigest) as each part fills. Disk never
     holds more than part_bytes + chunk at a time; the caller is expected to
     upload+verify+delete each part before pulling the next (delete-as-you-go).
     Supports HTTP Range resume if the server honors it.
+
+    hasher_factory: callable returning a fresh hash object with
+    update()/hexdigest(). Default hashlib.sha256 (the registry/GitHub
+    contract). Pass a BLAKE3 constructor for ~10x throughput when the
+    digest is only a local integrity note.
     """
     import urllib.request
     import urllib.error
@@ -1283,7 +1509,9 @@ def stream_url_to_parts(url, staging_dir, part_bytes, chunk=8 << 20,
 
     def _open_part(i):
         p = os.path.join(staging_dir, f"mirror-part-{i:04d}.bin")
-        return p, open(p, "wb"), hashlib.sha256()
+        hasher = (hasher_factory() if hasher_factory
+                  else hashlib.sha256())
+        return p, open(p, "wb"), hasher
 
     exhausted = False
     while not exhausted:
@@ -1935,6 +2163,24 @@ def main(argv=None):
     p = sub.add_parser("scan", help="report disk usage and largest consumers")
     p.add_argument("--json", action="store_true")
 
+    p = sub.add_parser("hash", help="hash one file with the fast-hash engine")
+    p.add_argument("--file", required=True)
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("agent-audit",
+                       help="per-agent workdir disk + registry-coverage report "
+                            "(AGENT DISK PUSH LAW; read-only)")
+    p.add_argument("--quota", default="",
+                   help="per-dir quota, e.g. 20G (flags dirs over it)")
+    p.add_argument("--top", type=int, default=20,
+                   help="report the N largest dirs (default 20, 0 = all)")
+    p.add_argument("--root", default="",
+                   help="audit this dir instead of ~/workspace")
+    p.add_argument("--min-uncovered", default="100M",
+                   help="flag dirs with this much unregistered data "
+                        "(default 100M)")
+    p.add_argument("--json", action="store_true")
+
     p = sub.add_parser("register", help="register a file as verified on a store")
     p.add_argument("--file", required=True)
     p.add_argument("--store", required=True, choices=STORES,
@@ -2033,6 +2279,10 @@ def main(argv=None):
     try:
         if args.cmd == "scan":
             cmd_scan(args.json)
+        elif args.cmd == "hash":
+            return cmd_hash(args)
+        elif args.cmd == "agent-audit":
+            return cmd_agent_audit(args)
         elif args.cmd == "register":
             return cmd_register(args)
         elif args.cmd == "verify":

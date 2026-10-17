@@ -1314,3 +1314,177 @@ def test_fast_hash_agrees_on_identical_files():
     finally:
         os.unlink(p1)
         os.unlink(p2)
+
+
+# ----------------- hash cmd + agent-audit + dust Mi fix (2026-10-17)
+import hashlib as _hashlib
+import inspect as _inspect
+import pytest as _pytest
+
+
+def _write_tmp_file(tmp_path, name, data):
+    p = tmp_path / name
+    p.write_bytes(data)
+    return str(p)
+
+
+def test_cmd_hash_json(tmp_path, capsys):
+    f = _write_tmp_file(tmp_path, "h.bin", b"hashme")
+    rc = cloud_dog.cmd_hash(type("A", (), {"file": f, "json": True})())
+    assert rc == 0
+    out = _json.loads(capsys.readouterr().out)
+    assert out["digest"] == cloud_dog.fast_hash_file(f)
+    assert out["bytes"] == 6
+    assert out["backend"].startswith(("blake3", "sha256"))
+    assert out["mb_per_s"] >= 0
+
+
+def test_cmd_hash_text_names_backend(tmp_path, capsys):
+    f = _write_tmp_file(tmp_path, "h2.bin", b"hashme2")
+    rc = cloud_dog.cmd_hash(type("A", (), {"file": f, "json": False})())
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert cloud_dog.fast_hash_file(f) in out
+
+
+def test_cmd_hash_missing_file(capsys):
+    rc = cloud_dog.cmd_hash(type("A", (), {
+        "file": "/no/such/file.bin", "json": False})())
+    assert rc == 1
+
+
+def test_stream_url_to_parts_accepts_hasher_factory():
+    sig = _inspect.signature(cloud_dog.stream_url_to_parts)
+    assert "hasher_factory" in sig.parameters
+
+
+def test_parse_size():
+    assert cloud_dog._parse_size("20G") == 20 * (1 << 30)
+    assert cloud_dog._parse_size("100M") == 100 * (1 << 20)
+    assert cloud_dog._parse_size("512") == 512
+    assert cloud_dog._parse_size("1.5G") == int(1.5 * (1 << 30))
+    with _pytest.raises(ValueError):
+        cloud_dog._parse_size("ten-gig")
+
+
+def test_parse_dust_size_iec_suffix():
+    # dust 1.2.6 emits IEC 'i' suffixes; same multipliers as K/M/G.
+    # Without this, the bundled dust's sizes all parse to 0 and the
+    # scan/audit fast paths go blind.
+    assert cloud_dog._parse_dust_size("1.0Mi") == 1024 ** 2
+    assert cloud_dog._parse_dust_size("512Ki") == 512 * 1024
+    assert cloud_dog._parse_dust_size("2.0Gi") == 2 * 1024 ** 3
+    assert cloud_dog._parse_dust_size("1.0Ti") == 1024 ** 4
+    # old format still works
+    assert cloud_dog._parse_dust_size("2.1M") == int(2.1 * 1024 ** 2)
+
+
+def _make_agent_tree(tmp_path):
+    # root/
+    #   lane-alpha/ big.bin (1MB), small.bin (100KB)
+    #   lane-beta/  notes.txt (50B)
+    root = tmp_path / "ws"
+    root.mkdir()
+    a = root / "lane-alpha"
+    a.mkdir()
+    (a / "big.bin").write_bytes(b"A" * (1 << 20))
+    (a / "small.bin").write_bytes(b"B" * (100 << 10))
+    b = root / "lane-beta"
+    b.mkdir()
+    (b / "notes.txt").write_bytes(b"C" * 50)
+    return str(root), str(a), str(b)
+
+
+def test_agent_audit_report_coverage(monkeypatch, tmp_path):
+    # force the stdlib walk path (exact bytes) — dust -j reports rounded
+    # human sizes, so exact assertions only hold on the walk path
+    monkeypatch.setattr(cloud_dog, "_dust_binary", lambda: None)
+    root, a, b = _make_agent_tree(tmp_path)
+    reg = {"version": 1, "entries": {
+        os.path.join(a, "big.bin"): {"store": "github", "size": 1 << 20,
+                                     "status": "registered"},
+        os.path.join(a, "gone.bin"): {"store": "github", "size": 500,
+                                      "status": "reaped"},
+        os.path.join(b, "old.bin"): {"store": "terabox", "size": 25,
+                                     "status": "registered"},
+    }}
+    rows = cloud_dog.agent_audit_report(
+        root=root, registry=reg, top=0, min_uncovered_bytes=10)
+    by_name = {r["name"]: r for r in rows}
+    alpha = by_name["lane-alpha"]
+    assert alpha["bytes"] == (1 << 20) + (100 << 10)
+    assert alpha["covered_bytes"] == (1 << 20)
+    assert alpha["cleared_bytes"] == 500
+    assert alpha["unregistered_bytes"] == (100 << 10)
+    assert 90.0 < alpha["coverage_pct"] < 100.0
+    assert alpha["flags"] == []
+    assert alpha["files"] == 2
+    # biggest dir sorts first
+    assert rows[0]["name"] == "lane-alpha"
+
+
+def test_agent_audit_report_dust_path_approximate(tmp_path):
+    # dust fast path: sizes are human-rounded, so assert approximate
+    if cloud_dog._dust_binary() is None:
+        _pytest.skip("no dust binary available")
+    root, a, b = _make_agent_tree(tmp_path)
+    reg = {"version": 1, "entries": {}}
+    rows = cloud_dog.agent_audit_report(
+        root=root, registry=reg, top=0, min_uncovered_bytes=10)
+    by_name = {r["name"]: r for r in rows}
+    alpha = by_name["lane-alpha"]
+    assert abs(alpha["bytes"] - ((1 << 20) + (100 << 10))) < 0.05 * (1 << 20)
+    assert alpha["files"] is None  # dust reports bytes only
+    assert rows[0]["name"] == "lane-alpha"
+
+
+def test_agent_audit_report_flags(monkeypatch, tmp_path):
+    monkeypatch.setattr(cloud_dog, "_dust_binary", lambda: None)
+    root, a, b = _make_agent_tree(tmp_path)
+    reg = {"version": 1, "entries": {}}
+    rows = cloud_dog.agent_audit_report(
+        root=root, registry=reg, top=0, quota_bytes=1000,
+        min_uncovered_bytes=10)
+    by_name = {r["name"]: r for r in rows}
+    alpha = by_name["lane-alpha"]
+    assert "over_quota" in alpha["flags"]
+    assert "uncovered_big" in alpha["flags"]
+    assert alpha["coverage_pct"] == 0.0
+    beta = by_name["lane-beta"]
+    assert "over_quota" not in beta["flags"]
+    assert "uncovered_big" in beta["flags"]
+
+
+def test_cmd_agent_audit_json(tmp_path, capsys):
+    root, a, b = _make_agent_tree(tmp_path)
+    db_path = cloud_dog.REGISTRY_DB_PATH
+    reg_path = cloud_dog.REGISTRY_PATH
+    backups = []
+    for p in (reg_path, db_path, db_path + "-wal", db_path + "-shm"):
+        if os.path.exists(p):
+            bak = p + ".test-bak"
+            os.replace(p, bak)
+            backups.append((p, bak))
+    import tempfile
+    audit_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
+    audit_tmp.close()
+    old_audit = _patch(cloud_dog, "AUDIT_PATH", audit_tmp.name)
+    try:
+        rc = cloud_dog.cmd_agent_audit(type("A", (), {
+            "quota": "1G", "top": 0, "root": root,
+            "min_uncovered": "1", "json": True})())
+        assert rc == 0
+        out = _json.loads(capsys.readouterr().out)
+        assert out["quota_bytes"] == 1 << 30
+        names = [r["name"] for r in out["rows"]]
+        assert "lane-alpha" in names and "lane-beta" in names
+    finally:
+        _patch(cloud_dog, "AUDIT_PATH", old_audit)
+        if os.path.exists(audit_tmp.name):
+            os.unlink(audit_tmp.name)
+        for p in (reg_path, db_path, db_path + "-wal", db_path + "-shm"):
+            if os.path.exists(p):
+                os.unlink(p)
+        for p, bak in backups:
+            if os.path.exists(bak):
+                os.replace(bak, p)
