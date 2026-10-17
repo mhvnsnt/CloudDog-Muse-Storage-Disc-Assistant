@@ -1,11 +1,12 @@
 """Tests for clouddog.reaper — the DELETE-AS-YOU-GO verified-delete engine."""
+
 import hashlib
 import json
 import os
 
 import pytest
 
-from clouddog.reaper import Reaper, ReapReport, compute_hash
+from clouddog.reaper import Reaper, compute_hash
 
 
 def git_sha(data: bytes) -> str:
@@ -46,7 +47,8 @@ def test_dry_run_deletes_nothing_but_logs_would_reap(lane):
     assert (src / "b.bin").exists()
     assert report.reaped == 0
     assert report.freed_bytes == 0
-    log = open(log_path).read()
+    with open(log_path) as _fh:
+        log = _fh.read()
     assert log.count("WOULD-REAP") == 2
     assert "REAPED a.bin" not in log
 
@@ -65,7 +67,8 @@ def test_live_reap_deletes_verified_files(lane):
     assert not (src / "a.bin").exists()
     assert not (src / "sub/b.bin").exists()
     assert report.freed_bytes == len(data1) + len(data2)
-    log = open(log_path).read()
+    with open(log_path) as _fh:
+        log = _fh.read()
     assert "REAPED a.bin" in log
     assert "REAPED sub/b.bin" in log
 
@@ -79,7 +82,8 @@ def test_mismatch_keeps_file(lane):
     assert report.mismatches == 1
     assert report.reaped == 0
     assert (src / "a.bin").exists()  # NEVER deleted on mismatch
-    assert "MISMATCH a.bin" in open(log_path).read()
+    with open(log_path) as _fh:
+        assert "MISMATCH a.bin" in _fh.read()
 
 
 def test_guard_skips_traversal_and_absolute_paths(lane):
@@ -88,7 +92,8 @@ def test_guard_skips_traversal_and_absolute_paths(lane):
     evil = src.parent / "evil.txt"
     evil.write_bytes(b"evil")
     outside_abs = str(src.parent / "abs_evil.txt")
-    open(outside_abs, "w").write("abs evil")
+    with open(outside_abs, "w") as _fh:
+        _fh.write("abs evil")
     manifest = {
         "../evil.txt": git_sha(b"evil"),
         outside_abs: git_sha(b"abs evil"),
@@ -99,7 +104,8 @@ def test_guard_skips_traversal_and_absolute_paths(lane):
     assert report.reaped == 0
     assert evil.exists()
     assert os.path.exists(outside_abs)
-    assert "GUARD-SKIP" in open(log_path).read()
+    with open(log_path) as _fh:
+        assert "GUARD-SKIP" in _fh.read()
 
 
 def test_guard_skips_protected_suffix(lane):
@@ -154,8 +160,7 @@ def test_spot_check_failure_halts_and_preserves_rest(lane):
         calls.append(rel)
         return False
 
-    r = make_reaper(src, manifest, log_path, state_path,
-                    spot_check=spot_check, spot_every=1)
+    r = make_reaper(src, manifest, log_path, state_path, spot_check=spot_check, spot_every=1)
     report = r.reap_once(dry_run=False)
     assert report.halted is True
     assert report.halt_reason
@@ -163,16 +168,18 @@ def test_spot_check_failure_halts_and_preserves_rest(lane):
     assert not (src / "a.bin").exists()
     assert (src / "b.bin").exists()  # subsequent entries untouched
     # state was saved: a.bin is marked reaped
-    state = json.loads(open(state_path).read())
+    with open(state_path) as _fh:
+        state = json.loads(_fh.read())
     assert state["reaped"] == ["a.bin"]
     # second instance does not re-reap a.bin; b.bin reaps cleanly now that
     # spot checks pass
-    r2 = make_reaper(src, manifest, log_path, state_path,
-                     spot_check=lambda rel, sha: True, spot_every=1)
+    r2 = make_reaper(
+        src, manifest, log_path, state_path, spot_check=lambda rel, sha: True, spot_every=1
+    )
     report2 = r2.reap_once(dry_run=False)
     assert report2.halted is False
     assert report2.skipped == 1  # a.bin, from saved state
-    assert report2.reaped == 1   # b.bin
+    assert report2.reaped == 1  # b.bin
     assert not (src / "b.bin").exists()
 
 
@@ -184,7 +191,8 @@ def test_state_persistence_second_instance_does_not_rereap(lane):
     r = make_reaper(src, manifest, log_path, state_path)
     report1 = r.reap_once(dry_run=False)
     assert report1.reaped == 1
-    state = json.loads(open(state_path).read())
+    with open(state_path) as _fh:
+        state = json.loads(_fh.read())
     assert state["reaped"] == ["a.bin"]
     r2 = make_reaper(src, manifest, log_path, state_path)
     report2 = r2.reap_once(dry_run=False)
@@ -199,7 +207,8 @@ def test_state_written_atomically(lane):
     r = make_reaper(src, manifest, log_path, state_path)
     r.reap_once(dry_run=False)
     assert not os.path.exists(state_path + ".tmp")
-    json.loads(open(state_path).read())  # valid JSON
+    with open(state_path) as _fh:
+        json.loads(_fh.read())  # valid JSON
 
 
 def test_sha256_algo(lane):
@@ -237,12 +246,14 @@ def test_missing_file_marked_skipped(lane):
     report = r.reap_once(dry_run=False)
     assert report.skipped == 1
     assert report.reaped == 0
-    state = json.loads(open(state_path).read())
+    with open(state_path) as _fh:
+        state = json.loads(_fh.read())
     assert "gone.bin" in state["reaped"]  # never retried
 
 
 def test_compute_hash_git_sha1():
     import tempfile
+
     with tempfile.NamedTemporaryFile(delete=False) as f:
         f.write(b"abc")
         path = f.name
@@ -253,24 +264,27 @@ def test_compute_hash_git_sha1():
 def test_reaper_refuses_without_store_verify(lane):
     """C1: fail closed — no live store check wired means no deletions."""
     from clouddog.reaper import compute_hash
+
     src, log_path, state_path = lane
     write(src, "a.txt", b"hello")
     manifest = {"a.txt": compute_hash(str(src / "a.txt"))}
-    r = Reaper(str(src), manifest, log_path, state_path=state_path,
-               store_verify=None)
+    r = Reaper(str(src), manifest, log_path, state_path=state_path, store_verify=None)
     report = r.reap_once(dry_run=False)
     assert report.reaped == 0
     assert (src / "a.txt").exists()
-    assert "NO-STORE-VERIFY" in open(log_path).read()
+    with open(log_path) as _fh:
+        assert "NO-STORE-VERIFY" in _fh.read()
 
 
 def test_reaper_skips_on_failed_store_verify(lane):
     from clouddog.reaper import compute_hash
+
     src, log_path, state_path = lane
     write(src, "a.txt", b"hello")
     manifest = {"a.txt": compute_hash(str(src / "a.txt"))}
-    r = Reaper(str(src), manifest, log_path, state_path=state_path,
-               store_verify=lambda rel, full: False)
+    r = Reaper(
+        str(src), manifest, log_path, state_path=state_path, store_verify=lambda rel, full: False
+    )
     report = r.reap_once(dry_run=False)
     assert report.reaped == 0
     assert (src / "a.txt").exists()

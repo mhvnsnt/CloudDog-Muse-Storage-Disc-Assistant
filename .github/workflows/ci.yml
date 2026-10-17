@@ -27,7 +27,11 @@ jobs:
       - name: Pytest (v1 engine suite, src/clouddog)
         # tests/v1/conftest.py re-points the `clouddog` import at src/
         # (the repo root also has a clouddog/ package from the v3 lane).
-        run: python -m pytest tests/v1 -q
+        # Uninstall the editable v3 package first: its meta-path finder
+        # would otherwise shadow src/ regardless of sys.path order.
+        run: |
+          pip uninstall -y clouddog
+          python -m pytest tests/v1 -q
 
   lint:
     runs-on: ubuntu-latest

@@ -24,7 +24,8 @@ def test_record_appends_jsonl(tmp_path):
     events = make_events()
     for e in events:
         j.record(e)
-    lines = open(tmp_path / "audit.jsonl").read().splitlines()
+    with open(tmp_path / "audit.jsonl") as _fh:
+        lines = _fh.read().splitlines()
     assert len(lines) == 3
     first = json.loads(lines[0])
     assert first["kind"] == "stored"

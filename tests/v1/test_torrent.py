@@ -4,6 +4,7 @@ Never downloads anything: live-engine tests use synthetic torrent_info
 built from local files (the session hash-checks local data only; DHT and
 networking are disabled in tests).
 """
+
 import hashlib
 import json
 import warnings
@@ -102,7 +103,7 @@ def wait_seeded(handle, timeout: float = 15.0) -> None:
             real = t._real_files(ti)
             if real and all(i < len(prog) and prog[i] >= size > 0 for i, _, size in real):
                 return
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - polling loop, transient errors retry
             pass
         time.sleep(0.2)
     raise AssertionError("synthetic torrent did not finish local hash check in time")
@@ -140,8 +141,7 @@ def test_unavailable_path_is_honest(home, monkeypatch):
 
 def test_add_magnet_rejects_bad_magnet(home):
     with pytest.raises(CloudDogError, match="not a magnet link"):
-        t.add_magnet("https://example.com/file.torrent", "github", "r",
-                     backend=FakeBackend())
+        t.add_magnet("https://example.com/file.torrent", "github", "r", backend=FakeBackend())
 
 
 def test_add_magnet_rejects_unknown_tier(home):
@@ -161,16 +161,20 @@ def test_session_lifecycle_and_status_shape(home):
     save_path = seed_dir(home)
     ti = make_torrent_info(save_path / "data")
     backend = FakeBackend()
-    tid = t._engine()._add_torrent_info(ti, "github", "owner/repo@tag", backend,
-                                       str(save_path))
+    tid = t._engine()._add_torrent_info(ti, "github", "owner/repo@tag", backend, str(save_path))
     try:
         assert isinstance(tid, str) and len(tid) == 16
         entries = t.torrent_status()
         assert len(entries) == 1
         e = entries[0]
         assert set(e.keys()) == {
-            "id", "name", "progress_pct", "down_rate_Bps",
-            "state", "pieces_done", "pieces_total",
+            "id",
+            "name",
+            "progress_pct",
+            "down_rate_Bps",
+            "state",
+            "pieces_done",
+            "pieces_total",
         }
         assert e["id"] == tid
         assert isinstance(e["name"], str)
@@ -189,11 +193,12 @@ def test_session_lifecycle_and_status_shape(home):
 def test_state_file_round_trip(home):
     save_path = seed_dir(home)
     ti = make_torrent_info(save_path / "data")
-    tid = t._engine()._add_torrent_info(ti, "github", "owner/repo@tag",
-                                       FakeBackend(), str(save_path))
+    tid = t._engine()._add_torrent_info(
+        ti, "github", "owner/repo@tag", FakeBackend(), str(save_path)
+    )
     state_file = Path(home / "home" / "torrents.json")
     assert state_file.is_file()
-    saved = json.loads(state_file.read_text())  # noqa: state file is ours
+    saved = json.loads(state_file.read_text())
     assert tid in saved
     assert saved[tid]["tier"] == "github"
     assert saved[tid]["remote_ref"] == "owner/repo@tag"
@@ -235,8 +240,7 @@ def test_pump_uploads_completed_files_and_deletes_local(home):
     data = save_path / "data"
     ti = make_torrent_info(data)
     backend = FakeBackend()
-    tid = t._engine()._add_torrent_info(ti, "terabox", "/remote/dir", backend,
-                                       str(save_path))
+    tid = t._engine()._add_torrent_info(ti, "terabox", "/remote/dir", backend, str(save_path))
     handle = t._engine()._registry[tid]["handle"]
     wait_seeded(handle)
 
@@ -254,7 +258,8 @@ def test_pump_uploads_completed_files_and_deletes_local(home):
     saved = json.loads((home / "home" / "torrents.json").read_text())
     assert saved[tid]["done"] is True
     assert {u["file_path"] for u in saved[tid]["uploaded_files"]} == {
-        "data/a.bin", "data/sub/b.bin",
+        "data/a.bin",
+        "data/sub/b.bin",
     }
     # every stored ref recorded is byte-verifiable against what was uploaded
     for u in saved[tid]["uploaded_files"]:
@@ -282,8 +287,7 @@ def test_remove_torrent_cleans_pieces(home):
     # must reflect that for the containment check to allow removal.
     piece_dir = t._pieces_root() / "testtid"
     piece_dir.mkdir(parents=True)
-    tid = t._engine()._add_torrent_info(ti, "github", "r", FakeBackend(),
-                                       str(piece_dir))
+    tid = t._engine()._add_torrent_info(ti, "github", "r", FakeBackend(), str(piece_dir))
     t.remove_torrent(tid, delete_pieces=True)
     assert not piece_dir.exists()
     assert t.torrent_status() == []

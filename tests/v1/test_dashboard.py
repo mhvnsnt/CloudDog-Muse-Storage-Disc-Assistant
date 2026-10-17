@@ -7,14 +7,14 @@ reaper, audit, daemon, torrent, cli) are built by parallel lanes, so any
 endpoint that needs them must return the honest "not available" error
 instead of crashing.
 """
+
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import threading
-import urllib.request
 import urllib.error
+import urllib.request
 from http.server import ThreadingHTTPServer
 
 import pytest
@@ -46,7 +46,9 @@ def get(base_url, path):
 def post(base_url, path, body):
     data = json.dumps(body).encode()
     req = urllib.request.Request(
-        base_url + path, data=data, method="POST",
+        base_url + path,
+        data=data,
+        method="POST",
         headers={"Content-Type": "application/json"},
     )
     try:
@@ -70,6 +72,7 @@ def test_disk_matches_shutil(base_url):
     # Same resolution as the server: CLOUDEDOG_DISK_PATH or /home/hatch,
     # falling back to / (e.g. CI runners).
     from clouddog.dashboard.server import _data_root
+
     root = _data_root()
     usage = shutil.disk_usage(root)
     assert body["path"] == root
@@ -94,9 +97,7 @@ def test_sysinfo_mem_matches_proc(base_url):
     status, body = get(base_url, "/api/sysinfo")
     assert status == 200
     with open("/proc/meminfo") as fh:
-        memtotal = next(
-            int(l.split()[1]) * 1024 for l in fh if l.startswith("MemTotal:")
-        )
+        memtotal = next(int(l.split()[1]) * 1024 for l in fh if l.startswith("MemTotal:"))
     assert body["mem"]["total_bytes"] == memtotal
     assert "load_avg_1min" in body["cpu"]  # labeled load average, never a fake %
     assert "cpu_pct" not in body["cpu"]
@@ -168,12 +169,10 @@ def test_daemon_install_generates_real_configs(base_url):
             for token in ("clouddog", "daemon", "--interval", "60"):
                 assert any(token in f["content"] for f in body["files"]), token
         else:
-            assert any(
-                "clouddog daemon --interval 60" in f["content"] for f in body["files"]
-            ), "no generated file runs the daemon command"
-    status, body = post(
-        base_url, "/api/daemon/install", {"os": "plan9", "interval_minutes": 60}
-    )
+            assert any("clouddog daemon --interval 60" in f["content"] for f in body["files"]), (
+                "no generated file runs the daemon command"
+            )
+    status, body = post(base_url, "/api/daemon/install", {"os": "plan9", "interval_minutes": 60})
     assert status == 400
 
 
@@ -196,8 +195,13 @@ def test_lanes_honest_unknowns(base_url):
     assert isinstance(body, list)
     for lane in body:
         assert set(lane.keys()) >= {
-            "lane", "manifest_path", "uploaded", "total",
-            "pct", "alive", "log_tail",
+            "lane",
+            "manifest_path",
+            "uploaded",
+            "total",
+            "pct",
+            "alive",
+            "log_tail",
         }
         assert isinstance(lane["log_tail"], list)
 
@@ -243,8 +247,11 @@ def test_sweep_returns_job_immediately(base_url):
 
     data = json.dumps({"dry_run": True}).encode()
     req = urllib.request.Request(
-        base_url + "/api/sweep", data=data,
-        headers={"Content-Type": "application/json"}, method="POST")
+        base_url + "/api/sweep",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
     with urllib.request.urlopen(req, timeout=30) as r:
         assert r.status == 202
         body = json.loads(r.read())
