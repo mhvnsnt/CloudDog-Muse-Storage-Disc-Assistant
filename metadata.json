@@ -1,0 +1,7 @@
+{
+  "name": "Muse Storage Disc Assist",
+  "description": "Smart disk cleanup, sound library relocation, and storage clutter assistant for Muse Hub, Muse Sounds, and MuseScore.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
