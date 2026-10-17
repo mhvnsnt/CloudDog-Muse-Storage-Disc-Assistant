@@ -498,7 +498,9 @@ def cmd_enforce(args):
     if report["over_ceiling"] or args.apply:
         print("--- reap phase ---")
         before = disk_usage_percent()[0]
-        rc = cmd_reap(args)
+        # v2 dispatcher: reaps github + terabox-live + kaggle entries.
+        # (v1 cmd_reap kept for backward compat; identical for github.)
+        rc = cmd_reap_v2(args)
         after = disk_usage_percent()[0]
         freed = before - after
         print(f"Disk: {before:.1f}% -> {after:.1f}%")
@@ -1296,7 +1298,8 @@ def cmd_verify_v2(args):
 def cmd_reap_v2(args):
     """v2 reap: verify-then-delete across all store backends."""
     apply = args.apply
-    search_root = os.path.abspath(args.path) if args.path else None
+    search_root = (os.path.abspath(args.path)
+                   if getattr(args, "path", "") else None)
     reaped, skipped, failed = [], [], []
     for path, entry in reap_candidates(search_root):
         ok, detail = verify_entry(entry, path)
