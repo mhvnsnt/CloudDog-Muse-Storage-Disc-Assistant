@@ -20,8 +20,18 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
-      - name: Pytest
-        run: python -m pytest -q
+      - name: Pytest (v3 engine + root script tests)
+        # The v1 engine suite (tests/v1/) needs src/ on the path and would
+        # shadow the installed clouddog package; it runs in the next step.
+        run: python -m pytest -q --ignore=tests/v1
+      - name: Pytest (v1 engine suite, src/clouddog)
+        # tests/v1/conftest.py re-points the `clouddog` import at src/
+        # (the repo root also has a clouddog/ package from the v3 lane).
+        # Uninstall the editable v3 package first: its meta-path finder
+        # would otherwise shadow src/ regardless of sys.path order.
+        run: |
+          pip uninstall -y clouddog
+          python -m pytest tests/v1 -q
 
   lint:
     runs-on: ubuntu-latest

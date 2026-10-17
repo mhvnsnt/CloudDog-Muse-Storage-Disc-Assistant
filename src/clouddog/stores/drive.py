@@ -127,7 +127,7 @@ class DriveBackend(StoreBackend):
                 extra={"dry_run": True},
             )
 
-        if shutil.which("rclone") is None:
+        if self._rclone_bin() is None:
             raise StoreDegraded(self.name, "rclone not installed")
 
         proc = self._run_rclone(["copyto", local_path, target, "--checksum"])
@@ -165,6 +165,13 @@ class DriveBackend(StoreBackend):
         proc = self._run_rclone(["check", local_path, locator, "--one-way"])
         if proc.returncode == 0:
             return True
-        # rclone check exits 1 when differences are found — that is a plain
-        # mismatch, not a transport error.
-        return False
+        if proc.returncode == 1:
+            # rclone check exits 1 when differences are found — a plain
+            # mismatch, not a transport error.
+            return False
+        # L1: exit >1 is a transport/config error — raise, don't misreport
+        # it as "verification failed".
+        raise CloudDogError(
+            f"rclone check failed (exit {proc.returncode}): "
+            f"{_truncate(proc.stderr or proc.stdout)}"
+        )

@@ -63,6 +63,15 @@ class StoreBackend(ABC):
 
     name: str = "base"
 
+    @property
+    def supports_content_verify(self) -> bool:
+        """True when verify() proves byte-identity (sha256), not just
+        name+size. Backends that cannot (e.g. TeraBox, whose API exposes
+        no remote checksum) MUST override to False; auto-delete paths
+        refuse to clear the local copy for such tiers."""
+
+        return True
+
     @abstractmethod
     def health(self) -> HealthStatus:
         """Probe backend usability. Must not fake success."""

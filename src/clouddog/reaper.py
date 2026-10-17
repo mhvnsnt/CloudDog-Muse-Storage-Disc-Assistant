@@ -36,20 +36,24 @@ class ReapReport:
     halt_reason: str = ""
 
 
-def compute_hash(path: str, algo: str) -> str:
-    """Compute a file hash.
+def compute_hash(path: str, algo: str = "git-sha1") -> str:
+    """Compute a file hash, streaming in 8 MiB chunks (safe for multi-GB blobs).
 
     algo "git-sha1": sha1("blob <len>\\0" + data) — matches the GitHub
     git-blobs API SHA. algo "sha256": plain sha256 — matches release
     asset checksums.
     """
-    with open(path, "rb") as f:
-        data = f.read()
     if algo == "git-sha1":
-        return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
-    if algo == "sha256":
-        return hashlib.sha256(data).hexdigest()
-    raise ValueError(f"unknown hash_algo: {algo!r}")
+        h = hashlib.sha1()
+        h.update(b"blob %d\0" % os.path.getsize(path))
+    elif algo == "sha256":
+        h = hashlib.sha256()
+    else:
+        raise ValueError(f"unknown hash_algo: {algo!r}")
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 class Reaper:
@@ -58,6 +62,13 @@ class Reaper:
     manifest maps rel-path (relative to src_dir) -> expected hex digest.
     Only manifest-listed files are ever candidates for deletion; everything
     else under src_dir is ignored.
+
+    Deletion requires TWO proofs: (1) the local file hashes to the
+    manifest-recorded SHA (lane accounting), and (2) ``store_verify`` —
+    a caller-supplied callback that checks the file against the LIVE
+    store (``backend.verify``). The manifest is a local claim; the live
+    store check is the proof. If ``store_verify`` is None, live runs
+    refuse to delete (fail closed); dry runs are unaffected.
     """
 
     def __init__(
@@ -69,6 +80,7 @@ class Reaper:
         hash_algo: str = "git-sha1",
         spot_check: Callable[[str, str], bool] | None = None,
         spot_every: int = 20,
+        store_verify: Callable[[str, str], bool] | None = None,
         protected_suffixes: tuple[str, ...] = (".py", ".log", ".json", ".sha256"),
         protected_names: tuple[str, ...] | None = None,
     ) -> None:
@@ -84,6 +96,7 @@ class Reaper:
         self._hash_algo = hash_algo
         self._spot_check = spot_check
         self._spot_every = max(1, int(spot_every))
+        self._store_verify = store_verify
         self._protected_suffixes = tuple(protected_suffixes)
         names: set[str] = set(protected_names or ())
         for p in (log_path, state_path):
@@ -213,6 +226,28 @@ class Reaper:
         size = os.path.getsize(guarded)
         if dry_run:
             self.log("WOULD-REAP %s %s %d" % (rel, sha, size))
+            return "skipped", spot_count
+        # Live-store proof (C1): the manifest is a local claim. Without a
+        # caller-supplied live verification, refuse to delete (fail closed).
+        if self._store_verify is None:
+            self.log("NO-STORE-VERIFY %s (no live store check wired) NOT deleted" % rel)
+            return "skipped", spot_count
+        try:
+            live_ok = self._store_verify(rel, guarded)
+        except Exception as e:  # noqa: BLE001
+            self.log("STORE-VERIFY-ERROR %s (%s) NOT deleted" % (rel, e))
+            return "skipped", spot_count
+        if not live_ok:
+            self.log("STORE-VERIFY-FAILED %s NOT deleted" % rel)
+            return "mismatch", spot_count
+        # TOCTOU re-check (M5): re-stat right before delete; abort on change.
+        try:
+            st = os.stat(guarded)
+        except OSError as e:
+            self.log("READ-ERROR %s (%s)" % (rel, e))
+            return "skipped", spot_count
+        if st.st_size != size:
+            self.log("CHANGED-SINCE-HASH %s (size moved) NOT deleted" % rel)
             return "skipped", spot_count
         os.remove(guarded)
         reaped.add(rel)

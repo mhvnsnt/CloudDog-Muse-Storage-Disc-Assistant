@@ -145,6 +145,89 @@ Candidates evaluated for the mission; wired only where genuinely useful:
 
 ---
 
+## CloudDog v1 engine package + live dashboard (2026-10-17)
+
+Built **on top of** `cloud_dog.py` — same verify-then-delete religion, new
+capabilities. Two tools, one mission:
+
+| | `cloud_dog.py` (single file) | `src/clouddog/` package + `clouddog` CLI |
+|---|---|---|
+| Style | lean stdlib CLI, registry-driven | importable engine library + CLI + daemon + dashboard |
+| Backends | github, terabox, kaggle, TorBox-mirror | github, terabox, drive (rclone) |
+| Law engine | sacred/in-flight guards | full `policy.py`: SACRED / NEVER_DELETE / STORE / STORE_AND_CLEAR / KEEP_LOCAL per the owner's disk laws |
+| Daemon | `daemon` subcommand | `clouddog daemon` (tick loop, --once, --dry-run) |
+| Audit | `cloud-dog-audit.jsonl` | `AuditJournal` (JSONL + `disk-cleanup-log.md` format) |
+| Dashboard | TS real-disk bridge (`server.ts`) | Python stdlib dashboard, **zero mock data** |
+| Torrent | TorBox cloud API mirror | libtorrent streaming ingest |
+
+Both write to the same audit log (`~/workspace/agent-ops/disk-cleanup-log.md`).
+The Python dashboard surfaces `cloud_dog.py`'s registry in its lanes view.
+
+### Install
+
+```bash
+pip install -e ".[test]"      # or: PYTHONPATH=src python3 -m clouddog.cli ...
+```
+
+### CLI
+
+```bash
+clouddog scan --path ~/workspace              # policy evaluation per disk law
+clouddog store <path> --tier github --remote-ref mhvnsnt/repo@tag
+clouddog verify <path> --backend github --locator mhvnsnt/repo@tag/asset
+clouddog reap --manifest lane.json --src-dir /path/to/files
+clouddog daemon --interval 600 --once --dry-run
+clouddog du --path ~/workspace --depth 2       # dust-powered visual du
+clouddog dedupe --path ~/workspace             # fclones duplicate report (never deletes)
+clouddog dashboard --port 8899                 # live dashboard, 127.0.0.1 only
+```
+
+`--dry-run` on everything destructive. Exit codes: 0 ok, 2 usage, 3 failed verify/policy.
+
+### Dashboard
+
+`clouddog dashboard` serves a stdlib-`http.server` API + vanilla-JS frontend
+(no build step, no CDN). Every number is live: `df`/`du`, policy scan,
+lane manifests (`blob_checkpoint.json`), backend health, audit journal.
+Panels: storage overview, clutter table, terminal (`/api/cli`, allowlisted
+subcommands), daemon scheduler (generates real systemd/LaunchAgent/Task
+Scheduler configs), repo explorer (`gh api`), torrent mirror, compute
+(real CPU/RAM/disk; GPU only if `nvidia-smi` exists — no fake vVRAM),
+emergency reaper, broadcast drafts (formatting only — never writes
+AGENTS.md/MEMORY.md), relocation wizard.
+
+API contract: `dashboard/API.md`.
+
+### Honest capability matrix (2026-10-17, verified live)
+
+| Capability | Status | Notes |
+|---|---|---|
+| GitHub releases backend | **LIVE** | `gh` CLI; split >2GB; re-download + sha256 verify |
+| TeraBox backend | **DEGRADED** | wraps real `tbupload.py`; `.creds.json` absent — needs one-time browser cookie flow (see `agent-ops/TERABOX-SESSION-KEEPER.md`) |
+| Drive backend | **WIRED, awaiting config** | rclone v1.75.2 installed at `~/workspace/tools/rclone/`; needs `rclone config` (owner Google OAuth) |
+| Kaggle backend | via `cloud_dog.py` | REST, needs `~/.kaggle/kaggle.json` |
+| Torrent ingest (libtorrent) | **LIVE** | libtorrent 2.1.1 streaming; pieces upload + delete as they verify |
+| Torrent mirror (TorBox) | via `cloud_dog.py mirror` | needs `custom.torbox` Secure Vault credential |
+| Policy law engine | **LIVE** | 28 tests; sacred/in-flight/game-file detection |
+| Delete-as-you-go reaper | **LIVE** | generalized from the proven scooby `blob_reaper.py` |
+| Dashboard | **LIVE** | stdlib server; all endpoints live-data |
+| dust / fclones | **LIVE** | `~/workspace/tools/dust`, `~/workspace/tools/fclones`; wired as `clouddog du` / `clouddog dedupe` |
+| sqlite | stdlib available | JSON registry + JSONL journal suffice today; candidate if concurrent writers appear |
+
+### Open-source tooling pulled in (2026-10-17)
+
+- **rclone v1.75.2** (`~/workspace/tools/rclone/`) — multi-cloud; wires the Drive backend. Why: Drive is a standing store tier with no uploader.
+- **dust v1.2.3** (`~/workspace/tools/dust/`) — visual `du`; `clouddog du`. Why: instant readable disk maps for triage.
+- **fclones v0.34.0** (`~/workspace/tools/fclones/`) — duplicate finder; `clouddog dedupe` (report only). Why: duplicates are pure waste; candidates feed the store→verify→clear flow.
+- **libtorrent 2.1.1** (pip) — streaming torrent ingest with per-file upload+delete. Why: torrents must never stage multi-GB locally.
+- **sqlite3** — stdlib, no install. Not wired yet; documented candidate for when the registry outgrows JSON.
+
+---
+
+## Spark-app dashboard & scripts (2026-10-17)
+
+---
+
 ## 2. `clouddog/` — policy engine, Drive store, config, bridge (Python)
 
 Library package that EXTENDS the `cloud_dog.py` v2 engine (which owns the

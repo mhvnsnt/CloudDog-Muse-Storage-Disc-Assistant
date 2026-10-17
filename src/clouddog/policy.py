@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 import os
+import sys
 import time
 
 __all__ = [
@@ -193,6 +194,12 @@ def evaluate(path: str, scan_root: str | None = None) -> Decision:
     over everything, then NEVER-DELETE-GAME-FILES, then KEEP_LOCAL (tooling /
     hot small files), then the size-based default.
     """
+    if not path or not str(path).strip():
+        return Decision(
+            Action.KEEP_LOCAL,
+            None,
+            "keep_local: empty path; never act on what you cannot see",
+        )
     p = Path(path)
     info = _stat_info(p)
     if info is None:
@@ -277,4 +284,8 @@ def scan(root: str, max_entries: int = 200) -> list[dict]:
         })
 
     entries.sort(key=lambda e: e["bytes"], reverse=True)
+    if len(entries) > max_entries:
+        # L7: never silently truncate — the daemon would never see the rest.
+        print(f"[clouddog] scan truncated: {len(entries)} entries, "
+              f"reporting top {max_entries}", file=sys.stderr)
     return entries[:max_entries]

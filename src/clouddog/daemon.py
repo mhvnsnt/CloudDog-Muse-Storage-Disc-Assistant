@@ -129,6 +129,7 @@ class Daemon:
         journal: "object | None" = None,
         disk_path: str = "/home/hatch",
         dry_run: bool = False,
+        pidfile: str | None = None,
     ) -> None:
         self.roots = list(roots)
         self.interval_s = interval_s
@@ -136,6 +137,36 @@ class Daemon:
         self.journal = journal if journal is not None else _default_journal()
         self.disk_path = disk_path
         self.dry_run = dry_run
+        self.pidfile = pidfile or os.path.expanduser("~/.clouddog/daemon.pid")
+
+    # ------------------------------------------------------------ internals
+
+    def _acquire_pidfile(self) -> bool:
+        """Single-instance guard (L3). Returns False when another live
+        daemon holds the pidfile."""
+        try:
+            os.makedirs(os.path.dirname(self.pidfile), exist_ok=True)
+            fd = os.open(self.pidfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                with open(self.pidfile) as fh:
+                    old_pid = int(fh.read().strip())
+                os.kill(old_pid, 0)  # raises if the process is gone
+                return False  # another live daemon holds it
+            except (ValueError, OSError, FileNotFoundError):
+                pass  # stale pidfile; take it over
+            fd = os.open(self.pidfile, os.O_CREAT | os.O_WRONLY | os.O_TRUNC)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(str(os.getpid()))
+        return True
+
+    def _release_pidfile(self) -> None:
+        try:
+            with open(self.pidfile) as fh:
+                if fh.read().strip() == str(os.getpid()):
+                    os.remove(self.pidfile)
+        except OSError:
+            pass
 
     # ------------------------------------------------------------ internals
 
@@ -218,6 +249,12 @@ class Daemon:
             report.skipped_sacred += 1
             return
 
+        # M3: backends are file-only; directories would error every tick.
+        # Skip them quietly (a future directory-tar flow can pick them up).
+        if os.path.isdir(path) and not os.path.islink(path):
+            report.skipped_sacred += 1
+            return
+
         backend = self.backends.get(tier)
         if backend is None:
             self._record_error(
@@ -291,6 +328,33 @@ class Daemon:
         if action == "store_and_clear":
             if self.dry_run:
                 return  # dry-run: verify the pipeline, delete nothing
+            if not backend.supports_content_verify:
+                # H2: name+size-only verification is not byte-proof; store
+                # but never clear local on such tiers.
+                self._journal("skipped", path, size, stored.locator,
+                              f"backend={tier} has no content verification; "
+                              f"kept local")
+                return
+            # M5: re-evaluate policy just before delete — the file may have
+            # become sacred/in-flight since the scan.
+            from clouddog import policy as _policy
+            try:
+                dec = _policy.evaluate(path)
+            except Exception:
+                dec = None
+            if dec is None or dec.action != _policy.Action.STORE_AND_CLEAR:
+                self._journal(
+                    "skipped", path, size, stored.locator,
+                    "policy changed since scan; kept local")
+                return
+            # M5: re-stat just before delete; abort if the file moved.
+            try:
+                if os.path.getsize(path) != size:
+                    self._journal("skipped", path, size, stored.locator,
+                                  "size changed since verify; kept local")
+                    return
+            except OSError:
+                return
             try:
                 freed = self._delete_local(path, action)
             except PolicyViolation:
@@ -368,38 +432,45 @@ class Daemon:
 
     def run_forever(self) -> None:
         """Loop tick() every interval_s. Prints only when critical or on error."""
+        if not self._acquire_pidfile():
+            print(f"[clouddog] another daemon is already running "
+                  f"(pidfile {self.pidfile}); exiting")
+            return
         print(f"[clouddog] daemon starting: roots={self.roots} "
               f"interval={self.interval_s}s dry_run={self.dry_run}")
-        while True:
-            try:
-                report = self.tick()
-            except KeyboardInterrupt:
-                print("[clouddog] daemon stopping (keyboard interrupt)")
-                break
-            except Exception as exc:  # a tick must never kill the daemon
-                print(f"[clouddog] tick crashed: {exc}")
+        try:
+            while True:
+                try:
+                    report = self.tick()
+                except KeyboardInterrupt:
+                    print("[clouddog] daemon stopping (keyboard interrupt)")
+                    break
+                except Exception as exc:  # a tick must never kill the daemon
+                    print(f"[clouddog] tick crashed: {exc}")
+                    try:
+                        time.sleep(self.interval_s)
+                    except KeyboardInterrupt:
+                        print("[clouddog] daemon stopping (keyboard interrupt)")
+                        break
+                    continue
+
+                if report.critical or report.errors:
+                    print(
+                        f"[clouddog] tick @ {report.started_utc}: "
+                        f"disk {report.disk_before_pct:.1f}%->{report.disk_after_pct:.1f}% "
+                        f"stored={report.stored} verified={report.verified} "
+                        f"cleared={report.cleared} freed={report.freed_bytes}B "
+                        f"skipped_sacred={report.skipped_sacred} "
+                        f"errors={len(report.errors)} critical={report.critical}"
+                    )
+                    for err in report.errors:
+                        print(f"[clouddog]   error: {err}")
+                    if report.critical:
+                        print(f"[clouddog]   CRITICAL: {report.critical_msg}")
                 try:
                     time.sleep(self.interval_s)
                 except KeyboardInterrupt:
                     print("[clouddog] daemon stopping (keyboard interrupt)")
                     break
-                continue
-
-            if report.critical or report.errors:
-                print(
-                    f"[clouddog] tick @ {report.started_utc}: "
-                    f"disk {report.disk_before_pct:.1f}%->{report.disk_after_pct:.1f}% "
-                    f"stored={report.stored} verified={report.verified} "
-                    f"cleared={report.cleared} freed={report.freed_bytes}B "
-                    f"skipped_sacred={report.skipped_sacred} "
-                    f"errors={len(report.errors)} critical={report.critical}"
-                )
-                for err in report.errors:
-                    print(f"[clouddog]   error: {err}")
-                if report.critical:
-                    print(f"[clouddog]   CRITICAL: {report.critical_msg}")
-            try:
-                time.sleep(self.interval_s)
-            except KeyboardInterrupt:
-                print("[clouddog] daemon stopping (keyboard interrupt)")
-                break
+        finally:
+            self._release_pidfile()

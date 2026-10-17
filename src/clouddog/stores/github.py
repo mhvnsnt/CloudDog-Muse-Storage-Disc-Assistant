@@ -213,6 +213,18 @@ class GitHubReleaseBackend(StoreBackend):
             )
         return path
 
+    def _remote_sha_matches(
+        self, repo: str, tag: str, asset_name: str, expected_sha256: str
+    ) -> bool:
+        """True iff the existing remote asset downloads sha256-identical."""
+        with tempfile.TemporaryDirectory(prefix="clouddog-gh-reuse-") as tmpdir:
+            path = self._download_asset(repo, tag, asset_name, tmpdir)
+            digest = hashlib.sha256()
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(8 * 1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest() == expected_sha256
+
     def _verify_assets(
         self, repo: str, tag: str, asset_names: list[str], expected_sha256: str
     ) -> None:
@@ -303,6 +315,23 @@ class GitHubReleaseBackend(StoreBackend):
             extra = {"parts": len(asset_names), "asset_names": asset_names}
         else:
             asset_names = [base]
+            # L5: never silently clobber a same-named asset from another
+            # lane/file. If it exists and is byte-identical, reuse it;
+            # if it differs, refuse.
+            existing = self._asset_size(repo, tag, base)
+            if existing is not None:
+                if existing == size and self._remote_sha_matches(
+                        repo, tag, base, sha256):
+                    locator = f"{repo}@{tag}/{base}"
+                    return StoredRef(
+                        backend=self.name, locator=locator, size=size,
+                        sha256=sha256,
+                        extra={"parts": 1, "asset_names": asset_names,
+                               "reused": True},
+                    )
+                raise CloudDogError(
+                    f"asset {base!r} already exists on {repo}@{tag} with "
+                    f"different content; refusing to clobber")
             self._run_gh(
                 ["release", "upload", "--repo", repo, tag, local_path, "--clobber"],
                 timeout=7200,

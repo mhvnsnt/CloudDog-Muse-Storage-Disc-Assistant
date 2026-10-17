@@ -395,8 +395,21 @@ class _TorrentEngine:
                 continue  # zero-byte files carry nothing; skip the store round-trip
             if i >= len(progress) or progress[i] < size:
                 continue  # not complete yet
-            local_path = os.path.join(entry["piece_dir"], rel_path)
+            # H6: torrent metadata paths are untrusted — contain the join.
+            piece_real = os.path.realpath(entry["piece_dir"])
+            local_path = os.path.realpath(os.path.join(piece_real, rel_path))
+            if not (local_path == piece_real
+                    or local_path.startswith(piece_real + os.sep)):
+                log.warning("torrent %s: path traversal in metadata, skipping %r",
+                            tid, rel_path)
+                continue
             if not os.path.isfile(local_path):
+                continue
+            # H2: never clear local on tiers without content verification.
+            # (getattr: duck-typed test backends default to True.)
+            if not getattr(backend, "supports_content_verify", True):
+                log.info("torrent %s: backend %s has no content verification; "
+                         "keeping %s local", tid, backend.name, rel_path)
                 continue
             stored = backend.store(local_path, entry["remote_ref"])
             # store() byte-verifies before returning (StoreBackend contract);
@@ -485,8 +498,16 @@ class _TorrentEngine:
                 log.warning("remove_torrent failed for %s", tid, exc_info=True)
         piece_dir = (entry or saved or {}).get("piece_dir")
         if delete_pieces and piece_dir:
-            shutil.rmtree(piece_dir, ignore_errors=True)
-            log.info("torrent %s: piece dir removed", tid)
+            # L2: contain the rmtree — piece_dir may come from the on-disk
+            # state file, which is local-trust only.
+            root_real = os.path.realpath(str(_pieces_root()))
+            dir_real = os.path.realpath(piece_dir)
+            if dir_real == root_real or dir_real.startswith(root_real + os.sep):
+                shutil.rmtree(dir_real, ignore_errors=True)
+                log.info("torrent %s: piece dir removed", tid)
+            else:
+                log.warning("torrent %s: piece_dir escapes pieces root, not removing",
+                            tid)
         if entry is None and saved is None:
             raise CloudDogError(f"unknown torrent id: {tid}")
 
