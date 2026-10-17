@@ -1263,3 +1263,54 @@ def test_cmd_mirror_search_live():
     assert len(data[0]["downloads"]) >= 1, "no download URLs returned"
     assert data[0]["downloads"][0]["url"].startswith(
         "https://archive.org/download/"), data[0]["downloads"][0]["url"]
+# --------------------------------------------------- blake3 fast-hash tests
+def test_fast_hash_file_uses_blake3_when_available():
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".dat") as f:
+        f.write(b"blake3-test-bytes")
+        p = f.name
+    try:
+        if not cloud_dog._blake3_available():
+            raise AssertionError("blake3 should be installed for this test")
+        import blake3
+        expected = blake3.blake3(b"blake3-test-bytes").hexdigest()
+        assert cloud_dog.fast_hash_file(p) == expected
+        assert len(expected) == 64
+    finally:
+        os.unlink(p)
+
+
+def test_fast_hash_file_falls_back_to_sha256():
+    import sys, tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".dat") as f:
+        f.write(b"fallback-bytes")
+        p = f.name
+    old = sys.modules.get("blake3")
+    sys.modules["blake3"] = None  # force ImportError on 'import blake3'
+    old_b3 = _patch(cloud_dog, "_b3sum_bin", lambda: None)
+    try:
+        import hashlib
+        expected = hashlib.sha256(b"fallback-bytes").hexdigest()
+        assert cloud_dog.fast_hash_file(p) == expected
+    finally:
+        _patch(cloud_dog, "_b3sum_bin", old_b3)
+        if old is None:
+            del sys.modules["blake3"]
+        else:
+            sys.modules["blake3"] = old
+        os.unlink(p)
+
+
+def test_fast_hash_agrees_on_identical_files():
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".dat") as f:
+        f.write(b"same")
+        p1 = f.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".dat") as f:
+        f.write(b"same")
+        p2 = f.name
+    try:
+        assert cloud_dog.fast_hash_file(p1) == cloud_dog.fast_hash_file(p2)
+    finally:
+        os.unlink(p1)
+        os.unlink(p2)

@@ -333,6 +333,18 @@ Surveyed 2026-10-17 by the build coordinator (web sources, no installs).
 Verdicts below; nothing here is wired into v1 — per the test-between-patches
 order, each gets its own researched, tested patch.
 
+### BLAKE3 — WIRED (2026-10-17, PR #16)
+- URL: https://github.com/BLAKE3-team/BLAKE3 — License: **CC0 / Apache-2.0
+  dual** (verified). Cryptographic 256-bit hash, ~8.4 GB/s/thread.
+- Wired as the optional internal hash accelerator: `fast_hash_file()` uses
+  BLAKE3 when the `blake3` pip package is importable, else falls back to
+  SHA-256. Used for INTERNAL comparisons only (dedup kept-vs-candidate
+  re-hash) — store digests stay SHA-256 where the store demands it (GitHub
+  release asset digests are SHA-256; BLAKE3 cannot replace those).
+- Measured on this VM: 2.6x faster than SHA-256 (50MB file).
+- 3 new tests (blake3 digest match, sha256 fallback via hidden module,
+  identical-file agreement).
+
 ### rclone — WIRED (v1)
 - URL: https://rclone.org/ — License: **MIT** (verified against the official
   backend tier list, crawled 2026-10-16).

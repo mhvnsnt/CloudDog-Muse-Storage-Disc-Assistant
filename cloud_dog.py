@@ -139,13 +139,31 @@ def _b3sum_bin():
     return cand if os.path.isfile(cand) and os.access(cand, os.X_OK) else None
 
 
-def fast_hash_file(path):
-    """Fast BLAKE3 hash via bundled b3sum binary, else SHA-256 fallback.
+def _blake3_available():
+    """True when the optional blake3 pip package is importable."""
+    try:
+        import blake3  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
-    For INTERNAL comparisons only (not store digests) — the digest only
-    needs to match between the two files being compared. GitHub release
-    assets always use SHA-256; use sha256_file() for those.
+
+def fast_hash_file(path, chunk=1 << 20):
+    """Fast BLAKE3 hash for INTERNAL comparisons (not store digests).
+
+    Prefers the in-process `blake3` pip package (fastest, no spawn
+    overhead), then the bundled b3sum binary (tools/bin/), then SHA-256.
+    The digest only needs to match between the two files being compared —
+    never use this where a store expects a specific digest (GitHub release
+    assets are SHA-256; use sha256_file() for those).
     """
+    if _blake3_available():
+        import blake3
+        h = blake3.blake3()
+        with open(path, "rb") as f:
+            for blk in iter(lambda: f.read(chunk), b""):
+                h.update(blk)
+        return h.hexdigest()
     b3 = _b3sum_bin()
     if b3:
         try:
@@ -155,7 +173,7 @@ def fast_hash_file(path):
                 return out.stdout.split()[0]
         except (subprocess.SubprocessError, OSError):
             pass
-    return sha256_file(path)
+    return sha256_file(path, chunk)
 
 
 def is_sacred(path):
@@ -326,15 +344,29 @@ def log_action(text):
 
 
 # ---------------------------------------------------------------- commands
+def _repo_tool_bin(name):
+    """Path to a binary vendored in the repo's tools/bin/, or None."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    cand = os.path.join(here, "tools", "bin", name)
+    if os.path.isfile(cand) and os.access(cand, os.X_OK):
+        return cand
+    return None
+
+
+def _workspace_tool_bin(name, *rel_parts):
+    """Locate a tool under ~/workspace/tools/<name>/... (this VM's layout)."""
+    for rel in rel_parts:
+        p = os.path.join(WORKSPACE, "tools", name, rel)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
 def _dust_binary():
     """Locate the dust binary (optional dependency for fast scans)."""
-    found = shutil.which("dust")
-    if found:
-        return found
-    known = os.path.join(WORKSPACE, "tools", "dust", "dust")
-    if os.path.isfile(known) and os.access(known, os.X_OK):
-        return known
-    return None
+    return (_repo_tool_bin("dust") or shutil.which("dust")
+            or _workspace_tool_bin("dust", "dust",
+                                  os.path.join("dust", "dust")))
 
 
 def _parse_dust_size(s):
@@ -1695,14 +1727,10 @@ def cmd_verify_v2(args):
 
 def _fclones_binary():
     """Locate the fclones binary (optional dependency for dedup)."""
-    found = shutil.which("fclones")
-    if found:
-        return found
-    for rel in ("tools/fclones/usr/bin/fclones", "tools/fclones/fclones"):
-        p = os.path.join(WORKSPACE, rel)
-        if os.path.isfile(p) and os.access(p, os.X_OK):
-            return p
-    return None
+    return (_repo_tool_bin("fclones") or shutil.which("fclones")
+            or _workspace_tool_bin("fclones",
+                                  os.path.join("usr", "bin", "fclones"),
+                                  "fclones"))
 
 
 def _in_git_tree(path):
@@ -1770,7 +1798,7 @@ def cmd_dedup(args):
         if not os.path.isfile(kept):
             continue
         try:
-            kept_hash = sha256_file(kept)
+            kept_hash = fast_hash_file(kept)
         except OSError:
             continue
         for path in files[1:]:
@@ -1780,8 +1808,8 @@ def cmd_dedup(args):
                 skipped.append((path, "inside git working tree"))
                 continue
             try:
-                if sha256_file(path) != kept_hash:
-                    failed.append((path, "sha256 mismatch vs kept copy"))
+                if fast_hash_file(path) != kept_hash:
+                    failed.append((path, "hash mismatch vs kept copy"))
                     continue
             except OSError as e:
                 failed.append((path, str(e)[:120]))
