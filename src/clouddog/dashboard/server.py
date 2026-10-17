@@ -27,9 +27,11 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
+import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -42,7 +44,10 @@ ALLOWED_ROOTS = ("/home/hatch", "/tmp")
 MAX_DU_ENTRIES = 200
 LANE_GLOB_MAX = 20
 CLI_TIMEOUT_S = 120
-CLI_ALLOWLIST = frozenset({"scan", "store", "reap", "daemon", "verify"})
+# H5: "daemon" removed — ["daemon"] runs run_forever() in the worker thread,
+# which never returns; the thread would tick live deletes forever inside
+# the dashboard process after the HTTP call timed out.
+CLI_ALLOWLIST = frozenset({"scan", "store", "reap", "verify"})
 ARG_RE = re.compile(r"^[A-Za-z0-9_./:@=\-]+$")
 FLAG_RE = re.compile(r"^-{1,2}[A-Za-z][A-Za-z0-9_-]*$")
 OWNER_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -60,7 +65,10 @@ def _utcnow() -> str:
 
 
 # In-flight sweep jobs: job_id -> {status, started, dry_run, report, error}.
+# M4: guarded by _SWEEP_LOCK, uuid ids (no collisions), capped at 20 jobs.
 _SWEEP_JOBS: dict = {}
+_SWEEP_LOCK = threading.Lock()
+_SWEEP_MAX_JOBS = 20
 
 
 def _send_json(handler: BaseHTTPRequestHandler, obj: object, status: int = 200) -> None:
@@ -1017,12 +1025,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
             )
             return
         status.setdefault("torrents", [])
-        if status.get("available") and hasattr(mod, "_TorrentEngine"):
-            try:
-                status["torrents"] = mod._TorrentEngine().status_list()
-            except Exception as exc:  # noqa: BLE001
-                status["torrents"] = []
-                status["reason"] = f"{status.get('reason', '')} (list failed: {exc})"
+        if status.get("available"):
+            # M1: use the singleton engine (owns the session + pump), not a
+            # fresh instance — otherwise live torrents never appear.
+            eng = getattr(mod, "_ENGINE", None)
+            if eng is not None:
+                try:
+                    status["torrents"] = eng.status_list()
+                except Exception as exc:  # noqa: BLE001
+                    status["torrents"] = []
+                    status["reason"] = f"{status.get('reason', '')} (list failed: {exc})"
         _send_json(self, status)
 
     # -- POST handlers ------------------------------------------------
@@ -1034,7 +1046,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         real = _require_allowed(body.get("path", ""))
         tier = body.get("tier", "")
         remote_ref = body.get("remote_ref", "")
-        dry_run = bool(body.get("dry_run", False))
+        dry_run = bool(body.get("dry_run", True))  # H7: destructive endpoints default to dry-run
         if tier not in KNOWN_BACKENDS:
             raise ValueError(f"tier must be one of {KNOWN_BACKENDS}")
         if not isinstance(remote_ref, str) or not remote_ref:
@@ -1094,7 +1106,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         manifest_raw = body.get("manifest", "")
         src_dir = _require_allowed(body.get("src_dir", ""))
-        dry_run = bool(body.get("dry_run", False))
+        dry_run = bool(body.get("dry_run", True))  # H7: destructive endpoints default to dry-run
         mod, merr = _engine("clouddog.reaper")
         if merr:
             _send_error(self, merr, 503)
@@ -1126,8 +1138,44 @@ class DashboardHandler(BaseHTTPRequestHandler):
             log_path = logs[-1] if logs else os.path.join(src_dir, "clouddog-reap.log")
         try:
             if hasattr(mod, "Reaper"):
+                # C1: live reap requires a backend + remote ref so every
+                # delete is verified against the LIVE store.
+                store_verify = None
+                if not dry_run:
+                    tier = body.get("backend", "")
+                    remote_ref = body.get("remote_ref", "")
+                    if tier not in KNOWN_BACKENDS or not remote_ref:
+                        _send_error(self, "live reap requires 'backend' and "
+                                          "'remote_ref' (manifest alone is a claim, "
+                                          "not proof)", 400)
+                        return
+                    if tier == "terabox":
+                        _send_error(self, "live reap to terabox refused: no remote "
+                                          "checksum (H2)", 409)
+                        return
+                    bmod, berr = _engine(f"clouddog.stores.{tier}")
+                    if berr:
+                        _send_error(self, berr, 503)
+                        return
+                    binst, bierr = _backend_instance(bmod)
+                    if bierr:
+                        _send_error(self, bierr, 503)
+                        return
+                    from clouddog.stores.base import StoredRef as _SR
+                    if tier == "github":
+                        def store_verify(rel, full, _b=binst, _r=remote_ref):
+                            return _b.verify(full, _SR(
+                                backend="github",
+                                locator=f"{_r}/{os.path.basename(full)}",
+                                size=os.path.getsize(full), sha256=""))
+                    else:
+                        def store_verify(rel, full, _b=binst, _r=remote_ref):
+                            return _b.verify(full, _SR(
+                                backend="drive", locator=f"{_r}/{rel}",
+                                size=os.path.getsize(full), sha256=""))
                 reaper = mod.Reaper(
-                    src_dir=src_dir, manifest=manifest, log_path=log_path
+                    src_dir=src_dir, manifest=manifest, log_path=log_path,
+                    store_verify=store_verify,
                 )
                 report = _report_to_dict(reaper.reap_once(dry_run=dry_run))
             else:
@@ -1149,15 +1197,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if err:
             _send_error(self, err, 400)
             return
-        dry_run = bool(body.get("dry_run", False))
+        dry_run = bool(body.get("dry_run", True))  # H7: destructive endpoints default to dry-run
         mod, merr = _engine("clouddog.daemon")
         if merr:
             _send_error(self, merr, 503)
             return
-        job_id = "sweep-%d" % int(time.time() * 1000)
-        _SWEEP_JOBS[job_id] = {"status": "running", "started": _utcnow(),
-                               "dry_run": dry_run, "report": None,
-                               "error": None}
+        job_id = "sweep-%s" % uuid.uuid4().hex[:12]
+        with _SWEEP_LOCK:
+            # Evict oldest finished jobs past the cap.
+            if len(_SWEEP_JOBS) >= _SWEEP_MAX_JOBS:
+                done = [jid for jid, j in _SWEEP_JOBS.items()
+                        if j.get("status") != "running"]
+                for jid in sorted(done,
+                                  key=lambda j: _SWEEP_JOBS[j]["started"])[:len(done) - _SWEEP_MAX_JOBS + 1]:
+                    del _SWEEP_JOBS[jid]
+            _SWEEP_JOBS[job_id] = {"status": "running", "started": _utcnow(),
+                                   "dry_run": dry_run, "report": None,
+                                   "error": None}
 
         def _run():
             try:
@@ -1172,10 +1228,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         roots=[os.path.expanduser("~/workspace")],
                         dry_run=dry_run,
                     )
-                _SWEEP_JOBS[job_id].update({"status": "done", "report": report})
+                with _SWEEP_LOCK:
+                    _SWEEP_JOBS[job_id].update({"status": "done", "report": report})
             except Exception as exc:  # noqa: BLE001
-                _SWEEP_JOBS[job_id].update({"status": "error",
-                                            "error": str(exc)[:500]})
+                with _SWEEP_LOCK:
+                    _SWEEP_JOBS[job_id].update({"status": "error",
+                                                "error": str(exc)[:500]})
 
         threading.Thread(target=_run, daemon=True).start()
         _send_json(self, {"ok": True, "job_id": job_id, "status": "running"},
@@ -1184,7 +1242,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _handle_sweep_status(self) -> None:
         query = urllib.parse.urlparse(self.path).query
         job_id = urllib.parse.parse_qs(query).get("job", [None])[0]
-        job = _SWEEP_JOBS.get(job_id) if job_id else None
+        with _SWEEP_LOCK:
+            raw = _SWEEP_JOBS.get(job_id) if job_id else None
+            job = dict(raw) if raw is not None else None
         if job is None:
             _send_error(self, "unknown sweep job", 404)
             return
@@ -1263,7 +1323,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         real = _require_allowed(body.get("path", ""))
         tier = body.get("tier", "")
         remote_ref = body.get("remote_ref", "")
-        dry_run = bool(body.get("dry_run", False))
+        dry_run = bool(body.get("dry_run", True))  # H7: destructive endpoints default to dry-run
         if not os.path.isdir(real):
             raise ValueError("path must be an existing directory")
         if tier not in KNOWN_BACKENDS:
@@ -1298,6 +1358,47 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not entries:
             _send_error(self, "directory contains no files to relocate", 400)
             return
+        # H2: terabox has no remote checksum — relocate would clear local on
+        # name+size-only "verification". Refused.
+        if tier == "terabox":
+            _send_error(self, "relocate to terabox refused: no remote checksum "
+                             "(name+size verification is not byte-proof)", 409)
+            return
+        # H3: policy gate — never relocate sacred/in-flight/game files.
+        pmod, perr = _engine("clouddog.policy")
+        if perr:
+            _send_error(self, perr, 503)
+            return
+        try:
+            decision = pmod.evaluate(real)
+        except Exception as exc:  # noqa: BLE001
+            _send_error(self, f"policy evaluation failed: {exc}", 500)
+            return
+        if decision.action.value not in ("store", "store_and_clear"):
+            _send_error(
+                self,
+                f"relocate refused by policy: {decision.action.value} "
+                f"({decision.reason})",
+                409,
+            )
+            return
+        # Per-file gate: skip in-flight-suffixed files individually.
+        kept = []
+        for e in entries:
+            try:
+                fdec = pmod.evaluate(e["local"])
+            except Exception:  # noqa: BLE001
+                fdec = None
+            if fdec is not None and fdec.action.value not in ("store", "store_and_clear"):
+                kept.append(e["rel"])
+        if kept:
+            _send_error(
+                self,
+                "relocate refused: policy protects files in this directory: "
+                + ", ".join(kept[:10]),
+                409,
+            )
+            return
         shim = _relocate_shim(tier, remote_ref, entries)
         manifest_out = [
             {k: e[k] for k in ("rel", "size", "sha256")} for e in entries
@@ -1315,37 +1416,68 @@ class DashboardHandler(BaseHTTPRequestHandler):
             )
             return
         stored_refs = []
+        # H4: github asset names are basenames — stage each file under its
+        # flattened name so the uploaded assets match the retrieval shim.
+        stage_dir = None
         try:
+            if tier == "github":
+                stage_dir = tempfile.mkdtemp(prefix="clouddog-relocate-")
+                for e in entries:
+                    staged = os.path.join(stage_dir, e["flat"])
+                    os.link(e["local"], staged)  # hardlink: no extra disk
+                    e["_staged"] = staged
             for e in entries:
+                local = e.get("_staged") or e["local"]
                 per_file_ref = (
                     f"{remote_ref}/{e['rel']}" if tier != "github" else remote_ref
                 )
-                stored = inst.store(e["local"], per_file_ref, dry_run=False)
+                stored = inst.store(local, per_file_ref, dry_run=False)
                 if not inst.verify(e["local"], stored):
                     raise RuntimeError(f"verify failed after store: {e['rel']}")
                 stored_refs.append(stored.to_dict())
         except Exception as exc:  # noqa: BLE001
-            _send_error(
+            _send_json(
                 self,
-                f"relocate aborted during store/verify: {exc}. "
-                "Original directory left untouched.",
-                502,
+                {"ok": False,
+                 "error": f"relocate aborted during store/verify: {exc}. "
+                          "Original directory left untouched.",
+                 "stored_refs": stored_refs},
+                status=502,
             )
             return
-        # verify-then-clear: every file verified -> delete original, write shim
+        finally:
+            if stage_dir:
+                shutil.rmtree(stage_dir, ignore_errors=True)
+        # M6: write the retrieval shim BEFORE clearing, so recovery info is
+        # never lost; include stored_refs in every error after this point.
         shim_path = real.rstrip(os.sep) + ".retrieve.sh"
         try:
-            shutil.rmtree(real)
             with open(shim_path, "w", encoding="utf-8") as fh:
                 fh.write(shim)
+                fh.flush()
+                os.fsync(fh.fileno())
             os.chmod(shim_path, 0o755)
         except OSError as exc:
-            _send_error(
+            _send_json(
                 self,
-                f"files are stored and verified, but clearing failed: {exc}. "
-                "Nothing was deleted." if os.path.isdir(real)
-                else f"shim write failed after clear: {exc}",
-                500,
+                {"ok": False,
+                 "error": f"files stored and verified but shim write failed: {exc}. "
+                          "Nothing was deleted.",
+                 "stored_refs": stored_refs},
+                status=500,
+            )
+            return
+        try:
+            shutil.rmtree(real)
+        except OSError as exc:
+            _send_json(
+                self,
+                {"ok": False,
+                 "error": f"shim written to {shim_path} but directory clear failed: "
+                          f"{exc}. Retrieve manually if needed.",
+                 "stored_refs": stored_refs,
+                 "shim": shim_path},
+                status=500,
             )
             return
         _send_json(

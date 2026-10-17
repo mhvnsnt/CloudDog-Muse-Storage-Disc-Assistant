@@ -278,8 +278,12 @@ def test_remove_torrent_unknown_id(home):
 def test_remove_torrent_cleans_pieces(home):
     save_path = seed_dir(home)
     ti = make_torrent_info(save_path / "data")
+    # L2: production piece dirs live under _pieces_root(); the test hook
+    # must reflect that for the containment check to allow removal.
+    piece_dir = t._pieces_root() / "testtid"
+    piece_dir.mkdir(parents=True)
     tid = t._engine()._add_torrent_info(ti, "github", "r", FakeBackend(),
-                                       str(save_path))
+                                       str(piece_dir))
     t.remove_torrent(tid, delete_pieces=True)
-    assert not save_path.exists()
+    assert not piece_dir.exists()
     assert t.torrent_status() == []

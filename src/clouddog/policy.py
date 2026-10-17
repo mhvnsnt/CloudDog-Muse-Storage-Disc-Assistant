@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 import os
+import sys
 import time
 
 __all__ = [
@@ -283,4 +284,8 @@ def scan(root: str, max_entries: int = 200) -> list[dict]:
         })
 
     entries.sort(key=lambda e: e["bytes"], reverse=True)
+    if len(entries) > max_entries:
+        # L7: never silently truncate — the daemon would never see the rest.
+        print(f"[clouddog] scan truncated: {len(entries)} entries, "
+              f"reporting top {max_entries}", file=sys.stderr)
     return entries[:max_entries]

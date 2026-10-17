@@ -29,6 +29,9 @@ def write(src, rel, data: bytes):
 
 
 def make_reaper(src, manifest, log_path, state_path, **kw):
+    # Live-delete tests simulate a verified store; the store_verify wiring
+    # itself is covered by test_reaper_refuses_without_store_verify.
+    kw.setdefault("store_verify", lambda rel, full: True)
     return Reaper(str(src), manifest, log_path, state_path=state_path, **kw)
 
 
@@ -245,3 +248,29 @@ def test_compute_hash_git_sha1():
         path = f.name
     assert compute_hash(path, "git-sha1") == git_sha(b"abc")
     assert compute_hash(path, "sha256") == hashlib.sha256(b"abc").hexdigest()
+
+
+def test_reaper_refuses_without_store_verify(lane):
+    """C1: fail closed — no live store check wired means no deletions."""
+    from clouddog.reaper import compute_hash
+    src, log_path, state_path = lane
+    write(src, "a.txt", b"hello")
+    manifest = {"a.txt": compute_hash(str(src / "a.txt"))}
+    r = Reaper(str(src), manifest, log_path, state_path=state_path,
+               store_verify=None)
+    report = r.reap_once(dry_run=False)
+    assert report.reaped == 0
+    assert (src / "a.txt").exists()
+    assert "NO-STORE-VERIFY" in open(log_path).read()
+
+
+def test_reaper_skips_on_failed_store_verify(lane):
+    from clouddog.reaper import compute_hash
+    src, log_path, state_path = lane
+    write(src, "a.txt", b"hello")
+    manifest = {"a.txt": compute_hash(str(src / "a.txt"))}
+    r = Reaper(str(src), manifest, log_path, state_path=state_path,
+               store_verify=lambda rel, full: False)
+    report = r.reap_once(dry_run=False)
+    assert report.reaped == 0
+    assert (src / "a.txt").exists()

@@ -144,6 +144,13 @@ def test_tick_store_verify_clear_deletes_and_journals(tmp_path, monkeypatch):
     entries = [{"path": target, "bytes": size, "action": "store_and_clear",
                 "tier": "github", "reason": "test"}]
     daemon, backend, journal = _make_daemon(tmp_path, monkeypatch, entries)
+    # M5: the daemon re-evaluates policy just before delete; make the
+    # pre-delete check agree with the test entry.
+    from clouddog.policy import Action, Decision
+    monkeypatch.setattr(
+        policy_mod, "evaluate",
+        lambda p, scan_root=None: Decision(Action.STORE_AND_CLEAR, "github", "test"),
+    )
 
     report = daemon.tick()
 

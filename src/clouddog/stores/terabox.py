@@ -59,6 +59,12 @@ class TeraBoxBackend(StoreBackend):
 
     name = "terabox"
 
+    @property
+    def supports_content_verify(self) -> bool:
+        # TeraBox's API exposes no remote checksum; verify() is name+size
+        # only. Auto-delete paths must never clear local on this tier.
+        return False
+
     # ------------------------------------------------------------------ #
     # helpers
     # ------------------------------------------------------------------ #

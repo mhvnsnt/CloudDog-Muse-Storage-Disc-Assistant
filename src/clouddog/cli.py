@@ -213,8 +213,42 @@ def cmd_reap(args: argparse.Namespace) -> int:
     log_path = args.log_path or (os.path.splitext(args.manifest)[0] + ".log")
     journal = _get_journal(args.journal)
 
+    # Live-store proof (C1): a live reap requires a backend + remote ref so
+    # every delete is verified against the LIVE store, not just the manifest.
+    # TeraBox is refused: its API exposes no remote checksum (H2).
+    store_verify = None
+    if not args.dry_run:
+        backend_name = getattr(args, "backend", None)
+        remote_ref = getattr(args, "remote_ref", None)
+        if not backend_name or not remote_ref:
+            print("[clouddog] live reap requires --backend and --remote-ref "
+                  "(the manifest alone is a claim, not proof)", file=sys.stderr)
+            return 2
+        if backend_name == "terabox":
+            print("[clouddog] refusing: terabox has no remote checksum — "
+                  "cannot byte-verify before delete", file=sys.stderr)
+            return 3
+        try:
+            backend = _backend_for(backend_name)
+        except CloudDogError as exc:
+            print(f"[clouddog] {exc}", file=sys.stderr)
+            return 3
+        from clouddog.stores.base import StoredRef
+        if backend_name == "github":
+            def store_verify(rel, full, _b=backend, _r=remote_ref):
+                ref = StoredRef(backend="github",
+                                locator=f"{_r}/{os.path.basename(full)}",
+                                size=os.path.getsize(full), sha256="")
+                return _b.verify(full, ref)
+        else:  # drive: rclone path check against the remote tree
+            def store_verify(rel, full, _b=backend, _r=remote_ref):
+                ref = StoredRef(backend="drive", locator=f"{_r}/{rel}",
+                                size=os.path.getsize(full), sha256="")
+                return _b.verify(full, ref)
+
     try:
-        reaper = Reaper(args.src_dir, manifest, log_path, hash_algo=args.hash_algo)
+        reaper = Reaper(args.src_dir, manifest, log_path,
+                        hash_algo=args.hash_algo, store_verify=store_verify)
         report = reaper.reap_once(dry_run=args.dry_run)
     except CloudDogError as exc:
         print(f"[clouddog] reap failed: {exc}", file=sys.stderr)
@@ -224,21 +258,19 @@ def cmd_reap(args: argparse.Namespace) -> int:
         return 3
 
     rep = _report_dict(report)
-    for item in rep.get("reaped") or []:
-        if isinstance(item, dict):
-            p, size = str(item.get("path", "")), int(item.get("bytes") or 0)
-        else:
-            p, size = str(item), 0
-        _journal(journal, "reaped", p, size, "",
-                 f"manifest={args.manifest} dry_run={args.dry_run}")
+    reaped_n = int(rep.get("reaped") or 0)
+    if reaped_n:
+        _journal(journal, "reaped", args.src_dir, int(rep.get("freed_bytes") or 0),
+                 f"manifest={args.manifest}",
+                 f"{reaped_n} files reaped dry_run={args.dry_run}")
 
     if args.json:
         print(json.dumps(rep, indent=2))
     else:
-        print(f"reaped:      {len(rep.get('reaped') or [])}")
-        print(f"mismatches:  {len(rep.get('mismatches') or [])}")
-        print(f"skipped:     {len(rep.get('skipped') or [])}")
-        print(f"freed_bytes: {rep.get('freed_bytes', 0)}")
+        print(f"reaped:      {reaped_n}")
+        print(f"mismatches:  {int(rep.get('mismatches') or 0)}")
+        print(f"skipped:     {int(rep.get('skipped') or 0)}")
+        print(f"freed_bytes: {int(rep.get('freed_bytes') or 0)}")
         print(f"halted:      {bool(rep.get('halted'))}")
         if rep.get("halted"):
             print(f"halt_reason: {rep.get('halt_reason', '')}")
@@ -424,7 +456,10 @@ def _add_common_flags(sp: argparse.ArgumentParser) -> None:
     contributes the flag when it was actually passed there.
     """
     sp.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS,
-                    help="no destructive action anywhere")
+                    help="no destructive action anywhere (default)")
+    sp.add_argument("--apply", action="store_false", dest="dry_run",
+                    default=argparse.SUPPRESS,
+                    help="actually perform destructive actions")
     sp.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                     help="machine-readable output")
     sp.add_argument("--journal", default=argparse.SUPPRESS,
@@ -437,8 +472,10 @@ def build_parser() -> argparse.ArgumentParser:
         description="CloudDog v1: mirror everything to GitHub/TeraBox/Drive, "
                     "verify byte-exact, then clear local.",
     )
-    p.add_argument("--dry-run", action="store_true",
-                   help="no destructive action anywhere")
+    p.add_argument("--dry-run", action="store_true", default=True,
+                   help="no destructive action anywhere (default)")
+    p.add_argument("--apply", action="store_false", dest="dry_run",
+                   help="actually perform destructive actions (overrides --dry-run)")
     p.add_argument("--json", action="store_true",
                    help="machine-readable output")
     p.add_argument("--journal", default=DEFAULT_JOURNAL,
@@ -469,6 +506,12 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--src-dir", required=True, help="source directory to reap")
     r.add_argument("--hash-algo", default="git-sha1", choices=["git-sha1", "sha256"])
     r.add_argument("--log-path", default=None, help="reaper log path")
+    r.add_argument("--backend", choices=["github", "terabox", "drive"],
+                   default=None,
+                   help="store tier for LIVE verification (required for live reap)")
+    r.add_argument("--remote-ref", default=None,
+                   help="remote ref for verification, e.g. 'owner/repo@tag' "
+                        "(github) or 'remote:/path' (drive); required for live reap")
     r.set_defaults(func=cmd_reap)
 
     d = sub.add_parser("daemon", help="run the hygiene daemon")

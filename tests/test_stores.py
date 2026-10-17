@@ -44,11 +44,13 @@ def no_sleep(monkeypatch):
 # GitHub backend fakes
 # ---------------------------------------------------------------------- #
 def make_gh_fake(*, auth_ok=True, view_ok=True, asset_size=None,
-                 download_bytes=None, api_failures=0):
+                 download_bytes=None, api_failures=0, asset_exists=True):
     """Fake ``subprocess.run`` for the gh CLI.
 
     api_failures: number of initial ``gh api`` calls that fail transiently
     (503) before succeeding — exercises the retry path.
+    asset_exists: whether the fake release lists the asset (default True
+    preserves the old collision-path tests; set False for fresh-upload tests).
     """
     calls = []
     state = {"api_calls": 0}
@@ -90,10 +92,11 @@ def make_gh_fake(*, auth_ok=True, view_ok=True, asset_size=None,
                     args, 1, "", "HTTP 503: Service Unavailable"
                 )
             size = len(FILE_BYTES) if asset_size is None else asset_size
+            assets = [{"name": FILE_NAME, "size": size}] if asset_exists else []
             releases = [
                 {
                     "tag_name": TAG,
-                    "assets": [{"name": FILE_NAME, "size": size}],
+                    "assets": assets,
                 }
             ]
             return subprocess.CompletedProcess(args, 0, json.dumps(releases), "")
@@ -127,7 +130,7 @@ def test_github_health_down(monkeypatch):
 # GitHub: store
 # ---------------------------------------------------------------------- #
 def test_github_store_success(monkeypatch, local_file):
-    fake = make_gh_fake(view_ok=False)  # release missing -> create runs
+    fake = make_gh_fake(view_ok=False, asset_exists=False)  # release missing -> create runs
     patch_gh(monkeypatch, fake)
     ref = GitHubReleaseBackend().store(local_file, f"{REPO}@{TAG}")
     assert ref.backend == "github"
@@ -159,9 +162,10 @@ def test_github_store_retries_transient_api(monkeypatch, local_file):
 
 
 def test_github_store_asset_size_mismatch(monkeypatch, local_file):
+    # L5: a same-named asset with different content is refused, not clobbered.
     fake = make_gh_fake(asset_size=len(FILE_BYTES) + 1)
     patch_gh(monkeypatch, fake)
-    with pytest.raises(VerificationFailed):
+    with pytest.raises(CloudDogError):
         GitHubReleaseBackend().store(local_file, f"{REPO}@{TAG}")
 
 
@@ -171,8 +175,20 @@ def test_github_store_sha256_mismatch(monkeypatch, local_file):
     assert len(corrupted) == len(FILE_BYTES)
     fake = make_gh_fake(download_bytes=corrupted)
     patch_gh(monkeypatch, fake)
-    with pytest.raises(VerificationFailed):
+    # L5: same size but different content -> refuse, not clobber.
+    with pytest.raises(CloudDogError):
         GitHubReleaseBackend().store(local_file, f"{REPO}@{TAG}")
+
+
+def test_github_store_reuses_identical_asset(monkeypatch, local_file):
+    # L5: a same-named asset that is byte-identical is reused, not re-uploaded.
+    fake = make_gh_fake(view_ok=True)
+    patch_gh(monkeypatch, fake)
+    ref = GitHubReleaseBackend().store(local_file, f"{REPO}@{TAG}")
+    subcmds = [c[1:3] for c in fake.calls]
+    assert ["release", "upload"] not in subcmds
+    assert ref.extra.get("reused") is True
+    assert ref.sha256 == FILE_SHA256
 
 
 def test_github_store_dry_run_no_network(monkeypatch, local_file):

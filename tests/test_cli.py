@@ -279,7 +279,7 @@ def test_store_refuses_when_backend_not_live(tmp_path, monkeypatch, capsys):
     journal = str(tmp_path / "audit.jsonl")
 
     rc = main(["--journal", journal, "store", target,
-               "--tier", "github", "--remote-ref", "owner/repo@tag"])
+               "--tier", "github", "--remote-ref", "owner/repo@tag", "--apply"])
 
     assert rc == 3
     assert fake.store_calls == []
@@ -294,7 +294,7 @@ def test_store_live_backend_journals_stored_ref(tmp_path, monkeypatch, capsys):
     journal = str(tmp_path / "audit.jsonl")
 
     rc = main(["--journal", journal, "store", target,
-               "--tier", "github", "--remote-ref", "owner/repo@tag"])
+               "--tier", "github", "--remote-ref", "owner/repo@tag", "--apply"])
 
     assert rc == 0
     assert fake.store_calls[0]["dry_run"] is False
@@ -316,7 +316,7 @@ class _FakeReaper:
     def reap_once(self, dry_run=False):
         self.dry_runs.append(dry_run)
         report_cls = reaper_mod.ReapReport
-        return report_cls(reaped=["a.txt"], mismatches=[], skipped=[],
+        return report_cls(reaped=1, mismatches=0, skipped=0,
                           freed_bytes=123, halted=False, halt_reason="")
 
 
@@ -339,7 +339,7 @@ def test_reap_halted_returns_3(tmp_path, monkeypatch):
     class _HaltedReaper(_FakeReaper):
         def reap_once(self, dry_run=False):
             report_cls = reaper_mod.ReapReport
-            return report_cls(reaped=[], mismatches=["a.txt"], skipped=[],
+            return report_cls(reaped=0, mismatches=1, skipped=0,
                               freed_bytes=0, halted=True, halt_reason="boom")
 
     monkeypatch.setattr(reaper_mod, "Reaper", _HaltedReaper)
