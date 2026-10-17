@@ -1,4 +1,5 @@
 """Tests for clouddog.audit — the append-only audit journal."""
+
 import json
 import os
 
@@ -7,15 +8,27 @@ from clouddog.audit import AuditEvent, AuditJournal, fmt_size
 
 def make_events():
     return [
-        AuditEvent(kind="stored", path="~/workspace/game/teardown/a.bin",
-                   size=1_500_000, locator="mhvnsnt/repo@v1.0/a.bin",
-                   note="upload verified byte-exact"),
-        AuditEvent(kind="reaped", path="~/workspace/game/teardown/a.bin",
-                   size=1_500_000, locator="mhvnsnt/repo@v1.0/a.bin",
-                   note="hash match, deleted locally"),
-        AuditEvent(kind="verified", path="~/workspace/game/teardown/b.bin",
-                   size=600, locator="/terabox/CN-Gigaleak/show/b.bin",
-                   note=""),
+        AuditEvent(
+            kind="stored",
+            path="~/workspace/game/teardown/a.bin",
+            size=1_500_000,
+            locator="mhvnsnt/repo@v1.0/a.bin",
+            note="upload verified byte-exact",
+        ),
+        AuditEvent(
+            kind="reaped",
+            path="~/workspace/game/teardown/a.bin",
+            size=1_500_000,
+            locator="mhvnsnt/repo@v1.0/a.bin",
+            note="hash match, deleted locally",
+        ),
+        AuditEvent(
+            kind="verified",
+            path="~/workspace/game/teardown/b.bin",
+            size=600,
+            locator="/terabox/CN-Gigaleak/show/b.bin",
+            note="",
+        ),
     ]
 
 
