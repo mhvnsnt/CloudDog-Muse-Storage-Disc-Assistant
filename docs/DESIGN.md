@@ -1,124 +1,116 @@
-# CloudDog design
+# CloudDog design — `clouddog/` package
 
-CloudDog treats local disk as a cache, not storage. Files are mirrored to
-permanent stores (TeraBox, GitHub releases, Google Drive), byte-verified, and
-only then eligible for clearing. The owner's standing disk laws are encoded
-as code in `clouddog.policy` and every mutating action is journaled.
+## Scope
+
+This package EXTENDS the `cloud_dog.py` engine; it does not duplicate it.
+The v2 lane owns the GitHub/TeraBox/Kaggle backends, the CLI surface
+(`scan`/`register`/`verify`/`reap`/`enforce`/`daemon`/`mirror`), daemon
+mode, mirror mode, and the audit journal (`cloud-dog-audit.jsonl`).
+
+What this package adds — the pieces v2 does not have:
+
+- **`clouddog.policy`** — the owner's disk laws as importable, tested code:
+  protected game-file matching, in-progress transfer detection, the
+  ONE-STORE decision engine, and approval gates. v2's engine enforces
+  inline checks; this is the formal policy layer any lane (engine,
+  dashboard, guardian) can call.
+- **`clouddog.stores`** — the importable `Store` interface (`upload`,
+  `verify`, `exists`, `uri_for`, retries, secret redaction) plus the
+  backends v2 does not ship — currently **Drive via rclone**.
+- **`clouddog.config`** — validated YAML configuration (`Config`
+  dataclass, `ConfigError` with named keys, `write_default_config`).
+- **`clouddog.bridge`** — folds `cloud_dog.py`'s registry
+  (`cloud-dog-registry.json`) into the v2 audit journal as
+  `registry-import` events, so there is one audit trail.
 
 ## Architecture
 
 ```
-                        +----------------------+
-                        |   clouddog CLI       |
-                        |   clouddog/cli.py    |
-                        | init status sweep    |
-                        | store verify watch   |
-                        +----------+-----------+
-                                   |
-                        +----------v-----------+
-                        |   policy gates       |
-                        |   clouddog/policy/   |
-                        |   laws.* decides     |
-                        |   approvals.* gates  |
-                        +----------+-----------+
-                                   |
-              +--------------------v--------------------+
-              | stores  (clouddog/stores/)               |
-              | terabox | github releases | drive       |
-              | upload / verify / exists + retries      |
-              +--------------------+--------------------+
-                                   |
-                        +----------v-----------+
-                        | journal (JSONL)      |
-                        | clouddog/core/       |
-                        | manifest.py          |
-                        +----------------------+
-
-  +------------------+        +---------------------+
-  | daemon           |------->| cron (10 min)       |
-  | clouddog/        |  runs  | clouddog watch      |
-  | daemon.py        |  once  | --once              |
-  +------------------+        +---------------------+
-
-  +------------------+        +---------------------+
-  | core             |        | config              |
-  | monitor/verifier |<-------| clouddog/config.py  |
-  | inventory        |  reads | YAML -> Config      |
-  +------------------+        +---------------------+
+  +---------------------+        +----------------------+
+  | cloud_dog.py (v2)   |        | clouddog/ package    |
+  | CLI: scan/register  |        |                      |
+  | verify/reap/enforce |        | policy/  laws as     |
+  | daemon/mirror       |        |   code: decide_      |
+  | backends: github /  |        |   delete, approvals  |
+  |   terabox / kaggle  |        |                      |
+  | audit journal       |<-------| stores/  Store ABC   |
+  | (cloud-dog-audit    | bridge |   + drive (rclone)   |
+  |  .jsonl)            |        |                      |
+  +---------------------+        | config   YAML        |
+                                 | bridge   registry -> |
+                                 |   audit events      |
+                                 +----------------------+
 ```
 
-The CLI never touches the network except through a `Store`. The daemon is a
-thin loop over `run_once`; policy and journaling are shared with the CLI.
+The package never shells out to `cloud_dog.py` and never modifies its
+files; the bridge only *reads* the registry and *appends* audit events.
 
-## Data flows
+## The policy engine (`clouddog.policy.laws`)
 
-### store <path> --to STORE --execute --yes
+`decide_delete(path, *, verified_stores, owner_approved=False,
+extra_patterns=()) -> Decision(allowed, requires_owner, reasons)` applies
+the owner's laws in a fixed rule order:
 
-1. `verifier.file_size` + `verifier.sha256_file` capture the local truth.
-2. `stores.get_store(name, cfg.stores)` builds the backend (raises
-   `StoreUnavailable` when the store is not configured).
-3. `run_with_retries(store.upload)` performs the upload (5 attempts,
-   exponential backoff).
-4. `store.verify(ref)` re-checks the remote object against size+sha256.
-5. On success: journal a `store` entry (`dry_run=False`) with the StoredRef.
-   On failure: journal a `verify` entry (`dry_run=False`, note `FAILED`) and
-   raise `VerificationFailed`. A success is never journaled without verify.
+1. **In-progress → never.** Anything downloading, uploading, rendering, or
+   extracting (transient suffixes like `.part`/`.aria2`, staging/download/
+   tmp dirs) is refused with `allowed=False` and `requires_owner=False` —
+   the law provides no override, not even the owner's.
+2. **`.DO_NOT_DELETE` marker → blocked.** Any marker file in the path's
+   ancestry vetoes the whole tree (`requires_owner=True`; only the owner
+   resolves it by removing the marker).
+3. **Protected game files → owner + verified store.** ISOs, ROMs, disc
+   images, and archives under `teardown/`, `game-reverse-engineering/`,
+   `chimera-roms/`, `isos/`, `roms/` (plus `protected_extra` config
+   patterns) need `owner_approved=True` AND at least one verified store
+   (NEVER-DELETE-GAME-FILES + ONE-STORE RULE).
+4. **Ordinary file + ≥1 verified store → allowed** (ONE-STORE RULE:
+   verified 100% on at least one store).
+5. **Nothing verified → refused** (NO-DELETE-BEFORE-SAFE-STORAGE).
 
-### verify --journal-entry N
+`approvals.require_execute(dry_run, assume_yes, what)` is the last gate
+before any destructive call: silent on dry-run, raises `ApprovalRequired`
+without an explicit `--yes`.
 
-1. Load entry N (1-based) from the journal.
-2. Rebuild each `StoredRef` from the entry's `stores` dicts.
-3. Call `store.verify(ref)` per store; print OK/FAIL.
-4. Journal a `verify` entry recording the per-store results.
+## The Drive store (`clouddog.stores.drive.DriveStore`)
 
-### sweep [--execute --yes] (default: dry-run plan)
+v2's engine covers GitHub, TeraBox, and Kaggle; bulk media also needs
+Google Drive (rclone `drive` backend, Tier 1). The store shells out to the
+`rclone` CLI (no new Python dependencies):
 
-1. `monitor.disk_usage("/")`; below `warn_pct` -> evaluation pass only:
-   list candidates, take no action, journal a `sweep-plan` entry.
-2. `inventory.scan` over each `scan_roots` entry, biggest first.
-3. Skip candidates that are in-progress (`laws.is_in_progress`) or under a
-   `.DO_NOT_DELETE` marker (`laws.has_do_not_delete_marker`).
-4. Route each candidate to a store (`media-file`/`unknown` -> terabox, else
-   github; `git-clone`/`venv`/`bulk-dir` -> github, else terabox).
-5. Dry-run: print `PLAN` lines, journal one `sweep-plan` entry
-   (`dry_run=True`), exit 0.
-6. `--execute --yes`: `approvals.require_execute` gates it (exit 2 without
-   `--yes`); each file candidate is uploaded + verified + journaled as a
-   `store` entry (`dry_run=False`). Directories are skipped in v1.
+- `upload`: `rclone copyto <local> <remote>:<base>/<dir>/<name>`
+- `verify`/`exists`: `rclone lsjson` size match
+- Missing rclone or unconfigured remote → `StoreUnavailable` with the
+  operator setup pointer (rclone remote setup stays operator-done)
+- Upload failure never deletes local — Drive is best-effort (the owner's
+  Drive has been near-quota before)
 
-### watch [--once] / daemon
+Retries use `stores.run_with_retries` (exponential backoff); every error
+message passes through `stores._redact` so no secret material leaks.
 
-`daemon.run_once(config)`:
+## The bridge (`clouddog.bridge`)
 
-1. Snapshot `disk_usage` per scan root.
-2. Collect journal entries with `action == "store"` and `dry_run == False`
-   as the already-mirrored set.
-3. Scan roots, take the top 5 candidates by size; skip in-progress, marked,
-   already-mirrored, and non-files (v1 mirrors files only).
-4. Upload each to the first configured store with retries; verify; journal
-   `store` on success or `verify`/`FAILED` on failure. Any `StoreError`
-   becomes a note, never a crash.
-5. Return `{ts, disk, candidates, mirrored, journal_entries, notes}`.
+`import_registry_to_audit(registry_path=..., audit_path=...) -> int`:
 
-`run_loop` prints one line per run and sleeps `interval_sec` unless `once`.
+1. Reads `cloud-dog-registry.json` (`{"version": 1, "entries": {...}}`).
+2. Converts each entry to a v2-shaped audit event (`action:
+   "registry-import"`, UTC `ts`, store-specific locators per the registry
+   contract, `imported_by: "clouddog.bridge"`).
+3. Appends the events to `cloud-dog-audit.jsonl`.
+
+Never raises (missing/corrupt registry → 0; failed writes skipped) and
+never modifies the registry. This is how registry history joins the
+single audit trail.
 
 ## Safety invariants
 
-- **Dry-run default.** Every mutating command plans first; `--execute`
-  plus `--yes` is required to act. Missing `--yes` exits 2 with the exact
-  flag spelled out.
-- **In-progress is sacred.** Anything downloading, uploading, rendering,
-  or extracting (suffixes like `.part`, or staging/download/tmp dirs) is
-  never touched -- no override exists, not even the owner's.
-- **Protected game files need the owner.** ISOs, ROMs, game archives, and
-  anything under `teardown/`, `game-reverse-engineering/`, `chimera-roms/`
-  (plus `protected_extra` patterns) require owner approval AND a verified
-  store before any delete; v1 never deletes them at all.
-- **No delete without a verified store.** The ONE-STORE RULE: a file may be
-  cleared only after it verifies 100% (hash + size) on GitHub OR TeraBox.
-  v1 implements the mirror half; deletion is a future explicit `reap`.
-- **Journal everything.** Every store, verify, and sweep plan appends a
-  JSONL entry (`~/.clouddog/journal.jsonl` by default). Failed verifies are
-  journaled as failures, never as successes.
-- **Bounded daemon.** Top 5 candidates per run, no deletes, failures become
-  notes. Safe to run every 10 minutes from cron.
+- **Extend, never duplicate.** If the v2 engine owns an area (backends,
+  CLI, daemon, journal), this package does not reimplement it.
+- **In-progress is sacred.** No override exists — not even the owner's.
+- **Protected game files need the owner.** ISOs/ROMs/teardown trees
+  require explicit owner approval AND a verified store.
+- **No delete without a verified store.** ONE-STORE RULE, encoded in
+  `decide_delete`, tested.
+- **Secrets never leak.** `_redact` scrubs token/cookie-shaped values from
+  every store error; the TeraBox credential file is only ever read at
+  runtime by the v2 engine, never logged.
+- **Append-only audit.** The bridge only appends; it never edits history.

@@ -1,5 +1,26 @@
 # CloudDog PULL-LOG
 
+## PIVOT NOTE (2026-10-17, before merge)
+
+The first version of the `clouddog/` package (branch `v1/core-package`)
+built a full engine: TeraBox/GitHub/Drive backends, CLI, daemon,
+inventory, journal. While it was in review, the v2 lane merged PR #4
+(`cloud_dog.py`: TeraBox+Kaggle backends, torrent mirror mode, daemon
+mode, audit journal, 20 tests). Per the no-duplicate-work law, the package
+was trimmed BEFORE merge to only the pieces v2 does not have:
+
+- KEPT: `clouddog.policy` (law engine), `clouddog.stores` (Store ABC +
+  Drive backend), `clouddog.config`, `clouddog.bridge`
+  (registry → audit journal).
+- DROPPED: `stores/terabox.py`, `stores/github_releases.py`, `cli.py`,
+  `daemon.py`, `core/` (monitor/verifier/manifest/inventory) — v2 owns
+  these areas now.
+
+The research below stands unchanged; the v2-candidate wiring plans
+(dust, fclones, sqlite) remain valid against the trimmed package.
+
+---
+
 Research survey of open-source pull-in candidates for CloudDog (disk as
 cache: continuous mirror to permanent stores, byte-verify, then clear
 local), conducted 2026-10-17 by the research lane. The draft below
@@ -12,9 +33,9 @@ per-project sections and verdicts kept as written.
    verify-then-delete CLI: `scan` / `register` / `verify` / `reap` /
    `enforce`. Already wired into the disk-space-guardian cron. Registry:
    `~/workspace/agent-ops/cloud-dog-registry.json`. The `clouddog/` package
-   extends it (TeraBox/Drive backends, policy engine, config, daemon,
-   journal) rather than replacing it — see "Coexistence with cloud_dog.py"
-   in `docs/OPERATIONS.md`.
+   extends it (policy engine, Drive backend, validated config,
+   registry → audit bridge) rather than replacing it — see "Coexistence
+   with cloud_dog.py" in `docs/OPERATIONS.md`.
 2. **tbupload.py session-keeper path** (`~/workspace/tools/terabox-uploader/`,
    in-house) — the proven TeraBox upload flow (precreate, 4MB chunks,
    create, verify) plus the cookie session keeper. `clouddog/stores/terabox.py`

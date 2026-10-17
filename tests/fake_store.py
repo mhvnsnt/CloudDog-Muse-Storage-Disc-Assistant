@@ -13,7 +13,6 @@ from pathlib import Path
 import yaml
 
 from clouddog import stores as stores_mod
-from clouddog.core import inventory
 
 
 class FakeStore(stores_mod.Store):
@@ -82,10 +81,3 @@ def write_config(tmp_path: Path, **overrides: object) -> str:
     cfg_path = tmp_path / "clouddog.yaml"
     cfg_path.write_text(yaml.safe_dump(data), encoding="utf-8")
     return str(cfg_path)
-
-
-def scan_one(monkeypatch, path, kind="media-file", size=4096):
-    """Make inventory.scan return exactly one candidate for *path*."""
-    cand = inventory.Candidate(path=str(path), size_bytes=size, mtime=0.0, kind=kind)
-    monkeypatch.setattr(inventory, "scan", lambda root, **kwargs: [cand])
-    return cand

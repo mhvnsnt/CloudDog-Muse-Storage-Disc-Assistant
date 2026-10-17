@@ -1,15 +1,12 @@
 [project]
 name = "clouddog"
 version = "0.1.0"
-description = "Disk-as-cache storage assistant"
+description = "CloudDog policy engine, Drive store, config, and registry bridge (extends the cloud_dog.py engine)"
 requires-python = ">=3.10"
-dependencies = ["requests", "pyyaml"]
+dependencies = ["pyyaml"]
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
-
-[project.scripts]
-clouddog = "clouddog.cli:main"
 
 [build-system]
 requires = ["setuptools"]

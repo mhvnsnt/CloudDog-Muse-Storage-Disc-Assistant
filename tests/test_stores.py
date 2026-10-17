@@ -7,7 +7,9 @@ from tests.fake_store import FakeStore
 
 
 def test_registry_has_expected_stores():
-    assert set(stores_mod.REGISTRY) == {"terabox", "github", "drive"}
+    # The GitHub/TeraBox/Kaggle backends live in the cloud_dog.py v2 engine;
+    # this package's registry holds the backends v2 does not have.
+    assert set(stores_mod.REGISTRY) == {"drive"}
 
 
 def test_get_store_unknown_name_raises():

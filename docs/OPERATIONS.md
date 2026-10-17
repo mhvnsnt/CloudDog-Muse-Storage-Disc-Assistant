@@ -1,4 +1,21 @@
-# CloudDog operations
+# CloudDog operations — `clouddog/` package
+
+## Scope
+
+This package EXTENDS the `cloud_dog.py` v2 engine; it does not duplicate
+it. The v2 lane owns the CLI (`scan`/`register`/`verify`/`reap`/`enforce`/
+`daemon`/`mirror`), the GitHub/TeraBox/Kaggle backends, daemon and mirror
+modes, and the audit journal. This package adds:
+
+- **`clouddog.policy`** — the disk laws as importable, tested code.
+- **`clouddog.stores`** — the `Store` interface + the Drive backend
+  (via rclone), which v2 does not ship.
+- **`clouddog.config`** — validated YAML configuration.
+- **`clouddog.bridge`** — registry → audit-journal bridge.
+
+There is no `clouddog` CLI in this package: the operator-facing CLI is
+`cloud_dog.py`. This package is the library the engine, the dashboard,
+and guardian lanes import.
 
 ## Install
 
@@ -7,168 +24,129 @@ cd ~/workspace/clouddog
 pip install -e ".[dev]"   # runtime + pytest + ruff
 ```
 
-This installs the `clouddog` console script (`clouddog.cli:main`).
-Python 3.11+; runtime deps are stdlib + `requests` + `pyyaml`.
+Python 3.10+; the only runtime dependency is `pyyaml` (stdlib otherwise).
+Drive operations additionally need the `rclone` CLI on PATH.
 
 ## Config file
 
-`clouddog init` writes a commented default to `~/.clouddog/config.yaml`
-(`--config PATH` overrides; `--force` overwrites). Reference:
+```python
+from clouddog.config import load_config, write_default_config
+
+write_default_config("~/.clouddog/config.yaml")  # commented default; never overwrites
+cfg = load_config()  # ~/.clouddog/config.yaml, or defaults when missing
+```
+
+Reference (keys the package reads):
 
 ```yaml
-# Permanent stores to mirror to. Keys are the store names used by the CLI.
 stores:
-  terabox:
-    creds_path: "~/workspace/tools/terabox-uploader/.creds.json"  # default
-    remote_root: "/CN-Gigaleak"                                    # default
-  github:
-    repo: "mhvnsnt/drive-storage"   # required for the github store
-    tag: "bulk-archive-2026-10-17"  # required for the github store
   drive:
-    remote: "gdrive"                # rclone remote name; requires rclone on PATH
+    remote: "gdrive"     # rclone remote name (required for the drive store)
+    base_dir: "clouddog" # remote base dir (default)
 
-# Disk usage thresholds (percent used).
-thresholds:
-  warn_pct: 75      # sweep acts at/above this; below it, evaluation pass only
+thresholds:              # percent-used thresholds
+  warn_pct: 75
   target_pct: 70
   ceiling_pct: 88
 
-scan_roots:           # roots scanned for sweep candidates
+scan_roots:
   - "/home/hatch/workspace"
 
-protected_extra: []   # extra fnmatch patterns treated as protected game files
-strict_verify: false  # reserved; one-store rule applies when false
+protected_extra: []      # extra fnmatch patterns treated as protected game files
+strict_verify: false
 journal_path: "~/.clouddog/journal.jsonl"
-terabox_remote_root: "/CN-Gigaleak"  # default remote dir for terabox uploads
+terabox_remote_root: "/CN-Gigaleak"
 github_repo: ""
 github_tag: ""
 state_dir: "~/.clouddog"
 ```
 
-## CLI commands
+Invalid YAML or mistyped keys raise `ConfigError` naming the bad key.
 
-Dry-run is the default everywhere. Nothing uploads without `--execute`,
-and `--execute` also needs `--yes` (missing `--yes` exits 2 and prints the
-exact flag to re-run with).
+## Using the policy engine
 
-```bash
-clouddog init [--config PATH] [--force]
-# Write the default config. Never overwrites without --force.
+```python
+from clouddog.policy import laws, approvals
 
-clouddog status [--config PATH]
-# Disk usage for / and each scan root, journal entry count + last 3 entries
-# rendered as markdown, and per-store "configured" (no network calls).
+# Should this path be cleared? (NEVER deletes anything itself.)
+d = laws.decide_delete(
+    "/home/hatch/workspace/urban-reign.iso",
+    verified_stores=["github"],
+    owner_approved=False,
+)
+print(d.allowed, d.requires_owner, d.reasons)
+# False True ['protected game file (...); NEVER-DELETE-GAME-FILES ...', ...]
 
-clouddog sweep [--config PATH] [--dry-run] [--execute] [--yes] [--owner-approved]
-# Default: print what WOULD be mirrored and journal a sweep-plan entry.
-# Below warn_pct: evaluation pass only, no actions, even with --execute.
-# --execute --yes: mirror file candidates (upload + verify + journal).
-# NEVER deletes. Directories are plan-only in v1. In-progress candidates
-# and .DO_NOT_DELETE-marked trees are skipped with a reason printed.
+# In-progress work is refused with no override, not even the owner's:
+d = laws.decide_delete("/home/hatch/dl/part-00.part", verified_stores=["github"],
+                       owner_approved=True)
+assert not d.allowed
 
-clouddog store <path> --to STORE [--remote-dir D] [--remote-name N] \
-    [--execute] [--yes] [--config PATH]
-# Default: print the plan (target store, remote path, size, sha256).
-# --execute --yes: upload with retries, verify, journal a store entry.
-# On verify failure: journals a verify entry (note FAILED) and raises.
-
-clouddog verify --journal-entry N [--config PATH]
-# Re-verify every store listed on journal entry N (1-based), print OK/FAIL
-# per store, and journal a verify entry with the results.
-
-clouddog watch [--config PATH] [--interval SEC] [--once]
-# Run the daemon mirror pass. --once (default for cron) runs a single pass
-# and prints a one-line report; otherwise it loops every SEC seconds.
+# Gate a destructive call site:
+approvals.require_execute(dry_run=False, assume_yes=True, what="reap 12 files")
 ```
 
-Exit codes: 0 ok, 1 error (bad config, unknown store, failed verify,
-out-of-range journal entry), 2 approval required (re-run with `--yes`).
+Rule order (see `docs/DESIGN.md`): in-progress → marker → protected game
+file → one-store rule → nothing-verified. `laws.is_in_progress`,
+`laws.is_protected_game_file`, and `laws.has_do_not_delete_marker` are
+also usable individually.
 
-## Cron wiring (example)
+## Using the Drive store
 
-A 10-minute cron keeps disk mirroring continuously without operator input:
+```python
+from clouddog.config import load_config
+from clouddog.stores import get_store
 
-```cron
-*/10 * * * * /home/hatch/.local/bin/clouddog watch --once >> ~/.clouddog/watch.log 2>&1
+store = get_store("drive", load_config().stores)  # StoreUnavailable if rclone/remote missing
+ref = store.upload("/home/hatch/big-file.bin", remote_dir="offload-2026-10-17")
+assert store.verify(ref)  # size match via rclone lsjson
+print(store.uri_for(ref))  # drive:gdrive:clouddog/offload-2026-10-17/big-file.bin
 ```
 
-Each run prints one line: `[ts] candidates=N mirrored=M journal_entries=K
-notes=J`. The daemon never deletes, caps itself at 5 candidates per run,
-and turns every store failure into a note instead of crashing.
+Drive is best-effort: the owner's Drive has been near-quota before, so an
+upload failure raises `StoreError` and local files are never deleted on
+failure. rclone remote setup stays operator-done (see the rclone docs);
+the store only points at it.
 
-Creating, enabling, or changing the real cron entry is the OPERATOR's job,
-not CloudDog's. CloudDog only provides `watch --once` as the thing to call.
+## The registry → audit bridge
 
-## TeraBox credentials
+```python
+from clouddog.bridge import import_registry_to_audit
 
-One-time operator setup follows the documented session-keeper flow (browser
-sign-in, then `setup_creds.py` writes `.creds.json`). CloudDog reads
-`~/workspace/tools/terabox-uploader/.creds.json` at runtime (override with
-the store's `creds_path` key) and never handles raw cookie values — never
-paste tokens into the config, never commit `.creds.json` (it is chmod 600
-and gitignored). If the creds file is missing or stale, the terabox store
-raises `StoreUnavailable` with a clear message and the daemon notes it and
-moves on.
+n = import_registry_to_audit()  # defaults: the live registry + live audit journal
+print(n, "registry entries folded into the audit journal")
+```
+
+Each registry entry becomes one `registry-import` audit event shaped like
+v2's `audit_log` events (`ts`, `action`, sorted fields, store-specific
+locators). Never raises; never modifies the registry; append-only.
 
 ## Coexistence with cloud_dog.py
 
-`origin/main` already carries PR #1's `cloud_dog.py` (stdlib-only,
-verify-then-delete CLI: `scan` / `register` / `verify` / `reap` / `enforce`)
-and PR #2's spark-app files. `cloud_dog.py` is wired into the
-disk-space-guardian cron and keeps its registry at
-`~/workspace/agent-ops/cloud-dog-registry.json`.
+`cloud_dog.py` (v2: stdlib CLI with GitHub/TeraBox/Kaggle backends,
+daemon and mirror modes, audit journal) is the working engine and is wired
+into the disk-space-guardian cron. This package:
 
-The `clouddog/` package EXTENDS it rather than replacing it:
+- does NOT reimplement any of it (the first version of this package did —
+  it was trimmed before merge per the no-duplicate-work law);
+- gives the engine (and the dashboard lane) an importable policy layer,
+  the missing Drive backend, validated config, and the audit bridge;
+- never modifies `cloud_dog.py`, its registry, or its journal — the bridge
+  only reads the registry and appends audit events.
 
-- `cloud_dog.py` is the working verify-then-delete engine for GitHub
-  releases. It names TeraBox but cannot live-verify it.
-- `clouddog/` adds: the TeraBox backend (the 5TB primary bulk store,
-  implementing the in-house tbupload.py protocol in-process), the Google
-  Drive backend, the policy-as-code law engine
-  (`clouddog/policy/laws.py`), structured YAML config, daemon mode
-  (`clouddog watch`), and the append-only audit journal.
-
-The bridge is `Journal.import_registry()` (`clouddog/core/manifest.py`): it
-imports `cloud_dog.py` registry entries into the journal so there is ONE
-audit trail across both tools. It never modifies the registry file.
+## Tests
 
 ```bash
-python3 -c "
-from clouddog.core.manifest import Journal
-n = Journal('~/.clouddog/journal.jsonl').import_registry(
-    '~/workspace/agent-ops/cloud-dog-registry.json')
-print(n, 'entries imported')
-"
+python3 -m pytest tests/ -q   # 25 tests: policy, config, stores ABC, drive, bridge
+python3 -m pytest test_cloud_dog.py -q  # v2 engine's own suite (sibling lane)
+python3 -m ruff check clouddog tests && python3 -m ruff format --check clouddog tests
 ```
 
-Never modify `cloud_dog.py` itself — it is the other lane's working engine.
+## What this package does NOT do
 
-## Journal
-
-Default location: `~/.clouddog/journal.jsonl` (see `journal_path`). One
-JSON object per line, fsync'd on every append. Actions: `store`, `verify`,
-`sweep-plan` (v1; a future `reap` will add `delete`). `clouddog status`
-shows the count and the last 3 entries.
-
-## Recovery
-
-Re-verify anything from the journal at any time:
-
-```bash
-clouddog verify --journal-entry 12
-```
-
-This re-checks the remote objects named on entry 12 against their recorded
-size+sha256 and journals the outcome. If a store lost an object, the entry
-tells you exactly which remote path to re-upload with `clouddog store`.
-
-## What v1 does NOT do yet
-
-- No automatic deletion. `sweep --execute` mirrors only; clearing verified
-  files is a future explicit `reap` command gated by `laws.decide_delete`
-  (owner approval for protected game files, verified-store requirement).
-- Directory candidates (git clones, venvs, bulk dirs) are plan-only; v1
-  mirrors files.
-- No cloud-to-cloud transfer lane yet (GitHub release -> TeraBox direct).
-- `strict_verify` (require all named stores instead of the one-store rule)
-  is parsed but not enforced.
+- No CLI, no daemon, no mirror mode — those are `cloud_dog.py` v2.
+- No GitHub/TeraBox/Kaggle backends — v2 owns them.
+- No automatic deletion anywhere in this package. `decide_delete` only
+  *decides*; the call site that acts on a `Decision` lives in the engine
+  lane and must honor `requires_owner` and `allowed`.
+- `strict_verify` is parsed but not enforced by any call site here.

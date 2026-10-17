@@ -4,6 +4,9 @@ A Store is a permanent home for offloaded files. Local disk is a cache:
 files are mirrored to a Store, byte-verified, and only then cleared locally.
 
 Concrete backends live in sibling modules and are registered in REGISTRY.
+The GitHub/TeraBox/Kaggle backends live in the ``cloud_dog.py`` engine
+(the v2 lane owns them); this package contributes the backends v2 does
+not have — currently Drive (via rclone).
 """
 
 from __future__ import annotations
@@ -131,12 +134,8 @@ class Store(ABC):
 
 
 from .drive import DriveStore
-from .github_releases import GitHubReleasesStore
-from .terabox import TeraBoxStore
 
 REGISTRY: dict[str, type[Store]] = {
-    "terabox": TeraBoxStore,
-    "github": GitHubReleasesStore,
     "drive": DriveStore,
 }
 

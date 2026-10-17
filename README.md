@@ -145,46 +145,46 @@ Candidates evaluated for the mission; wired only where genuinely useful:
 
 ---
 
-## 2. `clouddog/` — full engine package (Python)
+## 2. `clouddog/` — policy engine, Drive store, config, bridge (Python)
 
-Production-grade disk-storage assistant. Local disk is a **cache**, not
-storage: CloudDog continuously mirrors files to permanent stores (TeraBox,
-GitHub releases, Google Drive), byte-verifies them, journals everything,
-and only then makes them eligible for clearing. The owner's standing disk
-laws are encoded as code (`clouddog/policy/laws.py`). Built on top of
-`cloud_dog.py` — see `Journal.import_registry()` for the bridge between
-the two audit trails, and `docs/OPERATIONS.md` for the coexistence notes.
+Library package that EXTENDS the `cloud_dog.py` v2 engine (which owns the
+CLI, the GitHub/TeraBox/Kaggle backends, daemon and mirror modes, and the
+audit journal). This package adds the pieces v2 does not have:
 
-Install and quickstart:
+- **`clouddog.policy`** — the owner's disk laws as importable, tested
+  code: protected game-file matching, in-progress transfer detection, the
+  ONE-STORE decision engine (`decide_delete`), and approval gates.
+- **`clouddog.stores`** — the importable `Store` interface plus the Drive
+  backend (via rclone).
+- **`clouddog.config`** — validated YAML configuration.
+- **`clouddog.bridge`** — folds `cloud_dog.py`'s registry into the v2
+  audit journal (`registry-import` events), so there is one audit trail.
 
 ```bash
 pip install -e ".[dev]"
-clouddog init                                  # write ~/.clouddog/config.yaml
-clouddog status                                # disk, journal, stores
-clouddog sweep                                 # dry-run plan (default)
-clouddog sweep --execute --yes                 # mirror only; never deletes
-clouddog store ./big-file.bin --to terabox     # dry-run plan
-clouddog store ./big-file.bin --to terabox --execute --yes
-clouddog verify --journal-entry 3              # re-verify a journal entry
-clouddog watch --once                          # single daemon pass (cron calls this)
+python3 -m pytest tests/ -q
+```
+
+```python
+from clouddog.policy import laws
+d = laws.decide_delete("/home/hatch/workspace/game.iso",
+                       verified_stores=["github"], owner_approved=False)
+# Decision(allowed=False, requires_owner=True, reasons=[...])
 ```
 
 Docs:
 
-- `docs/DESIGN.md` — architecture, data flows, safety invariants
+- `docs/DESIGN.md` — architecture, the policy rule order, safety invariants
 - `docs/LAWS.md` — the owner's disk laws, quoted verbatim, with how each is encoded
-- `docs/OPERATIONS.md` — install, config reference, CLI usage, cron wiring,
-  TeraBox credentials, journal, recovery, coexistence with `cloud_dog.py`,
-  and what v1 does not do yet
+- `docs/OPERATIONS.md` — install, config reference, policy/Drive/bridge
+  usage, tests, and what this package does not do
 - `docs/PULL-LOG.md` — every open-source project surveyed: what was pulled
   in, what was excluded and why, plus v2 candidates
 
-Safety contract (v1): dry-run is the default; `--execute` needs `--yes`;
-`sweep --execute` mirrors only and never deletes (deletion is a future
-explicit `reap` step); in-progress work and `.DO_NOT_DELETE`-marked trees
-are never touched; protected game files need owner approval.
-
----
+Safety contract: this package never deletes anything — `decide_delete`
+only *decides*; in-progress work is refused with no override; protected
+game files require owner approval AND a verified store; secrets are
+redacted from every store error.
 
 ## 3. Web dashboard (Vite/React scaffold)
 
