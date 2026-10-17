@@ -26,4 +26,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install ruff
-      - run: ruff check .
+      # Lint scope is the clouddog/ engine package and its tests only.
+      # Root-level scripts (cloud_dog.py, spark-app helpers) belong to
+      # sibling lanes and are covered by their own test files.
+      - run: ruff check clouddog tests
+      - run: ruff format --check clouddog tests
