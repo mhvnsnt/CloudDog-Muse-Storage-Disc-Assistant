@@ -371,6 +371,16 @@ order, each gets its own researched, tested patch.
   `clouddog dedupe --dry-run` command would consume `fclones group` JSON,
   keep one copy per policy, and route the rest through the normal
   verify-then-clear pipeline.
+- **WIRED 2026-10-17** (PR #14): new `cloud_dog.py dedup` command.
+  `fclones group --format json` (probes PATH, then
+  `~/workspace/tools/fclones/usr/bin/fclones`) -> per group, keep first
+  (sorted), candidates re-hashed with sha256 against the kept copy, then
+  routed through `decide_delete` (game files need `--owner-approved`,
+  in-progress/markers blocked). Never touches files inside a git working
+  tree. Dry-run default; `--apply` deletes, audit-logs (`dedup` events)
+  and writes to disk-cleanup-log.md. Fail-closed without the policy
+  engine. 8 new tests (fake-fclones executable, JSON/error paths,
+  dry-run, apply, git-tree skip, game-file block, fail-closed, no-binary).
 - Wire plan (v2 patch): subprocess integration like rclone/gh, guarded by
   the policy engine (protected + in-progress rules apply to every
   candidate). Not wired in v1.

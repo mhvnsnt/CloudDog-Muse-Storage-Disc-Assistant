@@ -1357,6 +1357,134 @@ def cmd_verify_v2(args):
     return 0 if ok else 1
 
 
+def _fclones_binary():
+    """Locate the fclones binary (optional dependency for dedup)."""
+    found = shutil.which("fclones")
+    if found:
+        return found
+    for rel in ("tools/fclones/usr/bin/fclones", "tools/fclones/fclones"):
+        p = os.path.join(WORKSPACE, rel)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def _in_git_tree(path):
+    """True if path sits inside a git working tree (has a .git ancestor)."""
+    d = os.path.dirname(os.path.abspath(path))
+    while True:
+        if os.path.isdir(os.path.join(d, ".git")):
+            return True
+        parent = os.path.dirname(d)
+        if parent == d:
+            return False
+        d = parent
+
+
+def _fclones_groups(roots, excludes):
+    """Run `fclones group --format json`. Returns (groups, None) or
+    (None, error_message). Never raises."""
+    binary = _fclones_binary()
+    if not binary:
+        return None, "fclones not found (PATH or ~/workspace/tools/fclones)"
+    cmd = [binary, "group", "--format", "json"]
+    for pat in excludes or []:
+        cmd += ["--exclude", pat]
+    cmd += roots
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=1800)
+    except Exception as e:
+        return None, f"fclones failed: {e}"
+    if proc.returncode != 0:
+        return None, f"fclones exit {proc.returncode}: {proc.stderr.strip()[:200]}"
+    try:
+        data = json.loads(proc.stdout)
+    except Exception:
+        return None, "fclones output was not JSON"
+    return data.get("groups", []), None
+
+
+def cmd_dedup(args):
+    """Find duplicate files with fclones; delete down to one copy per group.
+
+    Safety: fclones groups are content-hash confirmed; each deletion target
+    is additionally re-hashed (sha256) against the kept copy, must pass the
+    owner's law engine (decide_delete), and is never taken from inside a git
+    working tree. Default is dry-run.
+    """
+    if not _POLICY_AVAILABLE:
+        print("POLICY ENGINE UNAVAILABLE; dedup disabled (fail-closed).",
+              file=sys.stderr)
+        return 1
+    roots = ([os.path.abspath(args.path)] if getattr(args, "path", "")
+             else [WORKSPACE])
+    owner_approved = getattr(args, "owner_approved", False)
+    apply = args.apply
+    groups, err = _fclones_groups(roots, getattr(args, "exclude", []))
+    if groups is None:
+        print(f"dedup: {err}", file=sys.stderr)
+        return 1
+    reaped, skipped, failed = [], [], []
+    for g in groups:
+        files = sorted(g.get("files", []))
+        if len(files) < 2:
+            continue
+        kept = files[0]
+        if not os.path.isfile(kept):
+            continue
+        try:
+            kept_hash = sha256_file(kept)
+        except OSError:
+            continue
+        for path in files[1:]:
+            if not os.path.isfile(path):
+                continue
+            if _in_git_tree(path):
+                skipped.append((path, "inside git working tree"))
+                continue
+            try:
+                if sha256_file(path) != kept_hash:
+                    failed.append((path, "sha256 mismatch vs kept copy"))
+                    continue
+            except OSError as e:
+                failed.append((path, str(e)[:120]))
+                continue
+            decision = decide_delete(
+                path, verified_stores=[f"local-duplicate:{kept}"],
+                owner_approved=owner_approved)
+            if (not decision.allowed
+                    or (decision.requires_owner and not owner_approved)):
+                skipped.append((path, "; ".join(decision.reasons)[:160]))
+                continue
+            size = os.path.getsize(path)
+            if apply:
+                try:
+                    os.remove(path)
+                    msg = (f"DEDUP {path} ({human(size)}) — "
+                           f"byte-identical to kept {kept}")
+                    log_action(msg)
+                    audit_log("dedup", path=path, kept=kept, size=size)
+                    reaped.append((path, size))
+                except OSError as e:
+                    failed.append((path, str(e)[:120]))
+            else:
+                reaped.append((path, size))
+                print(f"WOULD-DEDUP {path} ({human(size)}) — duplicate of {kept}")
+    total = sum(s for _, s in reaped)
+    mode = "APPLY" if apply else "DRY-RUN"
+    print(f"[{mode}] dedup groups={len(groups)} reaped={len(reaped)} "
+          f"({human(total)}) skipped={len(skipped)} failed={len(failed)}")
+    for path, reason in skipped:
+        print(f"  SKIP: {path} — {reason[:120]}")
+    for path, reason in failed:
+        print(f"  FAIL: {path} — {reason[:120]}")
+    if apply and reaped:
+        log_action(f"cloud_dog dedup: {len(reaped)} duplicates, "
+                   f"{human(total)} freed")
+    return 0
+
+
 def cmd_reap_v2(args):
     """v2 reap: verify-then-delete across all store backends.
 
@@ -1473,6 +1601,17 @@ def main(argv=None):
                    help="owner approval for protected game files "
                         "(NEVER-DELETE-GAME-FILES: unattended runs must omit)")
 
+    p = sub.add_parser("dedup", help="find duplicate files (fclones), "
+                                     "delete down to one copy per group")
+    p.add_argument("--apply", action="store_true",
+                   help="actually delete (default is dry-run)")
+    p.add_argument("--path", default="",
+                   help="scope to this directory (default: ~/workspace)")
+    p.add_argument("--owner-approved", action="store_true",
+                   help="owner approval for protected game files")
+    p.add_argument("--exclude", action="append", default=[],
+                   help="fclones --exclude pattern (repeatable)")
+
     p = sub.add_parser("enforce", help="full cycle: scan + reap")
     p.add_argument("--apply", action="store_true")
 
@@ -1521,6 +1660,8 @@ def main(argv=None):
             return cmd_verify_v2(args)
         elif args.cmd == "reap":
             return cmd_reap_v2(args)
+        elif args.cmd == "dedup":
+            return cmd_dedup(args)
         elif args.cmd == "mirror":
             return cmd_mirror(args)
         elif args.cmd == "daemon":
