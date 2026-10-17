@@ -1,0 +1,71 @@
+name: anti-bulk-delete
+
+# Technical enforcement of the ANTI-CLOBBER LAWS (AGENTS.md).
+# Blocks any PR that deletes more than DELETION_THRESHOLD files unless
+# the PR carries the 'allow-bulk-delete' label (explicit owner intent).
+# A green test suite does NOT excuse unexplained deletions.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+jobs:
+  bulk-delete-gate:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Count deletions in this PR
+        id: count
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Files deleted in the PR (not just lines — files gone from the tree)
+          DELETED_FILES=$(git diff --name-only --diff-filter=D "$BASE" "$HEAD" | wc -l)
+          DELETED_LINES=$(git diff --numstat "$BASE" "$HEAD" | awk '{d+=$2} END {print d+0}')
+          echo "deleted_files=$DELETED_FILES" >> "$GITHUB_OUTPUT"
+          echo "deleted_lines=$DELETED_LINES" >> "$GITHUB_OUTPUT"
+          echo "PR deletes $DELETED_FILES files ($DELETED_LINES lines)"
+
+      - name: Check for override label
+        id: label
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh pr view "${{ github.event.pull_request.number }}" \
+               --json labels --jq '.labels[].name' | grep -qx "allow-bulk-delete"; then
+            echo "override=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "override=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fail on unexplained bulk deletion
+        if: steps.count.outputs.deleted_files > 50 && steps.label.outputs.override != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          FILES="${{ steps.count.outputs.deleted_files }}"
+          gh pr comment "${{ github.event.pull_request.number }}" --body \
+            "⛔ **BULK-DELETE BLOCKED by anti-bulk-delete gate.**
+
+          This PR deletes **$FILES files** without the \`allow-bulk-delete\` label.
+
+          Per the ANTI-CLOBBER LAWS (AGENTS.md):
+          1. Every deleted file must be something the task intended to delete.
+          2. The commit message must name the deletions.
+          3. Unexplained deletions block the merge — CI green does not excuse them.
+
+          If these deletions are intentional, add the \`allow-bulk-delete\` label and re-run.
+          If they are not intentional, your working tree was incomplete — do not merge."
+          echo "BLOCKED: $FILES files deleted without override label"
+          exit 1
+
+      - name: Pass
+        if: steps.count.outputs.deleted_files <= 50 || steps.label.outputs.override == 'true'
+        run: |
+          echo "OK: ${{ steps.count.outputs.deleted_files }} files deleted (threshold 50, override=${{ steps.label.outputs.override }})"
