@@ -766,12 +766,26 @@ def kaggle_request(method, path, data=None, headers=None, timeout=120):
 
 
 def kaggle_dataset_view(owner_slug):
-    """GET /datasets/view/{owner}/{slug}. Returns (ok, payload|detail)."""
+    """GET /datasets/view/{owner}/{slug}. Returns (ok, payload|detail).
+
+    NOTE: the view endpoint returns dataset metadata but NOT the file list
+    (its `files` array is always empty). Use kaggle_dataset_list_files()
+    when you need the actual files.
+    """
     return kaggle_request("GET", f"/datasets/view/{owner_slug}")
 
 
+def kaggle_dataset_list_files(owner_slug):
+    """GET /datasets/list/{owner}/{slug}. Returns (ok, payload|detail).
+
+    payload["datasetFiles"] is the list of files, each with `name` and
+    `totalBytes`. This is the endpoint the verify path must use.
+    """
+    return kaggle_request("GET", f"/datasets/list/{owner_slug}")
+
+
 def verify_kaggle_entry(entry, local_path):
-    """Verify a registry entry against a Kaggle dataset (live view + size).
+    """Verify a registry entry against a Kaggle dataset (live file list + size).
 
     Registry entry needs: dataset ("owner/slug"), asset (filename).
     """
@@ -779,16 +793,15 @@ def verify_kaggle_entry(entry, local_path):
     asset = entry.get("asset", "")
     if not dataset or not asset:
         return False, "kaggle entry needs dataset (owner/slug) + asset (filename)"
-    ok, payload = kaggle_dataset_view(dataset)
+    ok, payload = kaggle_dataset_list_files(dataset)
     if not ok:
         return False, payload
-    files = payload.get("files", []) if isinstance(payload, dict) else []
+    files = payload.get("datasetFiles", []) if isinstance(payload, dict) else []
     for f in files:
-        name = f.get("name") or os.path.basename(f.get("ref", ""))
-        ref = f.get("ref", "")
-        if name == asset or ref.endswith("/" + asset):
+        name = f.get("name", "")
+        if name == asset or name.endswith("/" + asset):
             want = entry.get("size", 0)
-            got = int(f.get("totalBytes") or f.get("size") or 0)
+            got = int(f.get("totalBytes") or 0)
             if want and got and got != want:
                 return False, f"size mismatch: remote={got} local={want}"
             return True, f"kaggle:{dataset} file {asset} verified ({got} bytes)"
@@ -819,22 +832,47 @@ def multipart_encode(fields, files):
 
 def kaggle_dataset_upload_new(owner, slug, title, zip_path,
                               license_name="CC0-1.0"):
-    """Create a NEW Kaggle dataset from a local zip via the v1 REST API.
+    """Create a NEW Kaggle dataset from a local file via the official kaggle CLI.
 
-    Returns (ok, detail). Creates a public dataset under `owner`.
+    The previous hand-rolled multipart POST to /datasets/create/new was
+    broken: the endpoint expects a JSON body with pre-uploaded blob tokens,
+    not a raw file (it 400s with "Error reading JToken"). The official CLI
+    implements the real resumable-upload flow, so we shell out to it —
+    same pattern as the github backend shelling out to `gh`.
+
+    Returns (ok, detail). Creates a dataset under `owner` (private by
+    default). Requires the `kaggle` CLI on PATH (pip install kaggle) and
+    ~/.kaggle/kaggle.json credentials.
     """
+    import tempfile
+    kaggle_bin = shutil.which("kaggle")
+    if not kaggle_bin:
+        fallback = os.path.expanduser("~/.local/bin/kaggle")
+        if os.path.isfile(fallback):
+            kaggle_bin = fallback
+    if not kaggle_bin:
+        return False, "kaggle CLI not found (pip install kaggle)"
+    if not (6 <= len(slug) <= 50):
+        return False, f"kaggle slug must be 6-50 chars (got {len(slug)})"
+    if not (6 <= len(title) <= 50):
+        return False, f"kaggle title must be 6-50 chars (got {len(title)})"
+    if not os.path.isfile(zip_path):
+        return False, f"upload file not found: {zip_path}"
+    d = tempfile.mkdtemp(prefix="kaggle-upload-")
     try:
-        with open(zip_path, "rb") as f:
-            zdata = f.read()
-    except OSError as e:
-        return False, f"cannot read zip: {e}"
-    fields = {"title": title, "slug": slug, "licenseName": license_name,
-              "isPrivate": "false"}
-    body, ctype = multipart_encode(
-        fields,
-        {"file": (os.path.basename(zip_path), zdata, "application/zip")})
-    return kaggle_request("POST", "/datasets/create/new", data=body,
-                          headers={"Content-Type": ctype}, timeout=3600)
+        meta = {"id": f"{owner}/{slug}", "title": title,
+                "licenses": [{"name": license_name}]}
+        with open(os.path.join(d, "dataset-metadata.json"), "w") as f:
+            json.dump(meta, f)
+        shutil.copy(zip_path, os.path.join(d, os.path.basename(zip_path)))
+        rc, out, err = run([kaggle_bin, "datasets", "create", "-p", d],
+                           timeout=3600)
+        if rc != 0:
+            tail = (err.strip().splitlines() or [f"exit {rc}"])[-1]
+            return False, f"kaggle datasets create failed: {tail[:200]}"
+        return True, f"kaggle dataset {owner}/{slug} created"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 # ============================================================ v2: store dispatch
