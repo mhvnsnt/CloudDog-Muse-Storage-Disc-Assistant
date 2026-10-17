@@ -344,6 +344,24 @@ order, each gets its own researched, tested patch.
 - Measured on this VM: 2.6x faster than SHA-256 (50MB file).
 - 3 new tests (blake3 digest match, sha256 fallback via hidden module,
   identical-file agreement).
+- **Extended 2026-10-17** (this PR): new `hash` CLI subcommand on top of
+  `fast_hash_file()` (reports which backend ran + MB/s rate), and
+  `stream_url_to_parts(..., hasher_factory=...)` so mirror-mode callers can
+  opt into BLAKE3 part digests for local integrity notes.
+- **dust "Mi" fix 2026-10-17** (this PR): `_parse_dust_size()` now handles
+  the IEC suffixes (`1.0Mi`) that bundled dust 1.2.6 emits — without it,
+  every dust-reported size parsed to 0 and the scan/audit fast paths went
+  blind (verified live: 1MB dir reported as 0 bytes before the fix).
+
+### agent-audit (per-agent quotas, AGENT DISK PUSH LAW) — WIRED (2026-10-17)
+- New `cloud_dog.py agent-audit [--quota 20G] [--top N] [--json]`
+  subcommand: per top-level dir under ~/workspace shows bytes (dust fast
+  path, stdlib walk fallback), registry coverage % (bytes with a live store
+  entry), cleared bytes, and flags (`over_quota`, `uncovered_big`,
+  `mostly_unregistered`). Read-only — never deletes; tells the guardian
+  which lanes still need their work pushed to GitHub/TeraBox before any
+  reap. 5 new tests (walk-path exactness, dust-path approximate,
+  quota/flag logic, JSON output).
 
 ### rclone — WIRED (v1)
 - URL: https://rclone.org/ — License: **MIT** (verified against the official
