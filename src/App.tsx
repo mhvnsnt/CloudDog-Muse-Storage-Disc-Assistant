@@ -13,7 +13,8 @@ import {
   Cpu,
   Radio,
   Flame,
-  Zap
+  Zap,
+  Server
 } from 'lucide-react';
 import { 
   OSPlatform, 
@@ -49,6 +50,7 @@ import { TorrentCloudMirror } from './components/TorrentCloudMirror';
 import { ComputeOffloadPanel } from './components/ComputeOffloadPanel';
 import { AgentMemoryBroadcast } from './components/AgentMemoryBroadcast';
 import { EmergencyReaperCenter } from './components/EmergencyReaperCenter';
+import { RealDiskBridge } from './components/RealDiskBridge';
 import { DryRunModal } from './components/DryRunModal';
 import { CustomPathModal } from './components/CustomPathModal';
 
@@ -62,8 +64,7 @@ export default function App() {
   const [inFlightLanes, setInFlightLanes] = useState<InFlightLaneTask[]>(INITIAL_IN_FLIGHT_LANES);
   const [watchdogLogs, setWatchdogLogs] = useState<WatchdogSweepLog[]>(INITIAL_WATCHDOG_LOGS);
 
-  // Default to the Emergency Reaper tab to immediately address user's critical operation
-  const [activeTab, setActiveTab] = useState<'reaper' | 'overview' | 'mirror' | 'compute' | 'agents' | 'terminal' | 'repo'>('reaper');
+  const [activeTab, setActiveTab] = useState<'reaper' | 'real_bridge' | 'overview' | 'mirror' | 'compute' | 'agents' | 'terminal' | 'repo'>('reaper');
   const [selectedCategory, setSelectedCategory] = useState<ClutterCategoryId | 'all'>('all');
   const [isCleaning, setIsCleaning] = useState(false);
   const [isDryRunModalOpen, setIsDryRunModalOpen] = useState(false);
@@ -106,7 +107,6 @@ export default function App() {
     },
   ]);
 
-  // Handle platform change
   const handleSetPlatform = (newPlat: OSPlatform) => {
     setPlatform(newPlat);
     setItems(INITIAL_CLUTTER_ITEMS[newPlat]);
@@ -116,7 +116,6 @@ export default function App() {
     });
   };
 
-  // Toggle item selection
   const handleToggleItem = (id: string) => {
     setItems((prev) =>
       prev.map((it) => (it.id === id ? { ...it, selected: !it.selected } : it))
@@ -156,7 +155,6 @@ export default function App() {
         )
       );
 
-      // Drops disk from 96% down through 91%
       setDiskUsagePct((prev) => Math.max(74, prev - 5.2));
       setIsCleaning(false);
 
@@ -175,23 +173,6 @@ export default function App() {
         message: 'Scooby Lane: All 717 blobs verified! Local copies reaped on the spot. Disk dropped down to 90.8%. Ready for final commit step.',
         type: 'success',
       });
-
-      setLogs((prev) => [
-        ...prev,
-        {
-          id: `scooby-${Date.now()}`,
-          timestamp: new Date().toLocaleTimeString(),
-          command: 'muse-assist reaper --lane scooby --reap-all-verified',
-          output: [
-            '⚡ Reaping remaining 47 Scooby blobs against GitHub...',
-            '   ✓ Blobs 671-717: SHA-256 verified against remote tree.',
-            '   ✓ Local chunks deleted on the spot (Freed ~540 MB).',
-            '   ✓ Manifest updated: 717 of 717 blobs referenced.',
-            '📉 Disk usage reduced. Ready for commit step.',
-          ],
-          type: 'success',
-        },
-      ]);
     }, 700);
   };
 
@@ -240,7 +221,6 @@ export default function App() {
         )
       );
 
-      // Drops disk further by 3.7GB (~7.2%)
       setDiskUsagePct((prev) => Math.max(72, prev - 7.2));
       setIsCleaning(false);
 
@@ -259,24 +239,6 @@ export default function App() {
         message: 'Priority 8 Files verified and purged! Reclaimed 3.7 GB. Disk dropped below popup line!',
         type: 'success',
       });
-
-      setLogs((prev) => [
-        ...prev,
-        {
-          id: `files-8-${Date.now()}`,
-          timestamp: new Date().toLocaleTimeString(),
-          command: 'muse-assist reaper --team priority-8 --verify-and-purge',
-          output: [
-            '📦 Verifying 8 priority files against GitHub remote...',
-            '   ✓ DOA4_Soundtrack_Raw_Disc_Tars.tar (1.45 GB) -> Verified & Deleted',
-            '   ✓ DXMMII_Multitrack_Parts.part01.rar (1.28 GB) -> Verified & Deleted',
-            '   ✓ Master Render Stem 1 MP4 (485 MB) -> Verified & Deleted',
-            '   ✓ Master Render Stem 2 MP4 (485 MB) -> Verified & Deleted',
-            '🎉 Reclaimed 3.7 GB instantly! Local disk cleared.',
-          ],
-          type: 'success',
-        },
-      ]);
     }, 700);
   };
 
@@ -303,22 +265,6 @@ export default function App() {
         message: 'Watchdog sweep executed! Pruned 4.2 GB of partial chunks. Disk dropped to compliant range.',
         type: 'success',
       });
-
-      setLogs((prev) => [
-        ...prev,
-        {
-          id: `wd-sweep-${Date.now()}`,
-          timestamp: new Date().toLocaleTimeString(),
-          command: 'muse-assist watchdog --sweep-now',
-          output: [
-            '🐕 10-Minute Loop Watchdog executing immediate sweep...',
-            '   ✓ Checked active upload pipelines (Adventure Time, Gumball, Johnny Test).',
-            '   ✓ Pruned 4.2 GB of dead download staging and verified chunks.',
-            '📉 Disk usage successfully dropped down below the 75% Law ceiling!',
-          ],
-          type: 'success',
-        },
-      ]);
     }, 800);
   };
 
@@ -340,7 +286,6 @@ export default function App() {
         }))
       );
 
-      // Plummet disk down to 68% (under the 75% law!)
       setDiskUsagePct(68.2);
       setIsCleaning(false);
       
@@ -360,28 +305,9 @@ export default function App() {
         message: 'NO-LOCAL-CLUTTER LAW RESTORED: Disk dropped to 68.2% (safely below 75% threshold). Popup dismissed!',
         type: 'success',
       });
-
-      setLogs((prev) => [
-        ...prev,
-        {
-          id: `law-${Date.now()}`,
-          timestamp: new Date().toLocaleTimeString(),
-          command: 'muse-assist enforce-law --force-all-lanes',
-          output: [
-            '⚖️ Enforcing NO-LOCAL-CLUTTER LAW across all lanes and chats...',
-            '   ✓ Scooby Lane: 717/717 blobs verified & local reaped.',
-            '   ✓ Priority 8 Files: 8/8 files verified & local purged.',
-            '   ✓ Adventure Time & Gumball: Cleared 100%.',
-            '📉 Disk usage plummeted from 96.0% -> 68.2%!',
-            '🔒 Memory logged to AGENTS.md & MEMORY.md.',
-          ],
-          type: 'success',
-        },
-      ]);
     }, 800);
   };
 
-  // Delete only manually selected items
   const handleDeleteSelected = () => {
     const selected = items.filter((it) => it.selected);
     if (selected.length === 0) return;
@@ -399,7 +325,6 @@ export default function App() {
     }, 600);
   };
 
-  // Add Torrent Mirror task
   const handleAddTorrent = (name: string, magnet: string, target: CloudStorageTarget, sizeGb: number) => {
     const sizeBytes = sizeGb * 1024 * 1024 * 1024;
     const newTask: TorrentMirrorTask = {
@@ -577,7 +502,12 @@ export default function App() {
           />
         )}
 
-        {/* Tab 2: Storage Auditor & Table View */}
+        {/* Tab 2: Real OS Bridge (Native File System Access & Express Backend) */}
+        {activeTab === 'real_bridge' && (
+          <RealDiskBridge />
+        )}
+
+        {/* Tab 3: Storage Auditor & Table View */}
         {activeTab === 'overview' && (
           <div className="space-y-8">
             <StorageOverview
@@ -625,7 +555,7 @@ export default function App() {
           </div>
         )}
 
-        {/* Tab 3: 1TB+ Cloud Torrent Mirroring */}
+        {/* Tab 4: 1TB+ Cloud Torrent Mirroring */}
         {activeTab === 'mirror' && (
           <TorrentCloudMirror
             tasks={tasks}
@@ -637,7 +567,7 @@ export default function App() {
           />
         )}
 
-        {/* Tab 4: Compute & Non-Physical Virtual VRAM */}
+        {/* Tab 5: Compute & Non-Physical Virtual VRAM */}
         {activeTab === 'compute' && (
           <ComputeOffloadPanel
             computeState={computeState}
@@ -647,7 +577,7 @@ export default function App() {
           />
         )}
 
-        {/* Tab 5: Agents, MEMORY.md & NO-LOCAL-CLUTTER LAW */}
+        {/* Tab 6: Agents, MEMORY.md & NO-LOCAL-CLUTTER LAW */}
         {activeTab === 'agents' && (
           <AgentMemoryBroadcast
             lanes={lanes}
@@ -658,7 +588,7 @@ export default function App() {
           />
         )}
 
-        {/* Tab 6: Terminal CLI Runner */}
+        {/* Tab 7: Terminal CLI Runner */}
         {activeTab === 'terminal' && (
           <TerminalSimulator
             logs={logs}
@@ -668,7 +598,7 @@ export default function App() {
           />
         )}
 
-        {/* Tab 7: GitHub Repository Explorer */}
+        {/* Tab 8: GitHub Repository Explorer */}
         {activeTab === 'repo' && (
           <RepoExplorer />
         )}
@@ -687,6 +617,13 @@ export default function App() {
 
           <div className="flex items-center gap-4 text-slate-400">
             <button
+              onClick={() => setActiveTab('real_bridge')}
+              className="hover:text-emerald-400 transition-colors cursor-pointer"
+            >
+              Real OS Bridge
+            </button>
+            <span>·</span>
+            <button
               onClick={() => setActiveTab('reaper')}
               className="hover:text-rose-400 transition-colors cursor-pointer"
             >
@@ -698,13 +635,6 @@ export default function App() {
               className="hover:text-cyan-400 transition-colors cursor-pointer"
             >
               AGENTS.md & MEMORY.md
-            </button>
-            <span>·</span>
-            <button
-              onClick={() => setActiveTab('mirror')}
-              className="hover:text-cyan-400 transition-colors cursor-pointer"
-            >
-              1TB Torrents
             </button>
           </div>
         </div>

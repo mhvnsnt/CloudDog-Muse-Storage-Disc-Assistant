@@ -1,9 +1,9 @@
 import React from 'react';
-import { HardDrive, AlertTriangle, ShieldCheck, RefreshCw, Zap } from 'lucide-react';
+import { HardDrive, AlertTriangle, ShieldCheck, RefreshCw, Zap, Server } from 'lucide-react';
 
 interface HeaderProps {
-  activeTab: 'reaper' | 'overview' | 'mirror' | 'compute' | 'agents' | 'terminal' | 'repo';
-  setActiveTab: (tab: 'reaper' | 'overview' | 'mirror' | 'compute' | 'agents' | 'terminal' | 'repo') => void;
+  activeTab: 'reaper' | 'real_bridge' | 'overview' | 'mirror' | 'compute' | 'agents' | 'terminal' | 'repo';
+  setActiveTab: (tab: 'reaper' | 'real_bridge' | 'overview' | 'mirror' | 'compute' | 'agents' | 'terminal' | 'repo') => void;
   onEnforceLaw: () => void;
   isCleaning: boolean;
   diskUsagePercentage: number;
@@ -40,7 +40,7 @@ export const Header: React.FC<HeaderProps> = ({
           </button>
 
           {/* Zone 2: Concise single-line navigation links */}
-          <nav className="hidden lg:flex items-center gap-5 text-sm font-medium">
+          <nav className="hidden lg:flex items-center gap-4 text-sm font-medium">
             <button
               onClick={() => setActiveTab('reaper')}
               className={`whitespace-nowrap shrink-0 transition-colors py-1 cursor-pointer flex items-center gap-1.5 ${
@@ -53,6 +53,17 @@ export const Header: React.FC<HeaderProps> = ({
               <span>In-Flight Reaper</span>
             </button>
             <button
+              onClick={() => setActiveTab('real_bridge')}
+              className={`whitespace-nowrap shrink-0 transition-colors py-1 cursor-pointer flex items-center gap-1.5 ${
+                activeTab === 'real_bridge'
+                  ? 'text-emerald-400 font-semibold border-b-2 border-emerald-400'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Server className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Real OS Bridge</span>
+            </button>
+            <button
               onClick={() => setActiveTab('overview')}
               className={`whitespace-nowrap shrink-0 transition-colors py-1 cursor-pointer ${
                 activeTab === 'overview'
@@ -60,7 +71,7 @@ export const Header: React.FC<HeaderProps> = ({
                   : 'text-slate-400 hover:text-slate-200'
               }`}
             >
-              Storage Auditor
+              Auditor
             </button>
             <button
               onClick={() => setActiveTab('mirror')}
@@ -90,7 +101,7 @@ export const Header: React.FC<HeaderProps> = ({
                   : 'text-slate-400 hover:text-slate-200'
               }`}
             >
-              Agents & Memory Law
+              Agents Law
             </button>
             <button
               onClick={() => setActiveTab('terminal')}
@@ -150,7 +161,13 @@ export const Header: React.FC<HeaderProps> = ({
             onClick={() => setActiveTab('reaper')}
             className={`whitespace-nowrap shrink-0 cursor-pointer ${activeTab === 'reaper' ? 'text-rose-400 font-bold' : 'text-slate-400'}`}
           >
-            Emergency Reaper
+            Reaper
+          </button>
+          <button
+            onClick={() => setActiveTab('real_bridge')}
+            className={`whitespace-nowrap shrink-0 cursor-pointer ${activeTab === 'real_bridge' ? 'text-emerald-400 font-medium' : 'text-slate-400'}`}
+          >
+            Real Bridge
           </button>
           <button
             onClick={() => setActiveTab('overview')}
