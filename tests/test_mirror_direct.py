@@ -67,6 +67,28 @@ def test_split_file_to_parts_exact_multiple(tmp_path):
     assert b"".join(open(p[1], "rb").read() for p in parts) == data
 
 
+def test_split_file_to_parts_hasher_factory(tmp_path):
+    # main's stream_url_to_parts gained hasher_factory (blake3) in PR #22;
+    # split_file_to_parts must accept the same opt-in.
+    class FakeHasher:
+        def __init__(self):
+            self.buf = b""
+
+        def update(self, data):
+            self.buf += data
+
+        def hexdigest(self):
+            return "fake-" + str(len(self.buf))
+
+    src = tmp_path / "hf.bin"
+    src.write_bytes(b"X" * 100)
+    parts = list(cloud_dog.split_file_to_parts(
+        str(src), str(tmp_path / "staging"), part_bytes=64,
+        hasher_factory=FakeHasher))
+    assert parts
+    assert all(p[3].startswith("fake-") for p in parts)
+
+
 def test_aria2c_fetch_unknown_kind_fails_closed(tmp_path):
     ok, detail = cloud_dog._aria2c_fetch(
         "/nonexistent/aria2c", "bogus-kind", "x", str(tmp_path))

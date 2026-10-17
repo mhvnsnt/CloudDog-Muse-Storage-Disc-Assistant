@@ -56,7 +56,16 @@ python3 cloud_dog.py register --file /path/to/video.mp4 --store terabox \
 python3 cloud_dog.py register --file /path/to/data.zip --store kaggle \
     --dataset marsfmmg/my-dataset --asset data.zip
 
-# verify one file against its store (github | terabox | kaggle)
+# restic backend (deduped, encrypted snapshots; binary at
+# ~/workspace/tools/restic/restic; repo password via RESTIC_PASSWORD
+# env var — never on the command line, never in the repo)
+export RESTIC_PASSWORD="..."
+python3 cloud_dog.py register --file /path/to/bigfile.dat --store restic \
+    --restic-repo /mnt/archive/restic-repo
+# register backs the file up NOW and records the snapshot id; or record a
+# pre-existing snapshot: --restic-repo ... --snapshot-id <id>
+
+# verify one file against its store (github | terabox | kaggle | restic)
 python3 cloud_dog.py verify --file /path/to/part-aa
 
 # dry-run: show what WOULD be reaped

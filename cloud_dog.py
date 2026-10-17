@@ -27,6 +27,11 @@ Usage:
         [--part-mb 100]                   # torrent -> store, bounded disk
     cloud_dog.py daemon [--interval 600] [--apply]
         # continuous enforce loop (pidfile, SIGTERM-clean)
+    cloud_dog.py hash --file PATH [--json]
+        # fast file digest (BLAKE3 when available), prints backend + rate
+    cloud_dog.py agent-audit [--quota 20G] [--json]
+        # per-agent workdir sizes + registry coverage (AGENT DISK PUSH LAW;
+        # read-only, never deletes)
 
 v2 (2026-10-17): terabox backend (tbupload.py), kaggle backend (REST),
 torrent mirror mode (TorBox cloud -> Range-stream -> part upload/verify/
@@ -94,11 +99,16 @@ def now_stamp():
     return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M %Z")
 
 
-def run(cmd, timeout=60):
-    """Run a shell command, return (rc, stdout, stderr). Never raises."""
+def run(cmd, timeout=60, env=None):
+    """Run a shell command, return (rc, stdout, stderr). Never raises.
+
+    env=None inherits the parent environment; pass an explicit env mapping
+    when a secret (e.g. RESTIC_PASSWORD) must be present for the child.
+    """
     try:
         p = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout,
+            env=env,
         )
         return p.returncode, p.stdout, p.stderr
     except Exception as e:  # timeout, missing binary, etc.
@@ -134,13 +144,31 @@ def _b3sum_bin():
     return cand if os.path.isfile(cand) and os.access(cand, os.X_OK) else None
 
 
-def fast_hash_file(path):
-    """Fast BLAKE3 hash via bundled b3sum binary, else SHA-256 fallback.
+def _blake3_available():
+    """True when the optional blake3 pip package is importable."""
+    try:
+        import blake3  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
-    For INTERNAL comparisons only (not store digests) — the digest only
-    needs to match between the two files being compared. GitHub release
-    assets always use SHA-256; use sha256_file() for those.
+
+def fast_hash_file(path, chunk=1 << 20):
+    """Fast BLAKE3 hash for INTERNAL comparisons (not store digests).
+
+    Prefers the in-process `blake3` pip package (fastest, no spawn
+    overhead), then the bundled b3sum binary (tools/bin/), then SHA-256.
+    The digest only needs to match between the two files being compared —
+    never use this where a store expects a specific digest (GitHub release
+    assets are SHA-256; use sha256_file() for those).
     """
+    if _blake3_available():
+        import blake3
+        h = blake3.blake3()
+        with open(path, "rb") as f:
+            for blk in iter(lambda: f.read(chunk), b""):
+                h.update(blk)
+        return h.hexdigest()
     b3 = _b3sum_bin()
     if b3:
         try:
@@ -150,7 +178,7 @@ def fast_hash_file(path):
                 return out.stdout.split()[0]
         except (subprocess.SubprocessError, OSError):
             pass
-    return sha256_file(path)
+    return sha256_file(path, chunk)
 
 
 def is_sacred(path):
@@ -321,40 +349,52 @@ def log_action(text):
 
 
 # ---------------------------------------------------------------- commands
+def _repo_tool_bin(name):
+    """Path to a binary vendored in the repo's tools/bin/, or None."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    cand = os.path.join(here, "tools", "bin", name)
+    if os.path.isfile(cand) and os.access(cand, os.X_OK):
+        return cand
+    return None
+
+
+def _workspace_tool_bin(name, *rel_parts):
+    """Locate a tool under ~/workspace/tools/<name>/... (this VM's layout)."""
+    for rel in rel_parts:
+        p = os.path.join(WORKSPACE, "tools", name, rel)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
 def _dust_binary():
     """Locate the dust binary (optional dependency for fast scans)."""
-    found = shutil.which("dust")
-    if found:
-        return found
-    known = os.path.join(WORKSPACE, "tools", "dust", "dust")
-    if os.path.isfile(known) and os.access(known, os.X_OK):
-        return known
-    return None
+    return (_repo_tool_bin("dust") or shutil.which("dust")
+            or _workspace_tool_bin("dust", "dust",
+                                  os.path.join("dust", "dust")))
 
 
 def _aria2c_binary():
     """Locate the aria2c binary (transport for `mirror --direct`).
 
-    Probes PATH first, then the known install at
-    ~/workspace/tools/aria2/aria2c (wrapper script; the extracted
-    Debian-tree binary is at .../usr/bin/aria2c). Returns None when
-    missing so direct mode fails closed with a clear message.
+    Same precedence convention as _dust_binary: repo-vendored first, then
+    PATH, then the known install at ~/workspace/tools/aria2/aria2c
+    (wrapper script; the extracted Debian-tree binary is at
+    .../usr/bin/aria2c). Returns None when missing so direct mode fails
+    closed with a clear message.
     """
-    found = shutil.which("aria2c")
-    if found:
-        return found
-    for rel in (os.path.join("tools", "aria2", "aria2c"),
-                os.path.join("tools", "aria2", "usr", "bin", "aria2c")):
-        known = os.path.join(WORKSPACE, rel)
-        if os.path.isfile(known) and os.access(known, os.X_OK):
-            return known
-    return None
-
-
+    return (_repo_tool_bin("aria2c") or shutil.which("aria2c")
+            or _workspace_tool_bin("aria2", "aria2c",
+                                  os.path.join("usr", "bin", "aria2c")))
 def _parse_dust_size(s):
-    """Parse dust -j size strings like '2.1M', '272K', '512B' into bytes."""
+    """Parse dust -j size strings like '2.1M', '272K', '512B', '1.0Mi'.
+
+    dust >= 1.2.x emits IEC suffixes ('1.0Mi'); older releases emit 'M'.
+    Both mean the same binary multiplier. (Without the 'i' handling, the
+    bundled dust 1.2.6's sizes all parse to 0 — scan/audit go blind.)
+    """
     import re
-    m = re.match(r"^\s*([\d.]+)\s*([BKMGTPE]?)\s*$", str(s).upper())
+    m = re.match(r"^\s*([\d.]+)\s*([BKMGTPE]?)(I?)\s*$", str(s).upper())
     if not m:
         return 0
     num, unit = float(m.group(1)), m.group(2)
@@ -440,6 +480,217 @@ def cmd_scan(as_json=False):
     return report
 
 
+def cmd_hash(args):
+    """Hash one file with the fast-hash engine; print backend + digest + rate.
+
+    Uses fast_hash_file() (PR #17: blake3 module -> bundled b3sum ->
+    sha256) and reports which backend actually ran, so lanes can see what
+    speed they are getting. Local comparisons only — never for store
+    verification (registry/GitHub digests stay sha256).
+    """
+    path = os.path.abspath(args.file)
+    if not os.path.isfile(path):
+        print(f"not a file: {path}", file=sys.stderr)
+        return 1
+    if _blake3_available():
+        backend = "blake3/pip-module"
+    elif _b3sum_bin() is not None:
+        backend = "blake3/bundled-b3sum"
+    else:
+        backend = "sha256/stdlib"
+    size = os.path.getsize(path)
+    t0 = time.monotonic()
+    try:
+        hexd = fast_hash_file(path)
+    except OSError as e:
+        print(f"hash failed: {e}", file=sys.stderr)
+        return 1
+    dt = max(time.monotonic() - t0, 1e-9)
+    rate = size / dt / (1 << 20)
+    if args.json:
+        print(json.dumps({"path": path, "backend": backend, "digest": hexd,
+                          "bytes": size, "mb_per_s": round(rate, 1)}))
+    else:
+        print(f"{backend}: {hexd}  {path}  ({human(size)}, {rate:.1f} MB/s)")
+    return 0
+
+
+def _parse_size(s):
+    """Parse '20G', '500M', '1024' into bytes. Raises ValueError."""
+    s = str(s).strip().upper()
+    mult = {"B": 1, "K": 1 << 10, "KB": 1 << 10,
+            "M": 1 << 20, "MB": 1 << 20,
+            "G": 1 << 30, "GB": 1 << 30,
+            "T": 1 << 40, "TB": 1 << 40}
+    for suffix in sorted(mult, key=len, reverse=True):
+        if s.endswith(suffix) and len(s) > len(suffix):
+            return int(float(s[:-len(suffix)]) * mult[suffix])
+    return int(float(s))
+
+
+def _dir_tree_size(path):
+    """Walk a tree (no symlink follow, sacred dirs pruned). Returns (bytes, files)."""
+    total, count = 0, 0
+    if os.path.islink(path):
+        return 0, 0
+    if os.path.isfile(path):
+        try:
+            return os.lstat(path).st_size, 1
+        except OSError:
+            return 0, 0
+    for root, dirs, files in os.walk(path, followlinks=False):
+        # prune sacred subtrees and symlinked dirs: never descend, never count
+        dirs[:] = [d for d in dirs
+                   if not os.path.islink(os.path.join(root, d))
+                   and not is_sacred(os.path.join(root, d))]
+        if is_sacred(root):
+            dirs[:] = []
+            continue
+        for fn in files:
+            fp = os.path.join(root, fn)
+            try:
+                if os.path.islink(fp):
+                    continue
+                total += os.lstat(fp).st_size
+                count += 1
+            except OSError:
+                pass
+    return total, count
+
+
+def _topdir_sizes(root):
+    """[(name, bytes)] for top-level entries of root: dust fast path first,
+    stdlib walk fallback. Returns (sizes, file_counts) where file_counts is
+    a dict on the walk path or None when dust served sizes (dust reports
+    bytes only; counting files would cost the walk we just avoided)."""
+    biggest = _dust_largest(root)
+    if biggest is not None:
+        return biggest, None
+    sizes, counts = [], {}
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return [], {}
+    for name in names:
+        if name.startswith("."):
+            continue
+        p = os.path.join(root, name)
+        if is_sacred(p):
+            continue
+        total, count = _dir_tree_size(p)
+        sizes.append((name, total))
+        counts[name] = count
+    return sizes, counts
+
+
+def agent_audit_report(root=None, quota_bytes=0, registry=None, top=20,
+                       min_uncovered_bytes=100 << 20):
+    """Per-agent-directory disk report for the AGENT DISK PUSH LAW.
+
+    Every agent lane keeps work under ~/workspace/<lane>/; everything on
+    local disk must also live on GitHub or TeraBox. This read-only report
+    shows, per top-level dir: bytes on disk, registry coverage (bytes with
+    a live registered entry = claimed on a store), cleared bytes, and
+    flags: over_quota, uncovered_big (sizeable dir with NOTHING registered),
+    mostly_unregistered.
+
+    root: directory to audit (default ~/workspace). registry: loaded
+    registry dict (default load_registry()). quota_bytes: per-dir quota;
+    0 = no quota enforcement.
+    """
+    root = os.path.abspath(root or WORKSPACE)
+    if registry is None:
+        registry = load_registry()
+    entries = registry.get("entries", {})
+    # index registry bytes by directory prefix for O(1) lookups
+    covered, cleared = {}, {}
+    for path, e in entries.items():
+        if e.get("store") not in STORES:
+            continue
+        size = e.get("size", 0) or 0
+        topdir = path if os.path.isdir(path) else os.path.dirname(path)
+        # attribute to the immediate child of root
+        rel = os.path.relpath(topdir, root)
+        key = rel.split(os.sep, 1)[0] if not rel.startswith("..") else None
+        if not key or key == ".":
+            key = os.path.basename(path) if os.path.isfile(path) else None
+        if not key:
+            continue
+        bucket = cleared if e.get("status") == "reaped" else covered
+        bucket[key] = bucket.get(key, 0) + size
+    rows = []
+    sizes, file_counts = _topdir_sizes(root)
+    for name, total in sizes:
+        if name.startswith("."):
+            continue
+        p = os.path.join(root, name)
+        if is_sacred(p):
+            continue
+        count = file_counts[name] if file_counts else None
+        cov = covered.get(name, 0)
+        clr = cleared.get(name, 0)
+        unreg = max(total - cov, 0)
+        cov_pct = round(100.0 * cov / total, 1) if total else 100.0
+        flags = []
+        if quota_bytes and total > quota_bytes:
+            flags.append("over_quota")
+        if total >= min_uncovered_bytes and cov == 0:
+            flags.append("uncovered_big")
+        elif total >= min_uncovered_bytes and cov_pct < 10.0:
+            flags.append("mostly_unregistered")
+        rows.append({"name": name, "bytes": total, "files": count,
+                     "covered_bytes": cov, "cleared_bytes": clr,
+                     "unregistered_bytes": unreg,
+                     "coverage_pct": cov_pct, "flags": flags})
+    rows.sort(key=lambda r: r["bytes"], reverse=True)
+    return rows[:top] if top else rows
+
+
+def cmd_agent_audit(args):
+    """Audit per-agent workdirs: size, registry coverage, quota flags.
+
+    Read-only: never deletes anything. Serves the AGENT DISK PUSH LAW —
+    every agent's local disk must also live on GitHub/TeraBox.
+    """
+    try:
+        quota = _parse_size(args.quota) if getattr(args, "quota", "") else 0
+    except ValueError:
+        print(f"bad --quota value: {args.quota!r}", file=sys.stderr)
+        return 1
+    rows = agent_audit_report(
+        root=getattr(args, "root", "") or None,
+        quota_bytes=quota,
+        top=getattr(args, "top", 20),
+        min_uncovered_bytes=_parse_size(getattr(args, "min_uncovered", "100M")),
+    )
+    total = sum(r["bytes"] for r in rows)
+    if args.json:
+        print(json.dumps({"rows": rows,
+                          "quota_bytes": quota,
+                          "total_bytes": total}, indent=2))
+        return 0
+    print(f"Agent-dir audit of ~/workspace (quota "
+          f"{human(quota) if quota else 'none'}):")
+    for r in rows:
+        flag = f"  [{','.join(r['flags'])}]" if r["flags"] else ""
+        nfiles = f"{r['files']} files" if r["files"] is not None else "files n/a"
+        print(f"  {human(r['bytes']):>10}  {r['name']:<36}"
+              f"  covered {r['coverage_pct']:>5}% "
+              f"({nfiles}){flag}")
+    uncovered = sum(r["unregistered_bytes"] for r in rows)
+    print(f"Total audited: {human(total)}; "
+          f"unregistered on disk: {human(uncovered)}")
+    flagged = [r for r in rows if r["flags"]]
+    if flagged:
+        print("Flagged dirs (need store backup before any reap):")
+        for r in flagged:
+            print(f"  {r['name']}: {','.join(r['flags'])} "
+                  f"({human(r['unregistered_bytes'])} unregistered)")
+    audit_log("agent_audit", dirs=len(rows), total_bytes=total,
+              flagged=[r["name"] for r in flagged])
+    return 0
+
+
 def cmd_register(args):
     path = os.path.abspath(args.file)
     if is_sacred(path):
@@ -453,12 +704,31 @@ def cmd_register(args):
         "asset": args.asset,
         "remote_dir": getattr(args, "remote_dir", "") or "",
         "dataset": getattr(args, "dataset", "") or "",
+        "restic_repo": getattr(args, "restic_repo", "") or "",
+        "snapshot_id": getattr(args, "snapshot_id", "") or "",
         "sha256": args.sha256 or "",
         "size": args.size or 0,
         "note": args.note or "",
         "registered_at": now_stamp(),
         "status": "registered",
     }
+    if args.store == "restic":
+        # restic register performs the backup now and records the snapshot id
+        # (a registry claim alone is never proof; the backup IS the proof).
+        repo = getattr(args, "restic_repo", "") or ""
+        if not repo:
+            print("register --store restic needs --restic-repo", file=sys.stderr)
+            return 1
+        snapshot_id = getattr(args, "snapshot_id", "") or ""
+        if not snapshot_id:
+            ok, res = restic_backup(path, repo)
+            if not ok:
+                print(f"register: restic backup failed: {res}", file=sys.stderr)
+                return 1
+            snapshot_id = res
+            print(f"restic backup ok: snapshot {snapshot_id[:8]}")
+        entry["restic_repo"] = repo
+        entry["snapshot_id"] = snapshot_id
     if os.path.exists(path) and not args.sha256:
         try:
             entry["sha256"] = sha256_file(path)
@@ -468,11 +738,18 @@ def cmd_register(args):
     reg = load_registry()
     reg["entries"][path] = entry
     save_registry(reg)
-    print(f"Registered: {path} -> {args.store}:{args.repo}@{args.release}")
+    dest = {"github": f"{args.repo}@{args.release}",
+            "terabox": entry["remote_dir"],
+            "kaggle": entry["dataset"],
+            "restic": f"{entry['restic_repo']}#{entry['snapshot_id'][:8]}",
+            }.get(args.store, "")
+    print(f"Registered: {path} -> {args.store}:{dest}")
     audit_log("register", path=path, store=args.store,
               repo=args.repo, release=args.release, asset=args.asset,
               remote_dir=getattr(args, "remote_dir", "") or "",
               dataset=getattr(args, "dataset", "") or "",
+              restic_repo=entry["restic_repo"],
+              snapshot_id=entry["snapshot_id"][:16],
               sha256=entry["sha256"][:16], size=entry["size"])
     return 0
 
@@ -651,7 +928,7 @@ AUDIT_PATH = os.path.join(AGENT_OPS, "cloud-dog-audit.jsonl")
 MIRROR_STAGING = os.path.join(AGENT_OPS, "mirror-staging")
 DAEMON_PIDFILE = os.path.join(AGENT_OPS, "cloud-dog-daemon.pid")
 
-STORES = ("github", "terabox", "kaggle")
+STORES = ("github", "terabox", "kaggle", "restic")
 
 UA_BROWSER = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -755,6 +1032,126 @@ def verify_terabox_entry(entry, local_path):
     return False, f"{asset} not found in terabox:{remote_dir}"
 
 
+# ============================================================ restic backend
+def _restic_binary():
+    """Locate the restic binary (optional dependency)."""
+    found = shutil.which("restic")
+    if found:
+        return found
+    known = os.path.join(WORKSPACE, "tools", "restic", "restic")
+    if os.path.isfile(known) and os.access(known, os.X_OK):
+        return known
+    return None
+
+
+def _restic_env(password=None):
+    """Environment for restic subprocesses.
+
+    The repo password comes from the RESTIC_PASSWORD environment variable
+    (or the password argument). It is passed via the subprocess environment
+    only — never on the command line, never logged.
+    """
+    env = dict(os.environ)
+    pw = password or env.get("RESTIC_PASSWORD", "")
+    if pw:
+        env["RESTIC_PASSWORD"] = pw
+    return env
+
+
+def restic_repo_ready(repo, password=None):
+    """True if restic can open the repo (initialized + password works)."""
+    binary = _restic_binary()
+    if not binary or not repo:
+        return False
+    env = _restic_env(password)
+    if not env.get("RESTIC_PASSWORD"):
+        return False
+    rc, _, _ = run([binary, "-r", repo, "cat", "config"],
+                   timeout=60, env=env)
+    return rc == 0
+
+
+def restic_backup(local_path, repo, password=None):
+    """Back up one file into a restic repository.
+
+    Returns (ok, snapshot_id|detail). ok=True only if `restic backup --json`
+    exits 0 and reports a snapshot_id. The repo is auto-initialized on first
+    use. Password via RESTIC_PASSWORD env var (or the password argument),
+    passed through the subprocess environment — never on the command line.
+    """
+    binary = _restic_binary()
+    if not binary:
+        return False, "restic binary not found (PATH or ~/workspace/tools/restic)"
+    env = _restic_env(password)
+    if not env.get("RESTIC_PASSWORD"):
+        return False, "RESTIC_PASSWORD env var not set (restic repo password)"
+    if not repo:
+        return False, "restic repo required (--restic-repo)"
+    if not os.path.exists(local_path):
+        return False, f"local file missing: {local_path}"
+    if not restic_repo_ready(repo, password):
+        rc, _, err = run([binary, "-r", repo, "init"], timeout=120, env=env)
+        if rc != 0:
+            tail = (err.strip().splitlines() or [f"exit {rc}"])[-1]
+            return False, f"restic init failed: {tail[:200]}"
+    rc, out, err = run([binary, "-r", repo, "backup", "--json", local_path],
+                       timeout=7200, env=env)
+    if rc != 0:
+        tail = (err.strip().splitlines() or [out.strip().splitlines() or
+                f"exit {rc}"][-1])[-1]
+        return False, f"restic backup failed: {tail[:200]}"
+    snapshot_id = ""
+    for line in out.splitlines():
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        if msg.get("message_type") == "summary" and msg.get("snapshot_id"):
+            snapshot_id = msg["snapshot_id"]
+            break
+    if not snapshot_id:
+        return False, "restic backup ran but reported no snapshot_id"
+    return True, snapshot_id
+
+
+def restic_verify(entry, local_path=None):
+    """Verify a registry entry against a restic repository.
+
+    Registry entry needs: restic_repo, snapshot_id. Passes only if the
+    snapshot exists in the repo AND its recorded paths include the file.
+    A registry claim alone is never proof. Password via RESTIC_PASSWORD.
+    """
+    binary = _restic_binary()
+    if not binary:
+        return False, "restic binary not found (PATH or ~/workspace/tools/restic)"
+    repo = entry.get("restic_repo", "")
+    snapshot_id = entry.get("snapshot_id", "")
+    if not repo or not snapshot_id:
+        return False, "restic entry needs restic_repo + snapshot_id"
+    path = local_path or entry.get("local_path", "")
+    env = _restic_env()
+    if not env.get("RESTIC_PASSWORD"):
+        return False, "RESTIC_PASSWORD env var not set (restic repo password)"
+    rc, out, err = run([binary, "-r", repo, "snapshots", "--json"],
+                       timeout=300, env=env)
+    if rc != 0:
+        tail = (err.strip().splitlines() or [f"exit {rc}"])[-1]
+        return False, f"restic snapshots failed: {tail[:200]}"
+    try:
+        snapshots = json.loads(out)
+    except ValueError:
+        return False, "restic snapshots output was not JSON"
+    for snap in snapshots:
+        if snap.get("id") == snapshot_id or snap.get("short_id") == snapshot_id:
+            paths = snap.get("paths") or []
+            if path and path not in paths:
+                return False, (f"snapshot {snapshot_id[:8]} exists but does "
+                               f"not contain {path}")
+            return True, (f"restic:{repo} snapshot {snapshot_id[:8]} verified "
+                          f"({len(paths)} path(s))")
+    return False, f"snapshot {snapshot_id[:8]} not found in restic:{repo}"
+
+
 # ============================================================ v2: kaggle backend
 def kaggle_creds():
     """Return (username, key) from ~/.kaggle/kaggle.json, or (None, None)."""
@@ -811,12 +1208,26 @@ def kaggle_request(method, path, data=None, headers=None, timeout=120):
 
 
 def kaggle_dataset_view(owner_slug):
-    """GET /datasets/view/{owner}/{slug}. Returns (ok, payload|detail)."""
+    """GET /datasets/view/{owner}/{slug}. Returns (ok, payload|detail).
+
+    NOTE: the view endpoint returns dataset metadata but NOT the file list
+    (its `files` array is always empty). Use kaggle_dataset_list_files()
+    when you need the actual files.
+    """
     return kaggle_request("GET", f"/datasets/view/{owner_slug}")
 
 
+def kaggle_dataset_list_files(owner_slug):
+    """GET /datasets/list/{owner}/{slug}. Returns (ok, payload|detail).
+
+    payload["datasetFiles"] is the list of files, each with `name` and
+    `totalBytes`. This is the endpoint the verify path must use.
+    """
+    return kaggle_request("GET", f"/datasets/list/{owner_slug}")
+
+
 def verify_kaggle_entry(entry, local_path):
-    """Verify a registry entry against a Kaggle dataset (live view + size).
+    """Verify a registry entry against a Kaggle dataset (live file list + size).
 
     Registry entry needs: dataset ("owner/slug"), asset (filename).
     """
@@ -824,16 +1235,15 @@ def verify_kaggle_entry(entry, local_path):
     asset = entry.get("asset", "")
     if not dataset or not asset:
         return False, "kaggle entry needs dataset (owner/slug) + asset (filename)"
-    ok, payload = kaggle_dataset_view(dataset)
+    ok, payload = kaggle_dataset_list_files(dataset)
     if not ok:
         return False, payload
-    files = payload.get("files", []) if isinstance(payload, dict) else []
+    files = payload.get("datasetFiles", []) if isinstance(payload, dict) else []
     for f in files:
-        name = f.get("name") or os.path.basename(f.get("ref", ""))
-        ref = f.get("ref", "")
-        if name == asset or ref.endswith("/" + asset):
+        name = f.get("name", "")
+        if name == asset or name.endswith("/" + asset):
             want = entry.get("size", 0)
-            got = int(f.get("totalBytes") or f.get("size") or 0)
+            got = int(f.get("totalBytes") or 0)
             if want and got and got != want:
                 return False, f"size mismatch: remote={got} local={want}"
             return True, f"kaggle:{dataset} file {asset} verified ({got} bytes)"
@@ -864,22 +1274,47 @@ def multipart_encode(fields, files):
 
 def kaggle_dataset_upload_new(owner, slug, title, zip_path,
                               license_name="CC0-1.0"):
-    """Create a NEW Kaggle dataset from a local zip via the v1 REST API.
+    """Create a NEW Kaggle dataset from a local file via the official kaggle CLI.
 
-    Returns (ok, detail). Creates a public dataset under `owner`.
+    The previous hand-rolled multipart POST to /datasets/create/new was
+    broken: the endpoint expects a JSON body with pre-uploaded blob tokens,
+    not a raw file (it 400s with "Error reading JToken"). The official CLI
+    implements the real resumable-upload flow, so we shell out to it —
+    same pattern as the github backend shelling out to `gh`.
+
+    Returns (ok, detail). Creates a dataset under `owner` (private by
+    default). Requires the `kaggle` CLI on PATH (pip install kaggle) and
+    ~/.kaggle/kaggle.json credentials.
     """
+    import tempfile
+    kaggle_bin = shutil.which("kaggle")
+    if not kaggle_bin:
+        fallback = os.path.expanduser("~/.local/bin/kaggle")
+        if os.path.isfile(fallback):
+            kaggle_bin = fallback
+    if not kaggle_bin:
+        return False, "kaggle CLI not found (pip install kaggle)"
+    if not (6 <= len(slug) <= 50):
+        return False, f"kaggle slug must be 6-50 chars (got {len(slug)})"
+    if not (6 <= len(title) <= 50):
+        return False, f"kaggle title must be 6-50 chars (got {len(title)})"
+    if not os.path.isfile(zip_path):
+        return False, f"upload file not found: {zip_path}"
+    d = tempfile.mkdtemp(prefix="kaggle-upload-")
     try:
-        with open(zip_path, "rb") as f:
-            zdata = f.read()
-    except OSError as e:
-        return False, f"cannot read zip: {e}"
-    fields = {"title": title, "slug": slug, "licenseName": license_name,
-              "isPrivate": "false"}
-    body, ctype = multipart_encode(
-        fields,
-        {"file": (os.path.basename(zip_path), zdata, "application/zip")})
-    return kaggle_request("POST", "/datasets/create/new", data=body,
-                          headers={"Content-Type": ctype}, timeout=3600)
+        meta = {"id": f"{owner}/{slug}", "title": title,
+                "licenses": [{"name": license_name}]}
+        with open(os.path.join(d, "dataset-metadata.json"), "w") as f:
+            json.dump(meta, f)
+        shutil.copy(zip_path, os.path.join(d, os.path.basename(zip_path)))
+        rc, out, err = run([kaggle_bin, "datasets", "create", "-p", d],
+                           timeout=3600)
+        if rc != 0:
+            tail = (err.strip().splitlines() or [f"exit {rc}"])[-1]
+            return False, f"kaggle datasets create failed: {tail[:200]}"
+        return True, f"kaggle dataset {owner}/{slug} created"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 # ============================================================ v2: store dispatch
@@ -895,6 +1330,8 @@ def verify_entry(entry, local_path):
         return verify_terabox_entry(entry, local_path)
     if store == "kaggle":
         return verify_kaggle_entry(entry, local_path)
+    if store == "restic":
+        return restic_verify(entry, local_path)
     return False, f"unknown store {store}"
 
 
@@ -1059,13 +1496,18 @@ def iter_file_parts(fobj, part_bytes, chunk=1 << 20):
 
 
 def stream_url_to_parts(url, staging_dir, part_bytes, chunk=8 << 20,
-                        progress_cb=None):
+                        progress_cb=None, hasher_factory=None):
     """Stream a URL into rolling part files on disk.
 
-    Yields (index, part_path, size, sha256) as each part fills. Disk never
+    Yields (index, part_path, size, hexdigest) as each part fills. Disk never
     holds more than part_bytes + chunk at a time; the caller is expected to
     upload+verify+delete each part before pulling the next (delete-as-you-go).
     Supports HTTP Range resume if the server honors it.
+
+    hasher_factory: callable returning a fresh hash object with
+    update()/hexdigest(). Default hashlib.sha256 (the registry/GitHub
+    contract). Pass a BLAKE3 constructor for ~10x throughput when the
+    digest is only a local integrity note.
     """
     import urllib.request
     import urllib.error
@@ -1079,7 +1521,9 @@ def stream_url_to_parts(url, staging_dir, part_bytes, chunk=8 << 20,
 
     def _open_part(i):
         p = os.path.join(staging_dir, f"mirror-part-{i:04d}.bin")
-        return p, open(p, "wb"), hashlib.sha256()
+        hasher = (hasher_factory() if hasher_factory
+                  else hashlib.sha256())
+        return p, open(p, "wb"), hasher
 
     exhausted = False
     while not exhausted:
@@ -1124,12 +1568,18 @@ def stream_url_to_parts(url, staging_dir, part_bytes, chunk=8 << 20,
 
 
 def split_file_to_parts(path, staging_dir, part_bytes, chunk=8 << 20,
-                        progress_cb=None):
+                        progress_cb=None, hasher_factory=None):
     """Split a LOCAL file into rolling part files on disk.
 
     Same contract as stream_url_to_parts, but reads from a file already on
     disk (used by `mirror --direct`, where aria2c has materialized the
-    download). Yields (index, part_path, size, sha256) as each part fills.
+    download). Yields (index, part_path, size, hexdigest) as each part
+    fills.
+
+    hasher_factory: callable returning a fresh hash object with
+    update()/hexdigest(). Default hashlib.sha256 (the registry/GitHub
+    contract). Pass a BLAKE3 constructor for ~10x throughput when the
+    digest is only a local integrity note.
     """
     os.makedirs(staging_dir, exist_ok=True)
     idx = 0
@@ -1145,7 +1595,8 @@ def split_file_to_parts(path, staging_dir, part_bytes, chunk=8 << 20,
                 part_path = os.path.join(
                     staging_dir, f"mirror-part-{idx:04d}.bin")
                 part_f = open(part_path, "wb")
-                hasher = hashlib.sha256()
+                hasher = (hasher_factory() if hasher_factory
+                          else hashlib.sha256())
             part_f.write(data)
             hasher.update(data)
             if part_f.tell() >= part_bytes:
@@ -1757,14 +2208,10 @@ def cmd_verify_v2(args):
 
 def _fclones_binary():
     """Locate the fclones binary (optional dependency for dedup)."""
-    found = shutil.which("fclones")
-    if found:
-        return found
-    for rel in ("tools/fclones/usr/bin/fclones", "tools/fclones/fclones"):
-        p = os.path.join(WORKSPACE, rel)
-        if os.path.isfile(p) and os.access(p, os.X_OK):
-            return p
-    return None
+    return (_repo_tool_bin("fclones") or shutil.which("fclones")
+            or _workspace_tool_bin("fclones",
+                                  os.path.join("usr", "bin", "fclones"),
+                                  "fclones"))
 
 
 def _in_git_tree(path):
@@ -1832,7 +2279,7 @@ def cmd_dedup(args):
         if not os.path.isfile(kept):
             continue
         try:
-            kept_hash = sha256_file(kept)
+            kept_hash = fast_hash_file(kept)
         except OSError:
             continue
         for path in files[1:]:
@@ -1842,8 +2289,8 @@ def cmd_dedup(args):
                 skipped.append((path, "inside git working tree"))
                 continue
             try:
-                if sha256_file(path) != kept_hash:
-                    failed.append((path, "sha256 mismatch vs kept copy"))
+                if fast_hash_file(path) != kept_hash:
+                    failed.append((path, "hash mismatch vs kept copy"))
                     continue
             except OSError as e:
                 failed.append((path, str(e)[:120]))
@@ -1969,10 +2416,28 @@ def main(argv=None):
     p = sub.add_parser("scan", help="report disk usage and largest consumers")
     p.add_argument("--json", action="store_true")
 
+    p = sub.add_parser("hash", help="hash one file with the fast-hash engine")
+    p.add_argument("--file", required=True)
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("agent-audit",
+                       help="per-agent workdir disk + registry-coverage report "
+                            "(AGENT DISK PUSH LAW; read-only)")
+    p.add_argument("--quota", default="",
+                   help="per-dir quota, e.g. 20G (flags dirs over it)")
+    p.add_argument("--top", type=int, default=20,
+                   help="report the N largest dirs (default 20, 0 = all)")
+    p.add_argument("--root", default="",
+                   help="audit this dir instead of ~/workspace")
+    p.add_argument("--min-uncovered", default="100M",
+                   help="flag dirs with this much unregistered data "
+                        "(default 100M)")
+    p.add_argument("--json", action="store_true")
+
     p = sub.add_parser("register", help="register a file as verified on a store")
     p.add_argument("--file", required=True)
     p.add_argument("--store", required=True, choices=STORES,
-                   help="github | terabox | kaggle")
+                   help="github | terabox | kaggle | restic")
     p.add_argument("--repo", default="",
                    help="github: OWNER/REPO")
     p.add_argument("--release", default="",
@@ -1983,6 +2448,12 @@ def main(argv=None):
                    help="terabox: remote directory, e.g. /CN-Gigaleak/show")
     p.add_argument("--dataset", default="",
                    help="kaggle: dataset slug as owner/name")
+    p.add_argument("--restic-repo", default="",
+                   help="restic: repository path/URL (password via "
+                        "RESTIC_PASSWORD env var, never on the command line)")
+    p.add_argument("--snapshot-id", default="",
+                   help="restic: record a pre-existing snapshot instead of "
+                        "backing up now")
     p.add_argument("--sha256", default="")
     p.add_argument("--size", type=int, default=0)
     p.add_argument("--note", default="")
@@ -2073,6 +2544,10 @@ def main(argv=None):
     try:
         if args.cmd == "scan":
             cmd_scan(args.json)
+        elif args.cmd == "hash":
+            return cmd_hash(args)
+        elif args.cmd == "agent-audit":
+            return cmd_agent_audit(args)
         elif args.cmd == "register":
             return cmd_register(args)
         elif args.cmd == "verify":

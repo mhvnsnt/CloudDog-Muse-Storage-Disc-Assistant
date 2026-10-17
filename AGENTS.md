@@ -74,6 +74,22 @@ cron (every 10 min).
 - `verify` / `reap` dispatch on the entry's store: github (release asset
   API), terabox (`tbupload.py ls` + size), kaggle (`/datasets/view` + size).
 
+## New commands (2026-10-17, this lane)
+- `hash --file PATH [--json]`
+  Hash one file with the fast-hash engine (`fast_hash_file`: blake3 pip
+  module -> bundled b3sum -> stdlib sha256); prints which backend ran, the
+  digest, and the MB/s rate. Local comparisons only — registry/GitHub
+  digests stay sha256.
+- `agent-audit [--quota 20G] [--top N] [--json] [--root DIR]`
+  Per-agent workdir report for the AGENT DISK PUSH LAW: per top-level dir
+  under ~/workspace shows bytes (dust fast path, walk fallback), file
+  count, registry coverage % (bytes with a live store entry), cleared
+  bytes, and flags (`over_quota`, `uncovered_big`,
+  `mostly_unregistered`). Read-only — never deletes; shows which lanes
+  still need their work pushed to a store before any reap.
+- dust `1.0Mi`-style sizes now parse (bundled dust 1.2.6 emits IEC
+  suffixes; previously every dust size parsed to 0).
+
 ## Registry contract
 `~/workspace/agent-ops/cloud-dog-registry.json`:
 ```json

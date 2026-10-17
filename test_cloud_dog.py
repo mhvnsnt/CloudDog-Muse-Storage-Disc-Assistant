@@ -305,11 +305,11 @@ def test_kaggle_request_sends_basic_auth():
 
 
 def test_verify_kaggle_entry_found_and_sized():
-    def fake_view(owner_slug):
-        return True, {"files": [
-            {"ref": "u/ds/a.bin", "name": "a.bin", "totalBytes": 500},
+    def fake_list(owner_slug):
+        return True, {"datasetFiles": [
+            {"name": "a.bin", "totalBytes": 500},
         ]}
-    old = _patch(cloud_dog, "kaggle_dataset_view", fake_view)
+    old = _patch(cloud_dog, "kaggle_dataset_list_files", fake_list)
     try:
         e = {"dataset": "u/ds", "asset": "a.bin", "size": 500}
         ok, detail = cloud_dog.verify_kaggle_entry(e, "/tmp/a.bin")
@@ -321,7 +321,67 @@ def test_verify_kaggle_entry_found_and_sized():
         ok, detail = cloud_dog.verify_kaggle_entry(e3, "/tmp/a.bin")
         assert ok is False and "not found" in detail
     finally:
-        _patch(cloud_dog, "kaggle_dataset_view", old)
+        _patch(cloud_dog, "kaggle_dataset_list_files", old)
+
+
+def test_verify_kaggle_entry_live_readonly():
+    """Live read-only check against a real dataset (no writes)."""
+    e = {"dataset": "marsfmmg/cj-living-room-setup",
+         "asset": "dvd_stack_ref.png", "size": 4848}
+    ok, detail = cloud_dog.verify_kaggle_entry(e, "/tmp/dvd_stack_ref.png")
+    assert ok is True and "verified" in detail, detail
+    e2 = {"dataset": "marsfmmg/cj-living-room-setup",
+          "asset": "does-not-exist.bin"}
+    ok, detail = cloud_dog.verify_kaggle_entry(e2, "/tmp/x.bin")
+    assert ok is False and "not found" in detail
+
+
+def test_kaggle_dataset_upload_new_no_cli():
+    old_which = _patch(cloud_dog.shutil, "which", lambda *a, **k: None)
+    old_isfile = _patch(cloud_dog.os.path, "isfile", lambda p: False)
+    try:
+        ok, detail = cloud_dog.kaggle_dataset_upload_new(
+            "u", "someslug", "Some Title", "/tmp/x.zip")
+        assert ok is False and "kaggle CLI not found" in detail
+    finally:
+        _patch(cloud_dog.shutil, "which", old_which)
+        _patch(cloud_dog.os.path, "isfile", old_isfile)
+
+
+def test_kaggle_dataset_upload_new_validates():
+    old = _patch(cloud_dog.shutil, "which", lambda *a, **k: "/usr/bin/kaggle")
+    try:
+        ok, detail = cloud_dog.kaggle_dataset_upload_new(
+            "u", "abc", "Some Title", "/tmp/x.zip")
+        assert ok is False and "6-50 chars" in detail
+        ok, detail = cloud_dog.kaggle_dataset_upload_new(
+            "u", "validslug", "x", "/tmp/x.zip")
+        assert ok is False and "6-50 chars" in detail
+        ok, detail = cloud_dog.kaggle_dataset_upload_new(
+            "u", "validslug", "Valid Title", "/tmp/does-not-exist.zip")
+        assert ok is False and "not found" in detail
+    finally:
+        _patch(cloud_dog.shutil, "which", old)
+
+
+def test_kaggle_dataset_upload_new_cli_success():
+    import tempfile
+    old_which = _patch(cloud_dog.shutil, "which", lambda *a, **k: "/usr/bin/kaggle")
+    old_run = _patch(cloud_dog, "run",
+                     lambda cmd, timeout=60: (0, "Dataset URL: ...", ""))
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as f:
+            f.write(b"PK fake")
+            zp = f.name
+        try:
+            ok, detail = cloud_dog.kaggle_dataset_upload_new(
+                "marsfmmg", "testslug123", "Test Title Here", zp)
+            assert ok is True and "marsfmmg/testslug123" in detail
+        finally:
+            os.unlink(zp)
+    finally:
+        _patch(cloud_dog.shutil, "which", old_which)
+        _patch(cloud_dog, "run", old_run)
 
 
 def test_verify_entry_dispatches_on_store():
@@ -862,6 +922,163 @@ def test_dedup_no_binary_errors():
         _patch(cloud_dog, "_fclones_binary", old)
 
 
+# ------------------------------------------------------ restic backend tests
+def _restic_test_env(password="test-rest1c-pw"):
+    """Set RESTIC_PASSWORD for the test, returning the old value."""
+    old = os.environ.get("RESTIC_PASSWORD")
+    os.environ["RESTIC_PASSWORD"] = password
+    return old
+
+
+def _restic_restore_env(old):
+    if old is None:
+        os.environ.pop("RESTIC_PASSWORD", None)
+    else:
+        os.environ["RESTIC_PASSWORD"] = old
+
+
+def test_restic_binary_found():
+    assert cloud_dog._restic_binary() is not None
+
+
+def test_restic_backup_and_verify_roundtrip():
+    import shutil
+    old_pw = _restic_test_env()
+    d = tempfile.mkdtemp(prefix="cdrestic-")
+    try:
+        repo = os.path.join(d, "repo")
+        f1 = os.path.join(d, "f1.txt")
+        with open(f1, "w") as f:
+            f.write("restic-roundtrip-bytes")
+        ok, snap = cloud_dog.restic_backup(f1, repo)
+        assert ok, f"backup failed: {snap}"
+        assert len(snap) == 64, f"snapshot id should be 64 hex chars: {snap}"
+        entry = {"restic_repo": repo, "snapshot_id": snap,
+                 "local_path": f1}
+        ok, detail = cloud_dog.restic_verify(entry, f1)
+        assert ok, f"verify failed: {detail}"
+    finally:
+        _restic_restore_env(old_pw)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_restic_verify_missing_snapshot_fails():
+    import shutil
+    old_pw = _restic_test_env()
+    d = tempfile.mkdtemp(prefix="cdrestic-")
+    try:
+        repo = os.path.join(d, "repo")
+        f1 = os.path.join(d, "f1.txt")
+        with open(f1, "w") as f:
+            f.write("x")
+        ok, snap = cloud_dog.restic_backup(f1, repo)
+        assert ok
+        entry = {"restic_repo": repo,
+                 "snapshot_id": "0" * 64,
+                 "local_path": f1}
+        ok, detail = cloud_dog.restic_verify(entry, f1)
+        assert not ok
+        assert "not found" in detail
+    finally:
+        _restic_restore_env(old_pw)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_restic_verify_wrong_path_fails():
+    import shutil
+    old_pw = _restic_test_env()
+    d = tempfile.mkdtemp(prefix="cdrestic-")
+    try:
+        repo = os.path.join(d, "repo")
+        f1 = os.path.join(d, "f1.txt")
+        with open(f1, "w") as f:
+            f.write("x")
+        ok, snap = cloud_dog.restic_backup(f1, repo)
+        assert ok
+        entry = {"restic_repo": repo, "snapshot_id": snap,
+                 "local_path": f1}
+        ok, detail = cloud_dog.restic_verify(entry, "/nope/other.txt")
+        assert not ok
+        assert "does not contain" in detail
+    finally:
+        _restic_restore_env(old_pw)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_restic_backup_needs_password():
+    old_pw = _restic_test_env()
+    _restic_restore_env(None)  # ensure unset
+    try:
+        ok, detail = cloud_dog.restic_backup("/tmp/x", "/tmp/r")
+        assert not ok
+        assert "RESTIC_PASSWORD" in detail
+    finally:
+        _restic_restore_env(old_pw)
+
+
+def test_restic_verify_needs_password():
+    old_pw = _restic_test_env()
+    _restic_restore_env(None)
+    try:
+        ok, detail = cloud_dog.restic_verify(
+            {"restic_repo": "/tmp/r", "snapshot_id": "a" * 64}, "/tmp/x")
+        assert not ok
+        assert "RESTIC_PASSWORD" in detail
+    finally:
+        _restic_restore_env(old_pw)
+
+
+def test_restic_backup_missing_binary():
+    old = cloud_dog._restic_binary
+    cloud_dog._restic_binary = lambda: None
+    try:
+        ok, detail = cloud_dog.restic_backup("/tmp/x", "/tmp/r", password="p")
+        assert not ok
+        assert "not found" in detail
+    finally:
+        cloud_dog._restic_binary = old
+
+
+def test_register_restic_records_snapshot():
+    import shutil
+    old_pw = _restic_test_env()
+    reg_path = cloud_dog.REGISTRY_PATH
+    backup = None
+    if os.path.exists(reg_path):
+        backup = reg_path + ".test-bak"
+        os.replace(reg_path, backup)
+    d = tempfile.mkdtemp(prefix="cdrestic-")
+    old_audit = cloud_dog.AUDIT_PATH
+    cloud_dog.AUDIT_PATH = os.path.join(d, "audit.jsonl")
+    try:
+        repo = os.path.join(d, "repo")
+        f1 = os.path.join(d, "reg.txt")
+        with open(f1, "w") as f:
+            f.write("register-me")
+        rc = cloud_dog.cmd_register(type("A", (), {
+            "file": f1, "store": "restic", "repo": "", "release": "",
+            "asset": "", "remote_dir": "", "dataset": "",
+            "restic_repo": repo, "snapshot_id": "",
+            "sha256": "", "size": 0, "note": "test",
+        })())
+        assert rc == 0
+        reg = cloud_dog.load_registry()
+        entry = reg["entries"].get(os.path.abspath(f1))
+        assert entry is not None
+        assert entry["store"] == "restic"
+        assert entry["restic_repo"] == repo
+        assert len(entry["snapshot_id"]) == 64
+        # and the recorded snapshot verifies live
+        ok, detail = cloud_dog.restic_verify(entry, os.path.abspath(f1))
+        assert ok, detail
+    finally:
+        cloud_dog.AUDIT_PATH = old_audit
+        _restic_restore_env(old_pw)
+        shutil.rmtree(d, ignore_errors=True)
+        if os.path.exists(reg_path):
+            os.unlink(reg_path)
+        if backup and os.path.exists(backup):
+            os.replace(backup, reg_path)
 # ------------------------------------------------- mirror-search (IA) tests
 def _fake_ia_urlopen_factory(payload_bytes=None, http_code=None):
     import urllib.request
@@ -1046,3 +1263,228 @@ def test_cmd_mirror_search_live():
     assert len(data[0]["downloads"]) >= 1, "no download URLs returned"
     assert data[0]["downloads"][0]["url"].startswith(
         "https://archive.org/download/"), data[0]["downloads"][0]["url"]
+# --------------------------------------------------- blake3 fast-hash tests
+def test_fast_hash_file_uses_blake3_when_available():
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".dat") as f:
+        f.write(b"blake3-test-bytes")
+        p = f.name
+    try:
+        if not cloud_dog._blake3_available():
+            raise AssertionError("blake3 should be installed for this test")
+        import blake3
+        expected = blake3.blake3(b"blake3-test-bytes").hexdigest()
+        assert cloud_dog.fast_hash_file(p) == expected
+        assert len(expected) == 64
+    finally:
+        os.unlink(p)
+
+
+def test_fast_hash_file_falls_back_to_sha256():
+    import sys, tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".dat") as f:
+        f.write(b"fallback-bytes")
+        p = f.name
+    old = sys.modules.get("blake3")
+    sys.modules["blake3"] = None  # force ImportError on 'import blake3'
+    old_b3 = _patch(cloud_dog, "_b3sum_bin", lambda: None)
+    try:
+        import hashlib
+        expected = hashlib.sha256(b"fallback-bytes").hexdigest()
+        assert cloud_dog.fast_hash_file(p) == expected
+    finally:
+        _patch(cloud_dog, "_b3sum_bin", old_b3)
+        if old is None:
+            del sys.modules["blake3"]
+        else:
+            sys.modules["blake3"] = old
+        os.unlink(p)
+
+
+def test_fast_hash_agrees_on_identical_files():
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".dat") as f:
+        f.write(b"same")
+        p1 = f.name
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".dat") as f:
+        f.write(b"same")
+        p2 = f.name
+    try:
+        assert cloud_dog.fast_hash_file(p1) == cloud_dog.fast_hash_file(p2)
+    finally:
+        os.unlink(p1)
+        os.unlink(p2)
+
+
+# ----------------- hash cmd + agent-audit + dust Mi fix (2026-10-17)
+import hashlib as _hashlib
+import inspect as _inspect
+import pytest as _pytest
+
+
+def _write_tmp_file(tmp_path, name, data):
+    p = tmp_path / name
+    p.write_bytes(data)
+    return str(p)
+
+
+def test_cmd_hash_json(tmp_path, capsys):
+    f = _write_tmp_file(tmp_path, "h.bin", b"hashme")
+    rc = cloud_dog.cmd_hash(type("A", (), {"file": f, "json": True})())
+    assert rc == 0
+    out = _json.loads(capsys.readouterr().out)
+    assert out["digest"] == cloud_dog.fast_hash_file(f)
+    assert out["bytes"] == 6
+    assert out["backend"].startswith(("blake3", "sha256"))
+    assert out["mb_per_s"] >= 0
+
+
+def test_cmd_hash_text_names_backend(tmp_path, capsys):
+    f = _write_tmp_file(tmp_path, "h2.bin", b"hashme2")
+    rc = cloud_dog.cmd_hash(type("A", (), {"file": f, "json": False})())
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert cloud_dog.fast_hash_file(f) in out
+
+
+def test_cmd_hash_missing_file(capsys):
+    rc = cloud_dog.cmd_hash(type("A", (), {
+        "file": "/no/such/file.bin", "json": False})())
+    assert rc == 1
+
+
+def test_stream_url_to_parts_accepts_hasher_factory():
+    sig = _inspect.signature(cloud_dog.stream_url_to_parts)
+    assert "hasher_factory" in sig.parameters
+
+
+def test_parse_size():
+    assert cloud_dog._parse_size("20G") == 20 * (1 << 30)
+    assert cloud_dog._parse_size("100M") == 100 * (1 << 20)
+    assert cloud_dog._parse_size("512") == 512
+    assert cloud_dog._parse_size("1.5G") == int(1.5 * (1 << 30))
+    with _pytest.raises(ValueError):
+        cloud_dog._parse_size("ten-gig")
+
+
+def test_parse_dust_size_iec_suffix():
+    # dust 1.2.6 emits IEC 'i' suffixes; same multipliers as K/M/G.
+    # Without this, the bundled dust's sizes all parse to 0 and the
+    # scan/audit fast paths go blind.
+    assert cloud_dog._parse_dust_size("1.0Mi") == 1024 ** 2
+    assert cloud_dog._parse_dust_size("512Ki") == 512 * 1024
+    assert cloud_dog._parse_dust_size("2.0Gi") == 2 * 1024 ** 3
+    assert cloud_dog._parse_dust_size("1.0Ti") == 1024 ** 4
+    # old format still works
+    assert cloud_dog._parse_dust_size("2.1M") == int(2.1 * 1024 ** 2)
+
+
+def _make_agent_tree(tmp_path):
+    # root/
+    #   lane-alpha/ big.bin (1MB), small.bin (100KB)
+    #   lane-beta/  notes.txt (50B)
+    root = tmp_path / "ws"
+    root.mkdir()
+    a = root / "lane-alpha"
+    a.mkdir()
+    (a / "big.bin").write_bytes(b"A" * (1 << 20))
+    (a / "small.bin").write_bytes(b"B" * (100 << 10))
+    b = root / "lane-beta"
+    b.mkdir()
+    (b / "notes.txt").write_bytes(b"C" * 50)
+    return str(root), str(a), str(b)
+
+
+def test_agent_audit_report_coverage(monkeypatch, tmp_path):
+    # force the stdlib walk path (exact bytes) — dust -j reports rounded
+    # human sizes, so exact assertions only hold on the walk path
+    monkeypatch.setattr(cloud_dog, "_dust_binary", lambda: None)
+    root, a, b = _make_agent_tree(tmp_path)
+    reg = {"version": 1, "entries": {
+        os.path.join(a, "big.bin"): {"store": "github", "size": 1 << 20,
+                                     "status": "registered"},
+        os.path.join(a, "gone.bin"): {"store": "github", "size": 500,
+                                      "status": "reaped"},
+        os.path.join(b, "old.bin"): {"store": "terabox", "size": 25,
+                                     "status": "registered"},
+    }}
+    rows = cloud_dog.agent_audit_report(
+        root=root, registry=reg, top=0, min_uncovered_bytes=10)
+    by_name = {r["name"]: r for r in rows}
+    alpha = by_name["lane-alpha"]
+    assert alpha["bytes"] == (1 << 20) + (100 << 10)
+    assert alpha["covered_bytes"] == (1 << 20)
+    assert alpha["cleared_bytes"] == 500
+    assert alpha["unregistered_bytes"] == (100 << 10)
+    assert 90.0 < alpha["coverage_pct"] < 100.0
+    assert alpha["flags"] == []
+    assert alpha["files"] == 2
+    # biggest dir sorts first
+    assert rows[0]["name"] == "lane-alpha"
+
+
+def test_agent_audit_report_dust_path_approximate(tmp_path):
+    # dust fast path: sizes are human-rounded, so assert approximate
+    if cloud_dog._dust_binary() is None:
+        _pytest.skip("no dust binary available")
+    root, a, b = _make_agent_tree(tmp_path)
+    reg = {"version": 1, "entries": {}}
+    rows = cloud_dog.agent_audit_report(
+        root=root, registry=reg, top=0, min_uncovered_bytes=10)
+    by_name = {r["name"]: r for r in rows}
+    alpha = by_name["lane-alpha"]
+    assert abs(alpha["bytes"] - ((1 << 20) + (100 << 10))) < 0.05 * (1 << 20)
+    assert alpha["files"] is None  # dust reports bytes only
+    assert rows[0]["name"] == "lane-alpha"
+
+
+def test_agent_audit_report_flags(monkeypatch, tmp_path):
+    monkeypatch.setattr(cloud_dog, "_dust_binary", lambda: None)
+    root, a, b = _make_agent_tree(tmp_path)
+    reg = {"version": 1, "entries": {}}
+    rows = cloud_dog.agent_audit_report(
+        root=root, registry=reg, top=0, quota_bytes=1000,
+        min_uncovered_bytes=10)
+    by_name = {r["name"]: r for r in rows}
+    alpha = by_name["lane-alpha"]
+    assert "over_quota" in alpha["flags"]
+    assert "uncovered_big" in alpha["flags"]
+    assert alpha["coverage_pct"] == 0.0
+    beta = by_name["lane-beta"]
+    assert "over_quota" not in beta["flags"]
+    assert "uncovered_big" in beta["flags"]
+
+
+def test_cmd_agent_audit_json(tmp_path, capsys):
+    root, a, b = _make_agent_tree(tmp_path)
+    db_path = cloud_dog.REGISTRY_DB_PATH
+    reg_path = cloud_dog.REGISTRY_PATH
+    backups = []
+    for p in (reg_path, db_path, db_path + "-wal", db_path + "-shm"):
+        if os.path.exists(p):
+            bak = p + ".test-bak"
+            os.replace(p, bak)
+            backups.append((p, bak))
+    import tempfile
+    audit_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jsonl")
+    audit_tmp.close()
+    old_audit = _patch(cloud_dog, "AUDIT_PATH", audit_tmp.name)
+    try:
+        rc = cloud_dog.cmd_agent_audit(type("A", (), {
+            "quota": "1G", "top": 0, "root": root,
+            "min_uncovered": "1", "json": True})())
+        assert rc == 0
+        out = _json.loads(capsys.readouterr().out)
+        assert out["quota_bytes"] == 1 << 30
+        names = [r["name"] for r in out["rows"]]
+        assert "lane-alpha" in names and "lane-beta" in names
+    finally:
+        _patch(cloud_dog, "AUDIT_PATH", old_audit)
+        if os.path.exists(audit_tmp.name):
+            os.unlink(audit_tmp.name)
+        for p in (reg_path, db_path, db_path + "-wal", db_path + "-shm"):
+            if os.path.exists(p):
+                os.unlink(p)
+        for p, bak in backups:
+            if os.path.exists(bak):
+                os.replace(bak, p)
