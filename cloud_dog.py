@@ -295,33 +295,85 @@ def log_action(text):
 
 
 # ---------------------------------------------------------------- commands
+def _dust_binary():
+    """Locate the dust binary (optional dependency for fast scans)."""
+    found = shutil.which("dust")
+    if found:
+        return found
+    known = os.path.join(WORKSPACE, "tools", "dust", "dust")
+    if os.path.isfile(known) and os.access(known, os.X_OK):
+        return known
+    return None
+
+
+def _parse_dust_size(s):
+    """Parse dust -j size strings like '2.1M', '272K', '512B' into bytes."""
+    import re
+    m = re.match(r"^\s*([\d.]+)\s*([BKMGTPE]?)\s*$", str(s).upper())
+    if not m:
+        return 0
+    num, unit = float(m.group(1)), m.group(2)
+    return int(num * {"": 1, "B": 1, "K": 1024, "M": 1024 ** 2,
+                      "G": 1024 ** 3, "T": 1024 ** 4, "P": 1024 ** 5,
+                      "E": 1024 ** 6}[unit])
+
+
+def _dust_largest(root):
+    """Fast path: dust -j JSON -> [(name, bytes)] for top-level entries.
+
+    Returns None when dust is missing or its output can't be parsed, so the
+    caller falls back to the stdlib walker. Never raises.
+    """
+    binary = _dust_binary()
+    if not binary:
+        return None
+    try:
+        proc = subprocess.run([binary, "-j", root], capture_output=True,
+                              text=True, timeout=300)
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return None
+        data = json.loads(proc.stdout)
+        children = data.get("children") or []
+        out = []
+        for child in children:
+            name = os.path.basename(child.get("name", ""))
+            size = _parse_dust_size(child.get("size", "0"))
+            if name:
+                out.append((name, size))
+        return out or None
+    except Exception:
+        return None
+
+
 def cmd_scan(as_json=False):
     pct, used, total = disk_usage_percent()
-    # largest top-level dirs in workspace
-    biggest = []
-    try:
-        with os.scandir(WORKSPACE) as it:
-            entries = [e for e in it]
-    except OSError:
-        entries = []
-    for e in entries:
+    # largest top-level dirs in workspace (dust fast path, stdlib fallback)
+    biggest = _dust_largest(WORKSPACE)
+    if biggest is None:
+        biggest = []
         try:
-            if e.is_dir(follow_symlinks=False):
-                tot = 0
-                for root, _, files in os.walk(e.path, followlinks=False):
-                    for fn in files:
-                        try:
-                            tot += os.lstat(os.path.join(root, fn)).st_size
-                        except OSError:
-                            pass
-                biggest.append((e.name, tot))
-            elif e.is_file(follow_symlinks=False):
-                try:
-                    biggest.append((e.name, os.lstat(e.path).st_size))
-                except OSError:
-                    pass
+            with os.scandir(WORKSPACE) as it:
+                entries = [e for e in it]
         except OSError:
-            pass
+            entries = []
+        for e in entries:
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    tot = 0
+                    for root, _, files in os.walk(e.path, followlinks=False):
+                        for fn in files:
+                            try:
+                                tot += os.lstat(os.path.join(root, fn)).st_size
+                            except OSError:
+                                pass
+                    biggest.append((e.name, tot))
+                elif e.is_file(follow_symlinks=False):
+                    try:
+                        biggest.append((e.name, os.lstat(e.path).st_size))
+                    except OSError:
+                        pass
+            except OSError:
+                pass
     biggest.sort(key=lambda x: x[1], reverse=True)
     report = {
         "disk_usage_percent": round(pct, 1),

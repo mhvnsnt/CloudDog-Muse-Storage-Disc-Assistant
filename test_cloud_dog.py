@@ -563,3 +563,94 @@ def test_policy_unavailable_fails_closed():
         assert "fail-closed" in buf.getvalue()
     finally:
         _patch(cloud_dog, "_POLICY_AVAILABLE", old)
+
+
+# ---------------------------------------------------- dust scan wiring tests
+def test_parse_dust_size():
+    assert cloud_dog._parse_dust_size("2.1M") == int(2.1 * 1024 ** 2)
+    assert cloud_dog._parse_dust_size("272K") == 272 * 1024
+    assert cloud_dog._parse_dust_size("512B") == 512
+    assert cloud_dog._parse_dust_size("1.5G") == int(1.5 * 1024 ** 3)
+    assert cloud_dog._parse_dust_size("nonsense") == 0
+    assert cloud_dog._parse_dust_size("") == 0
+
+
+def _fake_dust_script(directory, payload):
+    """Write a fake `dust` executable that prints payload for -j."""
+    import stat
+    p = os.path.join(directory, "dust")
+    with open(p, "w") as f:
+        f.write("#!/bin/sh\nprintf '%s' '" + payload.replace("'", "'\"'\"'") + "'\n")
+    os.chmod(p, os.stat(p).st_mode | stat.S_IEXEC)
+    return p
+
+
+def test_dust_largest_parses_json():
+    import json, tempfile
+    d = tempfile.mkdtemp(prefix="cdtest-", dir=os.path.expanduser("~/workspace"))
+    try:
+        payload = json.dumps({"size": "3.0M", "name": "/root",
+                              "children": [
+                                  {"size": "2.0M", "name": "/root/aaa", "children": []},
+                                  {"size": "1.0M", "name": "/root/bbb", "children": []},
+                              ]})
+        _fake_dust_script(d, payload)
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = d + os.pathsep + old_path
+        try:
+            out = cloud_dog._dust_largest("/root")
+        finally:
+            os.environ["PATH"] = old_path
+        assert out is not None
+        by_name = dict(out)
+        assert by_name["aaa"] == 2 * 1024 ** 2
+        assert by_name["bbb"] == 1 * 1024 ** 2
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_dust_largest_bad_output_falls_back():
+    import tempfile
+    d = tempfile.mkdtemp(prefix="cdtest-", dir=os.path.expanduser("~/workspace"))
+    try:
+        _fake_dust_script(d, "this is not json{{{")
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = d + os.pathsep + old_path
+        try:
+            assert cloud_dog._dust_largest("/root") is None
+        finally:
+            os.environ["PATH"] = old_path
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_scan_uses_dust_when_present():
+    import json, tempfile
+    d = tempfile.mkdtemp(prefix="cdtest-", dir=os.path.expanduser("~/workspace"))
+    try:
+        payload = json.dumps({"size": "9.9M", "name": "ws", "children": [
+            {"size": "9.9M", "name": "ws/fakedir", "children": []}]})
+        _fake_dust_script(d, payload)
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = d + os.pathsep + old_path
+        try:
+            report = cloud_dog.cmd_scan(as_json=True)
+        finally:
+            os.environ["PATH"] = old_path
+        names = [i["name"] for i in report["largest"]]
+        assert "fakedir" in names, report["largest"]
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_scan_falls_back_without_dust():
+    old = _patch(cloud_dog, "_dust_binary", lambda: None)
+    try:
+        report = cloud_dog.cmd_scan(as_json=True)
+        assert report["largest"], "stdlib fallback must still list entries"
+        assert all("bytes" in i and i["bytes"] >= 0 for i in report["largest"])
+    finally:
+        _patch(cloud_dog, "_dust_binary", old)
