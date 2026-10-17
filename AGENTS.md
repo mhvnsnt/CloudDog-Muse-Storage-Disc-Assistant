@@ -61,6 +61,11 @@ cron (every 10 min).
   `custom.torbox` Secure Vault credential. Store dest flags: github needs
   `--repo` + `--release`; terabox needs `--remote-dir`; kaggle needs
   `--dataset owner/slug`.
+- `mirror --direct --magnet URI|--torrent PATH|--url URL --store ...`
+  Same upload/verify/delete pipeline, but the download happens on this
+  machine with aria2c (no TorBox credential needed). Trade-off: disk holds
+  the FULL download while aria2c works (free-space guard fails closed);
+  the source file is deleted as soon as its parts verify.
 - `daemon [--interval 600] [--apply] [--pidfile PATH]`
   Continuous enforce loop with pidfile, signal handling, per-cycle audit
   events. Refuses a second instance.

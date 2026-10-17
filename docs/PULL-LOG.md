@@ -385,6 +385,32 @@ order, each gets its own researched, tested patch.
   the policy engine (protected + in-progress rules apply to every
   candidate). Not wired in v1.
 
+### aria2 (tatsuhiro-t/aria2) — WIRED (v2, 2026-10-17)
+- License: **GPLv2+** (Debian .debs: aria2 + libaria2-0 + libssh2-1 +
+  libc-ares2, version-matched 1.35.0-3, installed 2026-10-17 to
+  `~/workspace/tools/aria2/` with an `aria2c` wrapper setting
+  `LD_LIBRARY_PATH`). GPLv2 is free and allows commercial use; we run the
+  binary as a transport subprocess — no aria2 code is embedded in the repo.
+- Fit: real. `mirror` mode previously required the `custom.torbox`
+  Secure Vault credential; when TorBox is unavailable there was no
+  download path at all. aria2 handles magnets, .torrent files, and direct
+  HTTP(S) URLs — the three source kinds mirror lanes actually use.
+- **WIRED 2026-10-17** (PR pending): new `cloud_dog.py mirror --direct`
+  mode. `_aria2c_binary()` probes PATH then
+  `~/workspace/tools/aria2/aria2c` (fail-closed when absent).
+  `_aria2c_fetch()` downloads magnet/--torrent/--url into
+  `<staging>/dl` (seed-time 0, 16x16 parallel, DHT bootstrap nodes, proxy
+  inherited from env). `split_file_to_parts()` splits each downloaded
+  file into rolling parts, and the per-file upload/verify/delete loop was
+  extracted into `_mirror_file_parts()` shared by both transports.
+  Trade-off (documented in `--help`): TorBox mode holds <= 1 part on
+  disk; direct mode holds the FULL download while aria2c works — a
+  free-space guard (`_check_free_space`, Content-Length HEAD when
+  available) fails closed, and the source file is deleted as soon as its
+  parts verify (delete-as-you-go). 7 new tests in
+  `tests/test_mirror_direct.py`. Live smoke: aria2c fetched
+  https://example.com/ (577B) through the real binary via `_aria2c_fetch`.
+
 ### sqlite — CANDIDATE (v2, not wired)
 - License: **public domain**; stdlib `sqlite3` — zero new dependencies.
 - Fit: real. The JSONL journal (`clouddog/core/manifest.py`) is correct for

@@ -332,6 +332,25 @@ def _dust_binary():
     return None
 
 
+def _aria2c_binary():
+    """Locate the aria2c binary (transport for `mirror --direct`).
+
+    Probes PATH first, then the known install at
+    ~/workspace/tools/aria2/aria2c (wrapper script; the extracted
+    Debian-tree binary is at .../usr/bin/aria2c). Returns None when
+    missing so direct mode fails closed with a clear message.
+    """
+    found = shutil.which("aria2c")
+    if found:
+        return found
+    for rel in (os.path.join("tools", "aria2", "aria2c"),
+                os.path.join("tools", "aria2", "usr", "bin", "aria2c")):
+        known = os.path.join(WORKSPACE, rel)
+        if os.path.isfile(known) and os.access(known, os.X_OK):
+            return known
+    return None
+
+
 def _parse_dust_size(s):
     """Parse dust -j size strings like '2.1M', '272K', '512B' into bytes."""
     import re
@@ -1104,13 +1123,144 @@ def stream_url_to_parts(url, staging_dir, part_bytes, chunk=8 << 20,
             os.unlink(part_path)
 
 
+def split_file_to_parts(path, staging_dir, part_bytes, chunk=8 << 20,
+                        progress_cb=None):
+    """Split a LOCAL file into rolling part files on disk.
+
+    Same contract as stream_url_to_parts, but reads from a file already on
+    disk (used by `mirror --direct`, where aria2c has materialized the
+    download). Yields (index, part_path, size, sha256) as each part fills.
+    """
+    os.makedirs(staging_dir, exist_ok=True)
+    idx = 0
+    part_path = None
+    part_f = None
+    hasher = None
+    with open(path, "rb") as src:
+        while True:
+            data = src.read(chunk)
+            if not data:
+                break
+            if part_f is None:
+                part_path = os.path.join(
+                    staging_dir, f"mirror-part-{idx:04d}.bin")
+                part_f = open(part_path, "wb")
+                hasher = hashlib.sha256()
+            part_f.write(data)
+            hasher.update(data)
+            if part_f.tell() >= part_bytes:
+                part_f.close()
+                size = os.path.getsize(part_path)
+                digest = hasher.hexdigest()
+                yield idx, part_path, size, digest
+                if progress_cb:
+                    progress_cb(idx, size)
+                idx += 1
+                part_f = None
+    if part_f is not None:
+        part_f.close()
+        size = os.path.getsize(part_path)
+        if size:
+            yield idx, part_path, size, hasher.hexdigest()
+            if progress_cb:
+                progress_cb(idx, size)
+        else:
+            os.unlink(part_path)
+
+
+def _check_free_space(path, needed_bytes, margin_bytes=256 << 20):
+    """Fail-closed free-space guard. Returns (ok, detail)."""
+    try:
+        free = shutil.disk_usage(path).free
+    except OSError as e:
+        return False, f"cannot stat disk for {path}: {e}"
+    if free < needed_bytes + margin_bytes:
+        return False, (
+            f"not enough free space: need {human(needed_bytes + margin_bytes)}, "
+            f"have {human(free)}")
+    return True, ""
+
+
+ARIA2_DHT_BOOTSTRAP = [
+    "dht.transmissionbt.com:6881",
+    "router.bittorrent.com:6881",
+    "dht.libtorrent.org:25401",
+]
+
+
+def _aria2c_fetch(binary, kind, uri, dl_dir, timeout_secs=12 * 3600):
+    """Download via aria2c into dl_dir.
+
+    kind: 'url' (direct http/https), 'magnet', or 'torrent' (.torrent path).
+    Returns (ok, files|detail): files is the sorted list of downloaded
+    regular files (aria2 control files excluded). Disk holds the full
+    download during this call — the documented trade-off of direct mode
+    (TorBox streaming mode keeps <= 1 part on disk instead).
+    """
+    os.makedirs(dl_dir, exist_ok=True)
+    cmd = [binary,
+           "--dir", dl_dir,
+           "--seed-time=0",
+           "--allow-overwrite=true",
+           "--continue=true",
+           "--auto-file-renaming=false",
+           "--max-connection-per-server=16",
+           "--split=16",
+           "--min-split-size=1M",
+           "--bt-enable-lpd=true"]
+    if kind == "url":
+        cmd += ["--user-agent", UA_BROWSER, uri]
+    elif kind == "magnet":
+        for node in ARIA2_DHT_BOOTSTRAP:
+            cmd += ["--dht-entry-point", node]
+        cmd += [uri]
+    elif kind == "torrent":
+        cmd += [uri]
+    else:
+        return False, f"unknown aria2 fetch kind {kind!r}"
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout_secs)
+    except subprocess.TimeoutExpired:
+        return False, "aria2c timed out"
+    except OSError as e:
+        return False, f"aria2c failed to start: {e}"
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "")[-1500:]
+        return False, f"aria2c exit {proc.returncode}: {tail[:1500]}"
+    files = []
+    for root, dirs, names in os.walk(dl_dir):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for n in sorted(names):
+            if n.startswith(".") or n.endswith(".aria2"):
+                continue
+            p = os.path.join(root, n)
+            try:
+                if os.path.isfile(p) and os.path.getsize(p) > 0:
+                    files.append(p)
+            except OSError:
+                continue
+    files.sort()
+    if not files:
+        return False, "aria2c finished but produced no files"
+    return True, files
+
+
 # ============================================================ v2: mirror command
 def cmd_mirror(args):
     """Torrent -> cloud store with bounded local footprint.
 
-    Pipeline: TorBox cloud torrent -> CDN link -> Range-stream into rolling
-    part files -> upload each part -> verify -> delete local part immediately
-    -> manifest + registry entry. Disk never holds more than one part.
+    Two transports:
+      TorBox mode (default): TorBox cloud torrent -> CDN link ->
+        Range-stream into rolling part files -> upload each part -> verify
+        -> delete local part immediately -> manifest + registry entry.
+        Disk never holds more than one part. Needs the custom.torbox
+        Secure Vault credential.
+      Direct mode (--direct): aria2c downloads magnet/.torrent/URL into
+        staging -> split into rolling parts -> same upload/verify/delete
+        pipeline. Needs no TorBox credential, but disk holds the FULL
+        download while aria2c works (source file is deleted as soon as its
+        parts are all verified). Use when TorBox is unavailable.
     """
     part_bytes = max(1, args.part_mb) * 1024 * 1024
     store = args.store
@@ -1126,26 +1276,70 @@ def cmd_mirror(args):
         audit_log("mirror_fail", run_id=run_id, detail=msg[:300])
         return 1
 
-    # 1. torrent source
-    if args.magnet:
-        ok, res = torbox_add_magnet(args.magnet)
+    if args.direct:
+        # ---- direct mode: aria2c transport, no TorBox credential ----
+        a2c = _aria2c_binary()
+        if not a2c:
+            return fail("direct mode needs aria2c: not on PATH and not at "
+                        "~/workspace/tools/aria2/aria2c")
+        print(f"aria2c: using {a2c}")
+        if args.magnet:
+            src_kind, src_uri = "magnet", args.magnet
+            manifest["source"] = {"kind": "direct-magnet"}
+        elif args.torrent:
+            if not os.path.isfile(args.torrent):
+                return fail(f"--torrent file not found: {args.torrent}")
+            src_kind, src_uri = "torrent", args.torrent
+            manifest["source"] = {"kind": "direct-torrent",
+                                  "file": args.torrent}
+        elif args.url:
+            src_kind, src_uri = "url", args.url
+            manifest["source"] = {"kind": "direct-url"}
+        else:
+            return fail("direct mode needs --magnet, --torrent or --url")
+        # free-space guard: full download lands on this disk
+        if src_kind == "url":
+            size = _head_content_length(src_uri)
+            need = size if size is not None else (2 << 30)
+            ok, detail = _check_free_space(staging, need)
+            if not ok:
+                return fail(detail)
+        else:
+            ok, detail = _check_free_space(staging, 2 << 30)
+            if not ok:
+                return fail(detail)
+        dl_dir = os.path.join(staging, "dl")
+        print(f"aria2c: downloading {src_kind} into {dl_dir} ...")
+        ok, fetched = _aria2c_fetch(a2c, src_kind, src_uri, dl_dir,
+                                    timeout_secs=args.direct_timeout)
         if not ok:
-            return fail(res)
-        torrent_id = res["torrent_id"]
-        manifest["source"] = {"kind": "magnet", "torrent_id": torrent_id,
-                              "name": res.get("name", "")}
-        print(f"torbox: added '{res.get('name', '')}' id={torrent_id}")
-    elif args.torrent_id:
-        torrent_id = args.torrent_id
-        manifest["source"] = {"kind": "torrent_id", "torrent_id": torrent_id}
+            return fail(fetched)
+        dl_files = fetched
+        print(f"aria2c: {len(dl_files)} file(s) downloaded")
     else:
-        return fail("need --magnet or --torrent-id")
+        # ---- TorBox mode (default) ----
+        # 1. torrent source
+        if args.magnet:
+            ok, res = torbox_add_magnet(args.magnet)
+            if not ok:
+                return fail(res)
+            torrent_id = res["torrent_id"]
+            manifest["source"] = {"kind": "magnet", "torrent_id": torrent_id,
+                                  "name": res.get("name", "")}
+            print(f"torbox: added '{res.get('name', '')}' id={torrent_id}")
+        elif args.torrent_id:
+            torrent_id = args.torrent_id
+            manifest["source"] = {"kind": "torrent_id",
+                                  "torrent_id": torrent_id}
+        else:
+            return fail("need --magnet or --torrent-id (or --direct with "
+                        "--magnet/--torrent/--url)")
 
-    # 2. wait for cloud download
-    print("torbox: waiting for cloud download to complete...")
-    ok, info = torbox_wait_complete(torrent_id, poll_secs=args.poll_secs)
-    if not ok:
-        return fail(info)
+        # 2. wait for cloud download
+        print("torbox: waiting for cloud download to complete...")
+        ok, info = torbox_wait_complete(torrent_id, poll_secs=args.poll_secs)
+        if not ok:
+            return fail(info)
     files = info.get("files") or []
     if args.file:
         files = [f for f in files
@@ -1170,101 +1364,55 @@ def cmd_mirror(args):
     else:
         return fail(f"unknown store {store}")
 
-    # 4. stream each file -> parts -> upload/verify/delete
+    # 4. each file -> parts -> upload/verify/delete
     total_up = 0
     reg = load_registry()
     try:
-        for fi, f in enumerate(files):
-            fname = str(f.get("name", f"file-{fi}"))
-            fid = str(f.get("id", ""))
-            fsize = int(f.get("size") or 0)
-            ok, link = torbox_requestdl(torrent_id, fid)
-            if not ok:
-                print(f"  SKIP {fname}: {link}")
-                audit_log("mirror_file_skip", run_id=run_id, file=fname,
-                          detail=str(link)[:200])
-                continue
-            print(f"[{fi + 1}/{len(files)}] {fname} ({human(fsize)})")
-            fentry = {"name": fname, "size": fsize, "parts": []}
-            base = os.path.splitext(os.path.basename(fname))[0][:60] or "mirror"
-            for pidx, ppath, psize, phash in stream_url_to_parts(
-                    link, staging, part_bytes):
-                asset = f"{base}.part-{pidx:04d}"
-                if store == "github":
-                    ok, detail = upload_to_store(
-                        store, ppath,
-                        {"repo": dest["repo"], "release": dest["release"]})
-                    # rename asset to our part name via gh (uploaded under
-                    # basename); verify by size+sha against the release
-                    ok_v, detail_v = (False, "upload failed: " + detail)
-                    if ok:
-                        ok_v, detail_v = verify_github_asset(
-                            dest["repo"], dest["release"],
-                            os.path.basename(ppath), psize, phash)
-                elif store == "terabox":
-                    ok, detail = upload_to_store(
-                        store, ppath,
-                        {"remote_dir": dest["remote_dir"],
-                         "remote_name": asset})
-                    ok_v, detail_v = (ok, detail)
-                    if ok:
-                        ok_v, detail_v = verify_terabox_entry(
-                            {"remote_dir": dest["remote_dir"],
-                             "asset": asset, "size": psize}, ppath)
-                else:  # kaggle: zip the part, one dataset per file
-                    import zipfile
-                    zpath = ppath + ".zip"
-                    with zipfile.ZipFile(zpath, "w",
-                                         zipfile.ZIP_DEFLATED) as z:
-                        z.write(ppath, asset)
-                    ok, detail = upload_to_store(
-                        store, zpath,
-                        {"owner": dest["owner"],
-                         "slug": f"{dest['slug']}-{base}-{pidx:04d}"[:90],
-                         "title": f"{dest['title']} {base} part {pidx:04d}"})
-                    ok_v, detail_v = (ok, detail)
-                    try:
-                        os.unlink(zpath)
-                    except OSError:
-                        pass
-                if not ok_v:
-                    print(f"  part {pidx}: VERIFY FAILED - {detail_v}; "
-                          f"local kept at {ppath}")
-                    audit_log("mirror_part_unverified", run_id=run_id,
-                              file=fname, part=pidx, detail=str(detail_v)[:200])
-                    fentry["parts"].append({"index": pidx, "status": "unverified",
-                                            "local": ppath, "size": psize,
-                                            "sha256": phash})
+        if args.direct:
+            nfiles = len(dl_files)
+            for fi, path in enumerate(dl_files):
+                fname = os.path.relpath(path, dl_dir)
+                if args.file and args.file.lower() not in fname.lower():
+                    print(f"  SKIP {fname}: does not match --file")
                     continue
-                # verified -> delete local part immediately (delete-as-you-go)
+                fsize = os.path.getsize(path)
+                parts_iter = split_file_to_parts(path, staging, part_bytes)
+                fentry, verified = _mirror_file_parts(
+                    fi, nfiles, fname, fsize, parts_iter, store, dest,
+                    args, run_id, reg)
+                manifest["files"].append(fentry)
+                total_up += verified
+                # delete the aria2c source once its parts are handled
                 try:
-                    os.unlink(ppath)
+                    os.unlink(path)
                 except OSError:
                     pass
-                total_up += psize
-                part_rec = {"index": pidx, "status": "verified",
-                            "size": psize, "sha256": phash,
-                            "asset": asset if store != "github"
-                            else os.path.basename(ppath)}
-                fentry["parts"].append(part_rec)
-                # registry entry so `reap` can clean stragglers later
-                rpath = f"mirror:{run_id}:{fname}:part-{pidx:04d}"
-                reg["entries"][rpath] = {
-                    "local_path": rpath, "store": store,
-                    "repo": dest.get("repo", ""),
-                    "release": dest.get("release", ""),
-                    "remote_dir": dest.get("remote_dir", ""),
-                    "dataset": args.dataset if store == "kaggle" else "",
-                    "asset": part_rec["asset"], "sha256": phash,
-                    "size": psize, "note": f"mirror {run_id} {fname}",
-                    "registered_at": now_stamp(), "status": "reaped",
-                }
-                audit_log("mirror_part", run_id=run_id, file=fname,
-                          part=pidx, size=psize, sha256=phash, store=store,
-                          asset=part_rec["asset"])
-                print(f"  part {pidx}: {human(psize)} verified on {store}, "
-                      f"local deleted")
-            manifest["files"].append(fentry)
+            # prune leftover aria2 control/metadata files
+            for root, dirs, names in os.walk(dl_dir):
+                for n in names:
+                    p = os.path.join(root, n)
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+        else:
+            nfiles = len(files)
+            for fi, f in enumerate(files):
+                fname = str(f.get("name", f"file-{fi}"))
+                fid = str(f.get("id", ""))
+                fsize = int(f.get("size") or 0)
+                ok, link = torbox_requestdl(torrent_id, fid)
+                if not ok:
+                    print(f"  SKIP {fname}: {link}")
+                    audit_log("mirror_file_skip", run_id=run_id, file=fname,
+                              detail=str(link)[:200])
+                    continue
+                parts_iter = stream_url_to_parts(link, staging, part_bytes)
+                fentry, verified = _mirror_file_parts(
+                    fi, nfiles, fname, fsize, parts_iter, store, dest,
+                    args, run_id, reg)
+                manifest["files"].append(fentry)
+                total_up += verified
     finally:
         save_registry(reg)
         manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
@@ -1353,6 +1501,111 @@ def ia_download_url(identifier, filename):
     import urllib.parse
     return (f"{IA_DOWNLOAD_BASE}/{urllib.parse.quote(identifier, safe='')}"
             f"/{urllib.parse.quote(filename, safe='/')}")
+
+
+def _head_content_length(url, timeout=30):
+    """HEAD request -> Content-Length in bytes, or None when unknown."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, method="HEAD",
+                                     headers={"User-Agent": UA_BROWSER})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            cl = r.headers.get("Content-Length")
+            return int(cl) if cl else None
+    except Exception:
+        return None
+
+
+def _mirror_file_parts(fi, nfiles, fname, fsize, parts_iter, store, dest,
+                       args, run_id, reg):
+    """Upload/verify/delete rolling parts for one file; returns (fentry, bytes).
+
+    parts_iter yields (index, part_path, size, sha256) as in
+    stream_url_to_parts / split_file_to_parts. Verified parts are deleted
+    from disk immediately (delete-as-you-go); unverified ones are kept and
+    recorded with status=unverified.
+    """
+    fentry = {"name": fname, "size": fsize, "parts": []}
+    base = os.path.splitext(os.path.basename(fname))[0][:60] or "mirror"
+    print(f"[{fi + 1}/{nfiles}] {fname} ({human(fsize)})")
+    verified = 0
+    for pidx, ppath, psize, phash in parts_iter:
+        asset = f"{base}.part-{pidx:04d}"
+        if store == "github":
+            ok, detail = upload_to_store(
+                store, ppath,
+                {"repo": dest["repo"], "release": dest["release"]})
+            # rename asset to our part name via gh (uploaded under
+            # basename); verify by size+sha against the release
+            ok_v, detail_v = (False, "upload failed: " + detail)
+            if ok:
+                ok_v, detail_v = verify_github_asset(
+                    dest["repo"], dest["release"],
+                    os.path.basename(ppath), psize, phash)
+        elif store == "terabox":
+            ok, detail = upload_to_store(
+                store, ppath,
+                {"remote_dir": dest["remote_dir"],
+                 "remote_name": asset})
+            ok_v, detail_v = (ok, detail)
+            if ok:
+                ok_v, detail_v = verify_terabox_entry(
+                    {"remote_dir": dest["remote_dir"],
+                     "asset": asset, "size": psize}, ppath)
+        else:  # kaggle: zip the part, one dataset per file
+            import zipfile
+            zpath = ppath + ".zip"
+            with zipfile.ZipFile(zpath, "w",
+                                 zipfile.ZIP_DEFLATED) as z:
+                z.write(ppath, asset)
+            ok, detail = upload_to_store(
+                store, zpath,
+                {"owner": dest["owner"],
+                 "slug": f"{dest['slug']}-{base}-{pidx:04d}"[:90],
+                 "title": f"{dest['title']} {base} part {pidx:04d}"})
+            ok_v, detail_v = (ok, detail)
+            try:
+                os.unlink(zpath)
+            except OSError:
+                pass
+        if not ok_v:
+            print(f"  part {pidx}: VERIFY FAILED - {detail_v}; "
+                  f"local kept at {ppath}")
+            audit_log("mirror_part_unverified", run_id=run_id,
+                      file=fname, part=pidx, detail=str(detail_v)[:200])
+            fentry["parts"].append({"index": pidx, "status": "unverified",
+                                    "local": ppath, "size": psize,
+                                    "sha256": phash})
+            continue
+        # verified -> delete local part immediately (delete-as-you-go)
+        try:
+            os.unlink(ppath)
+        except OSError:
+            pass
+        verified += psize
+        part_rec = {"index": pidx, "status": "verified",
+                    "size": psize, "sha256": phash,
+                    "asset": asset if store != "github"
+                    else os.path.basename(ppath)}
+        fentry["parts"].append(part_rec)
+        # registry entry so `reap` can clean stragglers later
+        rpath = f"mirror:{run_id}:{fname}:part-{pidx:04d}"
+        reg["entries"][rpath] = {
+            "local_path": rpath, "store": store,
+            "repo": dest.get("repo", ""),
+            "release": dest.get("release", ""),
+            "remote_dir": dest.get("remote_dir", ""),
+            "dataset": args.dataset if store == "kaggle" else "",
+            "asset": part_rec["asset"], "sha256": phash,
+            "size": psize, "note": f"mirror {run_id} {fname}",
+            "registered_at": now_stamp(), "status": "reaped",
+        }
+        audit_log("mirror_part", run_id=run_id, file=fname,
+                  part=pidx, size=psize, sha256=phash, store=store,
+                  asset=part_rec["asset"])
+        print(f"  part {pidx}: {human(psize)} verified on {store}, "
+              f"local deleted")
+    return fentry, verified
 
 
 def cmd_mirror_search(args):
@@ -1767,9 +2020,19 @@ def main(argv=None):
                        help="torrent -> cloud store, bounded local footprint")
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--magnet", default="",
-                     help="magnet URI to fetch via TorBox cloud")
+                     help="magnet URI (TorBox cloud, or aria2c in --direct)")
     src.add_argument("--torrent-id", default="",
                      help="existing TorBox torrent id")
+    src.add_argument("--torrent", default="",
+                     help="--direct: local .torrent file for aria2c")
+    src.add_argument("--url", default="",
+                     help="--direct: direct http(s) URL for aria2c")
+    p.add_argument("--direct", action="store_true",
+                   help="download with local aria2c instead of TorBox cloud "
+                        "(no TorBox credential needed; holds the full "
+                        "download on disk while aria2c works)")
+    p.add_argument("--direct-timeout", type=int, default=12 * 3600,
+                   help="aria2c download timeout in seconds (default 12h)")
     p.add_argument("--store", required=True, choices=STORES,
                    help="destination store")
     p.add_argument("--repo", default="", help="github: OWNER/REPO")
@@ -1782,7 +2045,9 @@ def main(argv=None):
     p.add_argument("--file", default="",
                    help="only mirror torrent files whose name contains this")
     p.add_argument("--part-mb", type=int, default=100,
-                   help="rolling part size in MB (disk never holds more)")
+                   help="rolling part size in MB (TorBox mode never holds "
+                        "more than one part; --direct holds the full "
+                        "download too)")
     p.add_argument("--poll-secs", type=int, default=60,
                    help="torbox completion poll interval")
 
