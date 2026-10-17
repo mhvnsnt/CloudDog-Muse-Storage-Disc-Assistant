@@ -51,6 +51,16 @@ import sys
 import time
 from datetime import datetime, timezone
 
+# Owner's disk laws as code (clouddog/policy/laws.py, PR #8). The reap path
+# consults decide_delete for every candidate: it can only make reap MORE
+# conservative, never less. Fail closed if the import breaks.
+try:
+    from clouddog.policy.laws import decide_delete
+    _POLICY_AVAILABLE = True
+except ImportError:  # pragma: no cover - defensive; package ships in-repo
+    decide_delete = None  # type: ignore
+    _POLICY_AVAILABLE = False
+
 # ---------------------------------------------------------------- locations
 HOME = os.path.expanduser("~")
 WORKSPACE = os.path.join(HOME, "workspace")
@@ -1296,12 +1306,38 @@ def cmd_verify_v2(args):
 
 
 def cmd_reap_v2(args):
-    """v2 reap: verify-then-delete across all store backends."""
+    """v2 reap: verify-then-delete across all store backends.
+
+    Every candidate additionally passes the owner's law engine
+    (clouddog.policy.laws.decide_delete). The gate can only BLOCK, never
+    approve: the live per-store verify_entry remains the proof of the
+    ONE-STORE RULE. Unattended runs never satisfy requires_owner.
+    """
+    if not _POLICY_AVAILABLE:
+        print("POLICY ENGINE UNAVAILABLE: clouddog.policy.laws failed to "
+              "import; reap disabled (fail-closed).", file=sys.stderr)
+        audit_log("reap_policy_unavailable")
+        return 1
     apply = args.apply
+    owner_approved = getattr(args, "owner_approved", False)
     search_root = (os.path.abspath(args.path)
                    if getattr(args, "path", "") else None)
-    reaped, skipped, failed = [], [], []
+    reaped, skipped, failed, blocked = [], [], [], []
     for path, entry in reap_candidates(search_root):
+        claimed = [entry["store"]] if entry.get("store") else []
+        decision = decide_delete(path, verified_stores=claimed,
+                                 owner_approved=owner_approved)
+        # Gate blocks unless the laws allow AND any owner-approval
+        # requirement is satisfied by this run's --owner-approved flag.
+        # (requires_owner=True on an allowed decision merely records that
+        # approval was the basis — it must not block an approved run.)
+        if not decision.allowed or (decision.requires_owner
+                                    and not owner_approved):
+            reason = "; ".join(decision.reasons)
+            blocked.append((path, reason))
+            audit_log("reap_policy_block", path=path, store=entry.get("store"),
+                      detail=reason[:200])
+            continue
         ok, detail = verify_entry(entry, path)
         if not ok:
             failed.append((path, detail))
@@ -1333,9 +1369,11 @@ def cmd_reap_v2(args):
     total = sum(s for _, s in reaped)
     mode = "APPLY" if apply else "DRY-RUN"
     print(f"[{mode}] reaped={len(reaped)} ({human(total)}) "
-          f"failed-verify={len(failed)}")
+          f"failed-verify={len(failed)} blocked-policy={len(blocked)}")
     for path, detail in failed:
         print(f"  KEEP (unverified): {path} - {detail}")
+    for path, reason in blocked:
+        print(f"  BLOCKED (policy): {path} - {reason[:160]}")
     if apply and reaped:
         log_action(f"cloud_dog reap: {len(reaped)} files, {human(total)} freed")
         audit_log("reap_summary", count=len(reaped), bytes_freed=total)
@@ -1379,6 +1417,9 @@ def main(argv=None):
                    help="actually delete (default is dry-run)")
     p.add_argument("--path", default="",
                    help="only consider files under this directory")
+    p.add_argument("--owner-approved", action="store_true",
+                   help="owner approval for protected game files "
+                        "(NEVER-DELETE-GAME-FILES: unattended runs must omit)")
 
     p = sub.add_parser("enforce", help="full cycle: scan + reap")
     p.add_argument("--apply", action="store_true")

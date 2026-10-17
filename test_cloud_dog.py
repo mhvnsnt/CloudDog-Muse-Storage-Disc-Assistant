@@ -449,3 +449,117 @@ def test_reap_v2_tolerates_missing_path_arg():
         assert rc == 0
     finally:
         _patch(cloud_dog, "reap_candidates", o1)
+
+
+# ------------------------------------------------- policy-gate wiring tests
+def _policy_test_setup():
+    """Back up the real registry and isolate the audit journal."""
+    import shutil
+    reg_path = cloud_dog.REGISTRY_PATH
+    backup = None
+    if os.path.exists(reg_path):
+        backup = reg_path + ".test-bak"
+        os.replace(reg_path, backup)
+    d = tempfile.mkdtemp(prefix="cdtest-",
+                        dir=os.path.expanduser("~/workspace"))
+    old_audit = _patch(cloud_dog, "AUDIT_PATH", os.path.join(d, "audit.jsonl"))
+
+    def cleanup():
+        _patch(cloud_dog, "AUDIT_PATH", old_audit)
+        shutil.rmtree(d, ignore_errors=True)
+        if os.path.exists(reg_path):
+            os.unlink(reg_path)
+        if backup and os.path.exists(backup):
+            os.replace(backup, reg_path)
+    return d, cleanup
+
+
+def _old_file(directory, name, content=b"data"):
+    """Create a file with mtime old enough to pass the in-flight filter."""
+    import time
+    p = os.path.join(directory, name)
+    with open(p, "wb") as f:
+        f.write(content)
+    old = time.time() - 600
+    os.utime(p, (old, old))
+    return p
+
+
+def _register(path, store="terabox"):
+    return cloud_dog.cmd_register(type("A", (), {
+        "file": path, "store": store, "repo": "", "release": "",
+        "asset": "", "sha256": "", "size": 0, "note": "test",
+    })())
+
+
+def _reap_dry(args):
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cloud_dog.cmd_reap_v2(args)
+    return rc, buf.getvalue()
+
+
+def test_policy_gate_blocks_protected_game_file():
+    """A .iso with a claimed store is BLOCKED by decide_delete (rule 3),
+    before any live verify runs. The file must survive."""
+    d, cleanup = _policy_test_setup()
+    try:
+        iso = _old_file(d, "game.iso")
+        assert _register(iso) == 0
+        rc, out = _reap_dry(type("A", (), {
+            "apply": True, "path": "", "owner_approved": False})())
+        assert rc == 0
+        assert "blocked-policy=1" in out, out
+        assert "BLOCKED (policy)" in out, out
+        assert "protected game file" in out, out
+        assert os.path.exists(iso), "policy-blocked file must never be deleted"
+    finally:
+        cleanup()
+
+
+def test_policy_gate_passes_ordinary_file_to_verify():
+    """An ordinary file with a claimed store passes the gate and reaches
+    live verification (fails locally without creds — no network)."""
+    d, cleanup = _policy_test_setup()
+    try:
+        dat = _old_file(d, "ordinary.dat")
+        assert _register(dat) == 0
+        rc, out = _reap_dry(type("A", (), {
+            "apply": False, "path": "", "owner_approved": False})())
+        assert rc == 0
+        assert "blocked-policy=0" in out, out
+        assert "failed-verify=1" in out, out
+        assert os.path.exists(dat)
+    finally:
+        cleanup()
+
+
+def test_policy_gate_owner_approved_allows_game_file_past_gate():
+    """With --owner-approved, a protected game file passes the POLICY gate
+    (rule 3 satisfied) and proceeds to live verification."""
+    d, cleanup = _policy_test_setup()
+    try:
+        iso = _old_file(d, "game2.iso")
+        assert _register(iso) == 0
+        rc, out = _reap_dry(type("A", (), {
+            "apply": False, "path": "", "owner_approved": True})())
+        assert rc == 0
+        assert "blocked-policy=0" in out, out
+        assert os.path.exists(iso)
+    finally:
+        cleanup()
+
+
+def test_policy_unavailable_fails_closed():
+    """If the law engine cannot import, reap refuses to run at all."""
+    import io, contextlib
+    old = _patch(cloud_dog, "_POLICY_AVAILABLE", False)
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            rc = cloud_dog.cmd_reap_v2(type("A", (), {"apply": True})())
+        assert rc == 1
+        assert "fail-closed" in buf.getvalue()
+    finally:
+        _patch(cloud_dog, "_POLICY_AVAILABLE", old)
