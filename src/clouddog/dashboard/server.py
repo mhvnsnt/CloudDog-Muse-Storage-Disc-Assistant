@@ -156,12 +156,21 @@ def _sha256_file(path: str) -> str:
 # live system probes (no engine needed)
 # --------------------------------------------------------------------------
 
+def _data_root() -> str:
+    """The data volume to report. Overridable via CLOUDEDOG_DISK_PATH;
+    falls back to / when the default doesn't exist (e.g. CI runners)."""
+    p = os.environ.get("CLOUDEDOG_DISK_PATH", "/home/hatch")
+    return p if os.path.isdir(p) else "/"
+
+
 def _disk_info() -> dict:
-    # The data volume is /home/hatch (100G); "/" is a different mount.
-    usage = shutil.disk_usage(os.path.expanduser("/home/hatch"))
+    # The data volume is /home/hatch (100G) on the owner's VM; "/" is a
+    # different mount there. CI runners lack /home/hatch -> use /.
+    root = _data_root()
+    usage = shutil.disk_usage(root)
     pct = round(usage.used / usage.total * 100, 2) if usage.total else 0.0
     return {
-        "path": "/home/hatch",
+        "path": root,
         "total_bytes": usage.total,
         "used_bytes": usage.used,
         "free_bytes": usage.free,

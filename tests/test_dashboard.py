@@ -67,9 +67,12 @@ def test_health(base_url):
 def test_disk_matches_shutil(base_url):
     status, body = get(base_url, "/api/disk")
     assert status == 200
-    # The data volume is /home/hatch, not "/" (different mount on this VM).
-    usage = shutil.disk_usage(os.path.expanduser("/home/hatch"))
-    assert body["path"] == os.path.expanduser("/home/hatch")
+    # Same resolution as the server: CLOUDEDOG_DISK_PATH or /home/hatch,
+    # falling back to / (e.g. CI runners).
+    from clouddog.dashboard.server import _data_root
+    root = _data_root()
+    usage = shutil.disk_usage(root)
+    assert body["path"] == root
     assert body["total_bytes"] == usage.total
     assert body["used_bytes"] == usage.used
     assert body["free_bytes"] == usage.free
