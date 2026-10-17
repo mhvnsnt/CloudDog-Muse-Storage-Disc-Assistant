@@ -326,3 +326,44 @@ def test_daemon_stale_pidfile_taken_over(tmp_path=None):
         _patch(cloud_dog, "log_action", o1)
         _patch(cloud_dog, "audit_log", o2)
     assert not os.path.exists(pf), "pidfile must be removed on exit"
+
+
+def test_enforce_uses_v2_reaper():
+    """enforce must reap via the v2 dispatcher (all stores), and must not
+    crash when args has no .path (the enforce parser never defines --path)."""
+    calls = []
+
+    def fake_scan():
+        return {"over_ceiling": True}
+
+    def fake_reap_v2(args):
+        calls.append("v2")
+        # must tolerate missing .path
+        _ = getattr(args, "path", "")
+        return 0
+
+    o1 = _patch(cloud_dog, "cmd_scan", fake_scan)
+    o2 = _patch(cloud_dog, "cmd_reap_v2", fake_reap_v2)
+    o3 = _patch(cloud_dog, "disk_usage_percent", lambda p="/home/hatch": (80.0, 1, 2))
+    o4 = _patch(cloud_dog, "log_action", lambda *a, **k: None)
+    try:
+        args = type("A", (), {"apply": True})()  # NO .path attribute
+        rc = cloud_dog.cmd_enforce(args)
+        assert rc == 0
+        assert calls == ["v2"], "enforce must dispatch to cmd_reap_v2"
+    finally:
+        _patch(cloud_dog, "cmd_scan", o1)
+        _patch(cloud_dog, "cmd_reap_v2", o2)
+        _patch(cloud_dog, "disk_usage_percent", o3)
+        _patch(cloud_dog, "log_action", o4)
+
+
+def test_reap_v2_tolerates_missing_path_arg():
+    """cmd_reap_v2 directly with an args object lacking .path (enforce path)."""
+    o1 = _patch(cloud_dog, "reap_candidates", lambda root=None: iter([]))
+    try:
+        args = type("A", (), {"apply": False})()
+        rc = cloud_dog.cmd_reap_v2(args)
+        assert rc == 0
+    finally:
+        _patch(cloud_dog, "reap_candidates", o1)
