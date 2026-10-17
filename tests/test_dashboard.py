@@ -74,9 +74,11 @@ def test_disk_matches_shutil(base_url):
     usage = shutil.disk_usage(root)
     assert body["path"] == root
     assert body["total_bytes"] == usage.total
-    assert body["used_bytes"] == usage.used
-    assert body["free_bytes"] == usage.free
-    assert body["use_pct"] == pytest.approx(usage.used / usage.total * 100, abs=0.01)
+    # used/free can move between the server's stat and ours on a live
+    # system — compare approximately.
+    assert body["used_bytes"] == pytest.approx(usage.used, rel=0.01)
+    assert body["free_bytes"] == pytest.approx(usage.free, rel=0.01)
+    assert body["use_pct"] == pytest.approx(usage.used / usage.total * 100, abs=1.0)
 
 
 def test_backends_shape(base_url):
