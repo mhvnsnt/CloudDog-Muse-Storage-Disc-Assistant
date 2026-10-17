@@ -127,6 +127,32 @@ def sha256_file(path, chunk=1 << 20):
     return h.hexdigest()
 
 
+def _b3sum_bin():
+    """Path to the bundled b3sum binary, or None."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    cand = os.path.join(here, "tools", "bin", "b3sum")
+    return cand if os.path.isfile(cand) and os.access(cand, os.X_OK) else None
+
+
+def fast_hash_file(path):
+    """Fast BLAKE3 hash via bundled b3sum binary, else SHA-256 fallback.
+
+    For INTERNAL comparisons only (not store digests) — the digest only
+    needs to match between the two files being compared. GitHub release
+    assets always use SHA-256; use sha256_file() for those.
+    """
+    b3 = _b3sum_bin()
+    if b3:
+        try:
+            out = subprocess.run([b3, str(path)], capture_output=True,
+                                 text=True, timeout=300)
+            if out.returncode == 0:
+                return out.stdout.split()[0]
+        except (subprocess.SubprocessError, OSError):
+            pass
+    return sha256_file(path)
+
+
 def is_sacred(path):
     ap = os.path.abspath(path)
     if "agent-ops/checkpoints" in ap or ("agent-ops" + os.sep + "checkpoints") in ap:
