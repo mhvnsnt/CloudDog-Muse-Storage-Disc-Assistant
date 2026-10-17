@@ -75,3 +75,58 @@ See `~/workspace/cron.d/minutely/disk-space-guardian__interval@10m.md`.
 ## Requirements
 
 Python 3.8+, stdlib only. `gh` CLI required for GitHub verification.
+
+---
+
+## Spark-app dashboard & scripts (2026-10-17)
+
+The `src/` dashboard (Vite + React + Tailwind) and the helper scripts below
+came from the spark/Gemini build of "Muse Storage Disc Assist". Installed
+verbatim per the owner's order. `cloud_dog.py` above is the real engine;
+the dashboard is its UI companion.
+
+# Muse Storage Disc Assist 🪄🎻⚡
+
+> **The zero-clutter storage, in-flight stream reaper, 1TB+ cloud torrent mirror, and free compute / virtual VRAM suite.**
+
+[![GitHub license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Stream Reaper](https://img.shields.io/badge/In--Flight%20Reaper-Active%20Per--Blob-emerald.svg)]()
+[![No-Local-Clutter Law](https://img.shields.io/badge/No--Local--Clutter%20Law-Enforced%20%3C75%25-red.svg)]()
+[![Free Cloud Vault](https://img.shields.io/badge/TeraBox%20Vault-1%20TB%2B%20Mirrored-cyan.svg)]()
+
+---
+
+### The In-Flight Stream Reaper Rule
+
+> **Everything on disk gets mirrored to GitHub/TeraBox continuously — mid-download, mid-upload, active work, all of it — instead of waiting for 100%. As each file's upload hash verifies against GitHub, the local copy gets deleted on the spot and the lane's progress file stays as the manifest. Disk falls while the upload runs instead of after.**
+
+### 10-Minute Loop Watchdog
+
+The watchdog runs continuously every 10 minutes to:
+1. Prune dead download directories and partial chunk shards.
+2. Nurse stalled upload lanes through slow proxy flakes.
+3. Patch around GitHub file-size blockers.
+4. Finalize commit steps so no blob sits unreferenced.
+
+---
+
+### CLI Usage
+
+```bash
+# 1. Run in-flight blob reaper for Scooby lane (deletes local blobs on verify)
+muse-assist reaper --lane scooby --auto-delete-verified
+
+# 2. Force immediate watchdog sweep
+muse-assist watchdog --sweep-now
+
+# 3. Mirror torrent straight to TeraBox 1TB (zero local footprint)
+muse-assist mirror-torrent "magnet:?xt=urn:btih:..." --target terabox
+
+# 4. Enforce < 75% constitutional ceiling
+muse-assist enforce-law --target-pct 75
+```
+
+---
+
+### License
+MIT License. Crafted for resilient continuous audio & asset pipeline engineering.
