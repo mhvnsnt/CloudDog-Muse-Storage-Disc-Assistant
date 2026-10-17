@@ -860,3 +860,162 @@ def test_dedup_no_binary_errors():
         assert rc == 1
     finally:
         _patch(cloud_dog, "_fclones_binary", old)
+
+
+# ------------------------------------------------------ restic backend tests
+def _restic_test_env(password="test-rest1c-pw"):
+    """Set RESTIC_PASSWORD for the test, returning the old value."""
+    old = os.environ.get("RESTIC_PASSWORD")
+    os.environ["RESTIC_PASSWORD"] = password
+    return old
+
+
+def _restic_restore_env(old):
+    if old is None:
+        os.environ.pop("RESTIC_PASSWORD", None)
+    else:
+        os.environ["RESTIC_PASSWORD"] = old
+
+
+def test_restic_binary_found():
+    assert cloud_dog._restic_binary() is not None
+
+
+def test_restic_backup_and_verify_roundtrip():
+    import shutil
+    old_pw = _restic_test_env()
+    d = tempfile.mkdtemp(prefix="cdrestic-")
+    try:
+        repo = os.path.join(d, "repo")
+        f1 = os.path.join(d, "f1.txt")
+        with open(f1, "w") as f:
+            f.write("restic-roundtrip-bytes")
+        ok, snap = cloud_dog.restic_backup(f1, repo)
+        assert ok, f"backup failed: {snap}"
+        assert len(snap) == 64, f"snapshot id should be 64 hex chars: {snap}"
+        entry = {"restic_repo": repo, "snapshot_id": snap,
+                 "local_path": f1}
+        ok, detail = cloud_dog.restic_verify(entry, f1)
+        assert ok, f"verify failed: {detail}"
+    finally:
+        _restic_restore_env(old_pw)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_restic_verify_missing_snapshot_fails():
+    import shutil
+    old_pw = _restic_test_env()
+    d = tempfile.mkdtemp(prefix="cdrestic-")
+    try:
+        repo = os.path.join(d, "repo")
+        f1 = os.path.join(d, "f1.txt")
+        with open(f1, "w") as f:
+            f.write("x")
+        ok, snap = cloud_dog.restic_backup(f1, repo)
+        assert ok
+        entry = {"restic_repo": repo,
+                 "snapshot_id": "0" * 64,
+                 "local_path": f1}
+        ok, detail = cloud_dog.restic_verify(entry, f1)
+        assert not ok
+        assert "not found" in detail
+    finally:
+        _restic_restore_env(old_pw)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_restic_verify_wrong_path_fails():
+    import shutil
+    old_pw = _restic_test_env()
+    d = tempfile.mkdtemp(prefix="cdrestic-")
+    try:
+        repo = os.path.join(d, "repo")
+        f1 = os.path.join(d, "f1.txt")
+        with open(f1, "w") as f:
+            f.write("x")
+        ok, snap = cloud_dog.restic_backup(f1, repo)
+        assert ok
+        entry = {"restic_repo": repo, "snapshot_id": snap,
+                 "local_path": f1}
+        ok, detail = cloud_dog.restic_verify(entry, "/nope/other.txt")
+        assert not ok
+        assert "does not contain" in detail
+    finally:
+        _restic_restore_env(old_pw)
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_restic_backup_needs_password():
+    old_pw = _restic_test_env()
+    _restic_restore_env(None)  # ensure unset
+    try:
+        ok, detail = cloud_dog.restic_backup("/tmp/x", "/tmp/r")
+        assert not ok
+        assert "RESTIC_PASSWORD" in detail
+    finally:
+        _restic_restore_env(old_pw)
+
+
+def test_restic_verify_needs_password():
+    old_pw = _restic_test_env()
+    _restic_restore_env(None)
+    try:
+        ok, detail = cloud_dog.restic_verify(
+            {"restic_repo": "/tmp/r", "snapshot_id": "a" * 64}, "/tmp/x")
+        assert not ok
+        assert "RESTIC_PASSWORD" in detail
+    finally:
+        _restic_restore_env(old_pw)
+
+
+def test_restic_backup_missing_binary():
+    old = cloud_dog._restic_binary
+    cloud_dog._restic_binary = lambda: None
+    try:
+        ok, detail = cloud_dog.restic_backup("/tmp/x", "/tmp/r", password="p")
+        assert not ok
+        assert "not found" in detail
+    finally:
+        cloud_dog._restic_binary = old
+
+
+def test_register_restic_records_snapshot():
+    import shutil
+    old_pw = _restic_test_env()
+    reg_path = cloud_dog.REGISTRY_PATH
+    backup = None
+    if os.path.exists(reg_path):
+        backup = reg_path + ".test-bak"
+        os.replace(reg_path, backup)
+    d = tempfile.mkdtemp(prefix="cdrestic-")
+    old_audit = cloud_dog.AUDIT_PATH
+    cloud_dog.AUDIT_PATH = os.path.join(d, "audit.jsonl")
+    try:
+        repo = os.path.join(d, "repo")
+        f1 = os.path.join(d, "reg.txt")
+        with open(f1, "w") as f:
+            f.write("register-me")
+        rc = cloud_dog.cmd_register(type("A", (), {
+            "file": f1, "store": "restic", "repo": "", "release": "",
+            "asset": "", "remote_dir": "", "dataset": "",
+            "restic_repo": repo, "snapshot_id": "",
+            "sha256": "", "size": 0, "note": "test",
+        })())
+        assert rc == 0
+        reg = cloud_dog.load_registry()
+        entry = reg["entries"].get(os.path.abspath(f1))
+        assert entry is not None
+        assert entry["store"] == "restic"
+        assert entry["restic_repo"] == repo
+        assert len(entry["snapshot_id"]) == 64
+        # and the recorded snapshot verifies live
+        ok, detail = cloud_dog.restic_verify(entry, os.path.abspath(f1))
+        assert ok, detail
+    finally:
+        cloud_dog.AUDIT_PATH = old_audit
+        _restic_restore_env(old_pw)
+        shutil.rmtree(d, ignore_errors=True)
+        if os.path.exists(reg_path):
+            os.unlink(reg_path)
+        if backup and os.path.exists(backup):
+            os.replace(backup, reg_path)

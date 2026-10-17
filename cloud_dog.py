@@ -94,11 +94,16 @@ def now_stamp():
     return datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M %Z")
 
 
-def run(cmd, timeout=60):
-    """Run a shell command, return (rc, stdout, stderr). Never raises."""
+def run(cmd, timeout=60, env=None):
+    """Run a shell command, return (rc, stdout, stderr). Never raises.
+
+    env=None inherits the parent environment; pass an explicit env mapping
+    when a secret (e.g. RESTIC_PASSWORD) must be present for the child.
+    """
     try:
         p = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout,
+            env=env,
         )
         return p.returncode, p.stdout, p.stderr
     except Exception as e:  # timeout, missing binary, etc.
@@ -408,12 +413,31 @@ def cmd_register(args):
         "asset": args.asset,
         "remote_dir": getattr(args, "remote_dir", "") or "",
         "dataset": getattr(args, "dataset", "") or "",
+        "restic_repo": getattr(args, "restic_repo", "") or "",
+        "snapshot_id": getattr(args, "snapshot_id", "") or "",
         "sha256": args.sha256 or "",
         "size": args.size or 0,
         "note": args.note or "",
         "registered_at": now_stamp(),
         "status": "registered",
     }
+    if args.store == "restic":
+        # restic register performs the backup now and records the snapshot id
+        # (a registry claim alone is never proof; the backup IS the proof).
+        repo = getattr(args, "restic_repo", "") or ""
+        if not repo:
+            print("register --store restic needs --restic-repo", file=sys.stderr)
+            return 1
+        snapshot_id = getattr(args, "snapshot_id", "") or ""
+        if not snapshot_id:
+            ok, res = restic_backup(path, repo)
+            if not ok:
+                print(f"register: restic backup failed: {res}", file=sys.stderr)
+                return 1
+            snapshot_id = res
+            print(f"restic backup ok: snapshot {snapshot_id[:8]}")
+        entry["restic_repo"] = repo
+        entry["snapshot_id"] = snapshot_id
     if os.path.exists(path) and not args.sha256:
         try:
             entry["sha256"] = sha256_file(path)
@@ -423,11 +447,18 @@ def cmd_register(args):
     reg = load_registry()
     reg["entries"][path] = entry
     save_registry(reg)
-    print(f"Registered: {path} -> {args.store}:{args.repo}@{args.release}")
+    dest = {"github": f"{args.repo}@{args.release}",
+            "terabox": entry["remote_dir"],
+            "kaggle": entry["dataset"],
+            "restic": f"{entry['restic_repo']}#{entry['snapshot_id'][:8]}",
+            }.get(args.store, "")
+    print(f"Registered: {path} -> {args.store}:{dest}")
     audit_log("register", path=path, store=args.store,
               repo=args.repo, release=args.release, asset=args.asset,
               remote_dir=getattr(args, "remote_dir", "") or "",
               dataset=getattr(args, "dataset", "") or "",
+              restic_repo=entry["restic_repo"],
+              snapshot_id=entry["snapshot_id"][:16],
               sha256=entry["sha256"][:16], size=entry["size"])
     return 0
 
@@ -606,7 +637,7 @@ AUDIT_PATH = os.path.join(AGENT_OPS, "cloud-dog-audit.jsonl")
 MIRROR_STAGING = os.path.join(AGENT_OPS, "mirror-staging")
 DAEMON_PIDFILE = os.path.join(AGENT_OPS, "cloud-dog-daemon.pid")
 
-STORES = ("github", "terabox", "kaggle")
+STORES = ("github", "terabox", "kaggle", "restic")
 
 UA_BROWSER = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -708,6 +739,126 @@ def verify_terabox_entry(entry, local_path):
             return True, (f"terabox:{remote_dir}/{asset} verified "
                           f"({e['size']} bytes)")
     return False, f"{asset} not found in terabox:{remote_dir}"
+
+
+# ============================================================ restic backend
+def _restic_binary():
+    """Locate the restic binary (optional dependency)."""
+    found = shutil.which("restic")
+    if found:
+        return found
+    known = os.path.join(WORKSPACE, "tools", "restic", "restic")
+    if os.path.isfile(known) and os.access(known, os.X_OK):
+        return known
+    return None
+
+
+def _restic_env(password=None):
+    """Environment for restic subprocesses.
+
+    The repo password comes from the RESTIC_PASSWORD environment variable
+    (or the password argument). It is passed via the subprocess environment
+    only — never on the command line, never logged.
+    """
+    env = dict(os.environ)
+    pw = password or env.get("RESTIC_PASSWORD", "")
+    if pw:
+        env["RESTIC_PASSWORD"] = pw
+    return env
+
+
+def restic_repo_ready(repo, password=None):
+    """True if restic can open the repo (initialized + password works)."""
+    binary = _restic_binary()
+    if not binary or not repo:
+        return False
+    env = _restic_env(password)
+    if not env.get("RESTIC_PASSWORD"):
+        return False
+    rc, _, _ = run([binary, "-r", repo, "cat", "config"],
+                   timeout=60, env=env)
+    return rc == 0
+
+
+def restic_backup(local_path, repo, password=None):
+    """Back up one file into a restic repository.
+
+    Returns (ok, snapshot_id|detail). ok=True only if `restic backup --json`
+    exits 0 and reports a snapshot_id. The repo is auto-initialized on first
+    use. Password via RESTIC_PASSWORD env var (or the password argument),
+    passed through the subprocess environment — never on the command line.
+    """
+    binary = _restic_binary()
+    if not binary:
+        return False, "restic binary not found (PATH or ~/workspace/tools/restic)"
+    env = _restic_env(password)
+    if not env.get("RESTIC_PASSWORD"):
+        return False, "RESTIC_PASSWORD env var not set (restic repo password)"
+    if not repo:
+        return False, "restic repo required (--restic-repo)"
+    if not os.path.exists(local_path):
+        return False, f"local file missing: {local_path}"
+    if not restic_repo_ready(repo, password):
+        rc, _, err = run([binary, "-r", repo, "init"], timeout=120, env=env)
+        if rc != 0:
+            tail = (err.strip().splitlines() or [f"exit {rc}"])[-1]
+            return False, f"restic init failed: {tail[:200]}"
+    rc, out, err = run([binary, "-r", repo, "backup", "--json", local_path],
+                       timeout=7200, env=env)
+    if rc != 0:
+        tail = (err.strip().splitlines() or [out.strip().splitlines() or
+                f"exit {rc}"][-1])[-1]
+        return False, f"restic backup failed: {tail[:200]}"
+    snapshot_id = ""
+    for line in out.splitlines():
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        if msg.get("message_type") == "summary" and msg.get("snapshot_id"):
+            snapshot_id = msg["snapshot_id"]
+            break
+    if not snapshot_id:
+        return False, "restic backup ran but reported no snapshot_id"
+    return True, snapshot_id
+
+
+def restic_verify(entry, local_path=None):
+    """Verify a registry entry against a restic repository.
+
+    Registry entry needs: restic_repo, snapshot_id. Passes only if the
+    snapshot exists in the repo AND its recorded paths include the file.
+    A registry claim alone is never proof. Password via RESTIC_PASSWORD.
+    """
+    binary = _restic_binary()
+    if not binary:
+        return False, "restic binary not found (PATH or ~/workspace/tools/restic)"
+    repo = entry.get("restic_repo", "")
+    snapshot_id = entry.get("snapshot_id", "")
+    if not repo or not snapshot_id:
+        return False, "restic entry needs restic_repo + snapshot_id"
+    path = local_path or entry.get("local_path", "")
+    env = _restic_env()
+    if not env.get("RESTIC_PASSWORD"):
+        return False, "RESTIC_PASSWORD env var not set (restic repo password)"
+    rc, out, err = run([binary, "-r", repo, "snapshots", "--json"],
+                       timeout=300, env=env)
+    if rc != 0:
+        tail = (err.strip().splitlines() or [f"exit {rc}"])[-1]
+        return False, f"restic snapshots failed: {tail[:200]}"
+    try:
+        snapshots = json.loads(out)
+    except ValueError:
+        return False, "restic snapshots output was not JSON"
+    for snap in snapshots:
+        if snap.get("id") == snapshot_id or snap.get("short_id") == snapshot_id:
+            paths = snap.get("paths") or []
+            if path and path not in paths:
+                return False, (f"snapshot {snapshot_id[:8]} exists but does "
+                               f"not contain {path}")
+            return True, (f"restic:{repo} snapshot {snapshot_id[:8]} verified "
+                          f"({len(paths)} path(s))")
+    return False, f"snapshot {snapshot_id[:8]} not found in restic:{repo}"
 
 
 # ============================================================ v2: kaggle backend
@@ -850,6 +1001,8 @@ def verify_entry(entry, local_path):
         return verify_terabox_entry(entry, local_path)
     if store == "kaggle":
         return verify_kaggle_entry(entry, local_path)
+    if store == "restic":
+        return restic_verify(entry, local_path)
     return False, f"unknown store {store}"
 
 
@@ -1574,7 +1727,7 @@ def main(argv=None):
     p = sub.add_parser("register", help="register a file as verified on a store")
     p.add_argument("--file", required=True)
     p.add_argument("--store", required=True, choices=STORES,
-                   help="github | terabox | kaggle")
+                   help="github | terabox | kaggle | restic")
     p.add_argument("--repo", default="",
                    help="github: OWNER/REPO")
     p.add_argument("--release", default="",
@@ -1585,6 +1738,12 @@ def main(argv=None):
                    help="terabox: remote directory, e.g. /CN-Gigaleak/show")
     p.add_argument("--dataset", default="",
                    help="kaggle: dataset slug as owner/name")
+    p.add_argument("--restic-repo", default="",
+                   help="restic: repository path/URL (password via "
+                        "RESTIC_PASSWORD env var, never on the command line)")
+    p.add_argument("--snapshot-id", default="",
+                   help="restic: record a pre-existing snapshot instead of "
+                        "backing up now")
     p.add_argument("--sha256", default="")
     p.add_argument("--size", type=int, default=0)
     p.add_argument("--note", default="")
