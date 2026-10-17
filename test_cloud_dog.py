@@ -51,14 +51,18 @@ def test_sha256_file():
 
 
 def test_registry_roundtrip(tmp_path=None):
-    # register + load must preserve the entry (uses real registry path;
-    # cleans up after itself)
+    # register + load must preserve the entry (uses real registry paths;
+    # cleans up after itself). Backs up BOTH the legacy JSON and the
+    # sqlite DB so the production registry is never polluted.
     import json
     reg_path = cloud_dog.REGISTRY_PATH
-    backup = None
-    if os.path.exists(reg_path):
-        backup = reg_path + ".test-bak"
-        os.replace(reg_path, backup)
+    db_path = cloud_dog.REGISTRY_DB_PATH
+    backups = []
+    for p in (reg_path, db_path, db_path + "-wal", db_path + "-shm"):
+        if os.path.exists(p):
+            bak = p + ".test-bak"
+            os.replace(p, bak)
+            backups.append((p, bak))
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".dat") as f:
             path = f.name
@@ -76,10 +80,81 @@ def test_registry_roundtrip(tmp_path=None):
         finally:
             os.unlink(path)
     finally:
-        if os.path.exists(reg_path):
-            os.unlink(reg_path)
-        if backup and os.path.exists(backup):
-            os.replace(backup, reg_path)
+        for p in (reg_path, db_path, db_path + "-wal", db_path + "-shm",
+                  db_path + ".test-bak-wal", db_path + ".test-bak-shm"):
+            if os.path.exists(p):
+                os.unlink(p)
+        for p, bak in backups:
+            if os.path.exists(bak):
+                os.replace(bak, p)
+
+
+def test_registry_sqlite_migration():
+    # legacy JSON entries migrate into sqlite exactly once
+    import json
+    db_path = cloud_dog.REGISTRY_DB_PATH
+    reg_path = cloud_dog.REGISTRY_PATH
+    backups = []
+    for p in (reg_path, db_path, db_path + "-wal", db_path + "-shm"):
+        if os.path.exists(p):
+            bak = p + ".test-bak"
+            os.replace(p, bak)
+            backups.append((p, bak))
+    try:
+        legacy = {"version": 1, "entries": {
+            "/tmp/fake-a": {"store": "github", "status": "registered"},
+            "/tmp/fake-b": {"store": "terabox", "status": "reaped"},
+        }}
+        with open(reg_path, "w") as f:
+            json.dump(legacy, f)
+        reg = cloud_dog.load_registry()  # triggers migration
+        assert "/tmp/fake-a" in reg["entries"]
+        assert reg["entries"]["/tmp/fake-b"]["store"] == "terabox"
+        # second load must not duplicate or wipe
+        reg2 = cloud_dog.load_registry()
+        assert len(reg2["entries"]) == 2
+        # sqlite file now exists and holds the rows
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        n = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+        conn.close()
+        assert n == 2
+    finally:
+        for p in (reg_path, db_path, db_path + "-wal", db_path + "-shm"):
+            if os.path.exists(p):
+                os.unlink(p)
+        for p, bak in backups:
+            if os.path.exists(bak):
+                os.replace(bak, p)
+
+
+def test_registry_export_json(tmp_path):
+    # export reproduces the legacy JSON shape from sqlite
+    import json
+    db_path = cloud_dog.REGISTRY_DB_PATH
+    reg_path = cloud_dog.REGISTRY_PATH
+    backups = []
+    for p in (reg_path, db_path, db_path + "-wal", db_path + "-shm"):
+        if os.path.exists(p):
+            bak = p + ".test-bak"
+            os.replace(p, bak)
+            backups.append((p, bak))
+    try:
+        cloud_dog.save_registry({"version": 3, "entries": {
+            "/tmp/x": {"store": "github", "status": "registered"}}})
+        dest = str(tmp_path / "export.json")
+        out = cloud_dog.registry_export_json(dest)
+        assert out == dest
+        with open(dest) as f:
+            data = json.load(f)
+        assert "/tmp/x" in data["entries"]
+    finally:
+        for p in (reg_path, db_path, db_path + "-wal", db_path + "-shm"):
+            if os.path.exists(p):
+                os.unlink(p)
+        for p, bak in backups:
+            if os.path.exists(bak):
+                os.replace(bak, p)
 
 
 if __name__ == "__main__":
