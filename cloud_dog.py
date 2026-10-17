@@ -132,6 +132,32 @@ def sha256_file(path, chunk=1 << 20):
     return h.hexdigest()
 
 
+def _b3sum_bin():
+    """Path to the bundled b3sum binary, or None."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    cand = os.path.join(here, "tools", "bin", "b3sum")
+    return cand if os.path.isfile(cand) and os.access(cand, os.X_OK) else None
+
+
+def fast_hash_file(path):
+    """Fast BLAKE3 hash via bundled b3sum binary, else SHA-256 fallback.
+
+    For INTERNAL comparisons only (not store digests) — the digest only
+    needs to match between the two files being compared. GitHub release
+    assets always use SHA-256; use sha256_file() for those.
+    """
+    b3 = _b3sum_bin()
+    if b3:
+        try:
+            out = subprocess.run([b3, str(path)], capture_output=True,
+                                 text=True, timeout=300)
+            if out.returncode == 0:
+                return out.stdout.split()[0]
+        except (subprocess.SubprocessError, OSError):
+            pass
+    return sha256_file(path)
+
+
 def is_sacred(path):
     ap = os.path.abspath(path)
     if "agent-ops/checkpoints" in ap or ("agent-ops" + os.sep + "checkpoints") in ap:
@@ -917,12 +943,26 @@ def kaggle_request(method, path, data=None, headers=None, timeout=120):
 
 
 def kaggle_dataset_view(owner_slug):
-    """GET /datasets/view/{owner}/{slug}. Returns (ok, payload|detail)."""
+    """GET /datasets/view/{owner}/{slug}. Returns (ok, payload|detail).
+
+    NOTE: the view endpoint returns dataset metadata but NOT the file list
+    (its `files` array is always empty). Use kaggle_dataset_list_files()
+    when you need the actual files.
+    """
     return kaggle_request("GET", f"/datasets/view/{owner_slug}")
 
 
+def kaggle_dataset_list_files(owner_slug):
+    """GET /datasets/list/{owner}/{slug}. Returns (ok, payload|detail).
+
+    payload["datasetFiles"] is the list of files, each with `name` and
+    `totalBytes`. This is the endpoint the verify path must use.
+    """
+    return kaggle_request("GET", f"/datasets/list/{owner_slug}")
+
+
 def verify_kaggle_entry(entry, local_path):
-    """Verify a registry entry against a Kaggle dataset (live view + size).
+    """Verify a registry entry against a Kaggle dataset (live file list + size).
 
     Registry entry needs: dataset ("owner/slug"), asset (filename).
     """
@@ -930,16 +970,15 @@ def verify_kaggle_entry(entry, local_path):
     asset = entry.get("asset", "")
     if not dataset or not asset:
         return False, "kaggle entry needs dataset (owner/slug) + asset (filename)"
-    ok, payload = kaggle_dataset_view(dataset)
+    ok, payload = kaggle_dataset_list_files(dataset)
     if not ok:
         return False, payload
-    files = payload.get("files", []) if isinstance(payload, dict) else []
+    files = payload.get("datasetFiles", []) if isinstance(payload, dict) else []
     for f in files:
-        name = f.get("name") or os.path.basename(f.get("ref", ""))
-        ref = f.get("ref", "")
-        if name == asset or ref.endswith("/" + asset):
+        name = f.get("name", "")
+        if name == asset or name.endswith("/" + asset):
             want = entry.get("size", 0)
-            got = int(f.get("totalBytes") or f.get("size") or 0)
+            got = int(f.get("totalBytes") or 0)
             if want and got and got != want:
                 return False, f"size mismatch: remote={got} local={want}"
             return True, f"kaggle:{dataset} file {asset} verified ({got} bytes)"
@@ -970,22 +1009,47 @@ def multipart_encode(fields, files):
 
 def kaggle_dataset_upload_new(owner, slug, title, zip_path,
                               license_name="CC0-1.0"):
-    """Create a NEW Kaggle dataset from a local zip via the v1 REST API.
+    """Create a NEW Kaggle dataset from a local file via the official kaggle CLI.
 
-    Returns (ok, detail). Creates a public dataset under `owner`.
+    The previous hand-rolled multipart POST to /datasets/create/new was
+    broken: the endpoint expects a JSON body with pre-uploaded blob tokens,
+    not a raw file (it 400s with "Error reading JToken"). The official CLI
+    implements the real resumable-upload flow, so we shell out to it —
+    same pattern as the github backend shelling out to `gh`.
+
+    Returns (ok, detail). Creates a dataset under `owner` (private by
+    default). Requires the `kaggle` CLI on PATH (pip install kaggle) and
+    ~/.kaggle/kaggle.json credentials.
     """
+    import tempfile
+    kaggle_bin = shutil.which("kaggle")
+    if not kaggle_bin:
+        fallback = os.path.expanduser("~/.local/bin/kaggle")
+        if os.path.isfile(fallback):
+            kaggle_bin = fallback
+    if not kaggle_bin:
+        return False, "kaggle CLI not found (pip install kaggle)"
+    if not (6 <= len(slug) <= 50):
+        return False, f"kaggle slug must be 6-50 chars (got {len(slug)})"
+    if not (6 <= len(title) <= 50):
+        return False, f"kaggle title must be 6-50 chars (got {len(title)})"
+    if not os.path.isfile(zip_path):
+        return False, f"upload file not found: {zip_path}"
+    d = tempfile.mkdtemp(prefix="kaggle-upload-")
     try:
-        with open(zip_path, "rb") as f:
-            zdata = f.read()
-    except OSError as e:
-        return False, f"cannot read zip: {e}"
-    fields = {"title": title, "slug": slug, "licenseName": license_name,
-              "isPrivate": "false"}
-    body, ctype = multipart_encode(
-        fields,
-        {"file": (os.path.basename(zip_path), zdata, "application/zip")})
-    return kaggle_request("POST", "/datasets/create/new", data=body,
-                          headers={"Content-Type": ctype}, timeout=3600)
+        meta = {"id": f"{owner}/{slug}", "title": title,
+                "licenses": [{"name": license_name}]}
+        with open(os.path.join(d, "dataset-metadata.json"), "w") as f:
+            json.dump(meta, f)
+        shutil.copy(zip_path, os.path.join(d, os.path.basename(zip_path)))
+        rc, out, err = run([kaggle_bin, "datasets", "create", "-p", d],
+                           timeout=3600)
+        if rc != 0:
+            tail = (err.strip().splitlines() or [f"exit {rc}"])[-1]
+            return False, f"kaggle datasets create failed: {tail[:200]}"
+        return True, f"kaggle dataset {owner}/{slug} created"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 # ============================================================ v2: store dispatch
@@ -1416,6 +1480,125 @@ def cmd_mirror(args):
     return 0
 
 
+# ============================================================ mirror-search: Internet Archive link finder
+IA_SEARCH_URL = "https://archive.org/advancedsearch.php"
+IA_METADATA_URL = "https://archive.org/metadata"
+IA_DOWNLOAD_BASE = "https://archive.org/download"
+IA_USER_AGENT = ("CloudDog/1.0 (mirror-search; "
+                 "+https://github.com/mhvnsnt/CloudDog-Muse-Storage-Disc-Assistant)")
+
+
+def ia_search(query, rows=10, timeout=60):
+    """Search the Internet Archive (public advancedsearch API, no key needed).
+
+    Returns (ok, docs|detail). docs: [{identifier, title, mediatype}, ...].
+    """
+    import urllib.request
+    import urllib.error
+    import urllib.parse
+    params = [("q", query),
+              ("fl[]", "identifier"), ("fl[]", "title"), ("fl[]", "mediatype"),
+              ("rows", str(max(1, rows))),
+              ("output", "json")]
+    url = IA_SEARCH_URL + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"User-Agent": IA_USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return False, f"IA search HTTP {e.code}"
+    except Exception as e:
+        return False, f"IA search error: {e}"
+    try:
+        docs = data["response"]["docs"]
+    except (KeyError, TypeError):
+        return False, "IA search returned unexpected JSON"
+    return True, docs
+
+
+def ia_item_files(identifier, timeout=60):
+    """Fetch an item's file list via the public IA metadata API.
+
+    Returns (ok, files|detail). files: [{name, size, ...}, ...].
+    """
+    import urllib.request
+    import urllib.error
+    import urllib.parse
+    url = f"{IA_METADATA_URL}/{urllib.parse.quote(identifier, safe='')}"
+    req = urllib.request.Request(url, headers={"User-Agent": IA_USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return False, f"IA metadata HTTP {e.code} for {identifier}"
+    except Exception as e:
+        return False, f"IA metadata error for {identifier}: {e}"
+    files = data.get("files")
+    if not isinstance(files, list):
+        return False, f"IA metadata has no file list for {identifier}"
+    return True, files
+
+
+def ia_download_url(identifier, filename):
+    """Direct download URL for one item file (no API key needed)."""
+    import urllib.parse
+    return (f"{IA_DOWNLOAD_BASE}/{urllib.parse.quote(identifier, safe='')}"
+            f"/{urllib.parse.quote(filename, safe='/')}")
+
+
+def cmd_mirror_search(args):
+    """Find mirror links on the Internet Archive for QUERY.
+
+    Prints each matching item's title, identifier, and direct download URLs
+    (https://archive.org/download/<id>/<file>). Pure stdlib, IA only —
+    no pirate-site scrapers.
+    """
+    limit = max(1, getattr(args, "limit", 10) or 10)
+    as_json = getattr(args, "json", False)
+    ok, docs = ia_search(args.query, rows=limit)
+    if not ok:
+        print(f"mirror-search: {docs}", file=sys.stderr)
+        return 1
+    results = []
+    for doc in docs:
+        ident = doc.get("identifier") or ""
+        title = doc.get("title") or ""
+        if isinstance(title, list):
+            title = "; ".join(str(t) for t in title)
+        entry = {"identifier": ident, "title": title, "downloads": []}
+        if ident:
+            ok2, files = ia_item_files(ident)
+            if not ok2:
+                entry["error"] = files
+            else:
+                for f in files:
+                    name = f.get("name") or ""
+                    if not name:
+                        continue
+                    size = f.get("size")
+                    try:
+                        size = int(size) if size is not None else 0
+                    except (TypeError, ValueError):
+                        size = 0
+                    entry["downloads"].append({
+                        "file": name,
+                        "size": size,
+                        "url": ia_download_url(ident, name),
+                    })
+        results.append(entry)
+    if as_json:
+        print(json.dumps(results, indent=2))
+    else:
+        for e in results:
+            print(f"= {e['title'] or '(no title)'}")
+            print(f"  identifier: {e['identifier']}")
+            if e.get("error"):
+                print(f"  file list unavailable: {e['error']}")
+            for dl in e["downloads"]:
+                print(f"  - {dl['url']} ({human(dl['size'])})")
+    return 0
+
+
 # ============================================================ v2: daemon command
 def cmd_daemon(args):
     """Run the enforce loop continuously (guardian cadence without cron).
@@ -1800,6 +1983,15 @@ def main(argv=None):
     p.add_argument("--poll-secs", type=int, default=60,
                    help="torbox completion poll interval")
 
+    p = sub.add_parser("mirror-search",
+                       help="find mirror links on the Internet Archive")
+    p.add_argument("query",
+                   help="IA advancedsearch query, e.g. 'shakespeare'")
+    p.add_argument("--limit", type=int, default=10,
+                   help="max items to list (default 10)")
+    p.add_argument("--json", action="store_true",
+                   help="machine-readable output")
+
     p = sub.add_parser("daemon",
                        help="run the enforce loop continuously")
     p.add_argument("--interval", type=int, default=600,
@@ -1823,6 +2015,8 @@ def main(argv=None):
             return cmd_dedup(args)
         elif args.cmd == "mirror":
             return cmd_mirror(args)
+        elif args.cmd == "mirror-search":
+            return cmd_mirror_search(args)
         elif args.cmd == "daemon":
             return cmd_daemon(args)
         elif args.cmd == "enforce":

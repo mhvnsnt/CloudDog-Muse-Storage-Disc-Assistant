@@ -305,11 +305,11 @@ def test_kaggle_request_sends_basic_auth():
 
 
 def test_verify_kaggle_entry_found_and_sized():
-    def fake_view(owner_slug):
-        return True, {"files": [
-            {"ref": "u/ds/a.bin", "name": "a.bin", "totalBytes": 500},
+    def fake_list(owner_slug):
+        return True, {"datasetFiles": [
+            {"name": "a.bin", "totalBytes": 500},
         ]}
-    old = _patch(cloud_dog, "kaggle_dataset_view", fake_view)
+    old = _patch(cloud_dog, "kaggle_dataset_list_files", fake_list)
     try:
         e = {"dataset": "u/ds", "asset": "a.bin", "size": 500}
         ok, detail = cloud_dog.verify_kaggle_entry(e, "/tmp/a.bin")
@@ -321,7 +321,67 @@ def test_verify_kaggle_entry_found_and_sized():
         ok, detail = cloud_dog.verify_kaggle_entry(e3, "/tmp/a.bin")
         assert ok is False and "not found" in detail
     finally:
-        _patch(cloud_dog, "kaggle_dataset_view", old)
+        _patch(cloud_dog, "kaggle_dataset_list_files", old)
+
+
+def test_verify_kaggle_entry_live_readonly():
+    """Live read-only check against a real dataset (no writes)."""
+    e = {"dataset": "marsfmmg/cj-living-room-setup",
+         "asset": "dvd_stack_ref.png", "size": 4848}
+    ok, detail = cloud_dog.verify_kaggle_entry(e, "/tmp/dvd_stack_ref.png")
+    assert ok is True and "verified" in detail, detail
+    e2 = {"dataset": "marsfmmg/cj-living-room-setup",
+          "asset": "does-not-exist.bin"}
+    ok, detail = cloud_dog.verify_kaggle_entry(e2, "/tmp/x.bin")
+    assert ok is False and "not found" in detail
+
+
+def test_kaggle_dataset_upload_new_no_cli():
+    old_which = _patch(cloud_dog.shutil, "which", lambda *a, **k: None)
+    old_isfile = _patch(cloud_dog.os.path, "isfile", lambda p: False)
+    try:
+        ok, detail = cloud_dog.kaggle_dataset_upload_new(
+            "u", "someslug", "Some Title", "/tmp/x.zip")
+        assert ok is False and "kaggle CLI not found" in detail
+    finally:
+        _patch(cloud_dog.shutil, "which", old_which)
+        _patch(cloud_dog.os.path, "isfile", old_isfile)
+
+
+def test_kaggle_dataset_upload_new_validates():
+    old = _patch(cloud_dog.shutil, "which", lambda *a, **k: "/usr/bin/kaggle")
+    try:
+        ok, detail = cloud_dog.kaggle_dataset_upload_new(
+            "u", "abc", "Some Title", "/tmp/x.zip")
+        assert ok is False and "6-50 chars" in detail
+        ok, detail = cloud_dog.kaggle_dataset_upload_new(
+            "u", "validslug", "x", "/tmp/x.zip")
+        assert ok is False and "6-50 chars" in detail
+        ok, detail = cloud_dog.kaggle_dataset_upload_new(
+            "u", "validslug", "Valid Title", "/tmp/does-not-exist.zip")
+        assert ok is False and "not found" in detail
+    finally:
+        _patch(cloud_dog.shutil, "which", old)
+
+
+def test_kaggle_dataset_upload_new_cli_success():
+    import tempfile
+    old_which = _patch(cloud_dog.shutil, "which", lambda *a, **k: "/usr/bin/kaggle")
+    old_run = _patch(cloud_dog, "run",
+                     lambda cmd, timeout=60: (0, "Dataset URL: ...", ""))
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as f:
+            f.write(b"PK fake")
+            zp = f.name
+        try:
+            ok, detail = cloud_dog.kaggle_dataset_upload_new(
+                "marsfmmg", "testslug123", "Test Title Here", zp)
+            assert ok is True and "marsfmmg/testslug123" in detail
+        finally:
+            os.unlink(zp)
+    finally:
+        _patch(cloud_dog.shutil, "which", old_which)
+        _patch(cloud_dog, "run", old_run)
 
 
 def test_verify_entry_dispatches_on_store():
@@ -1019,3 +1079,187 @@ def test_register_restic_records_snapshot():
             os.unlink(reg_path)
         if backup and os.path.exists(backup):
             os.replace(backup, reg_path)
+# ------------------------------------------------- mirror-search (IA) tests
+def _fake_ia_urlopen_factory(payload_bytes=None, http_code=None):
+    import urllib.request
+    import urllib.error
+    import json as _json
+
+    class FakeResp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return payload_bytes
+
+    def fake_urlopen(req, timeout=60):
+        if http_code is not None:
+            raise urllib.error.HTTPError(req.full_url, http_code, "err",
+                                         {}, None)
+        return FakeResp()
+    return fake_urlopen
+
+
+def test_ia_download_url_quoting():
+    u = cloud_dog.ia_download_url("some-id", "dir/my file (1).txt")
+    assert u == ("https://archive.org/download/some-id/"
+                 "dir/my%20file%20%281%29.txt"), u
+    u2 = cloud_dog.ia_download_url("some-id", "plain.bin")
+    assert u2 == "https://archive.org/download/some-id/plain.bin"
+
+
+def test_ia_search_parses_docs():
+    import urllib.request
+    import json as _json
+    payload = _json.dumps({
+        "response": {"numFound": 2, "docs": [
+            {"identifier": "abc123", "title": "Test Title"},
+            {"identifier": "def456", "title": ["Multi", "Title"]},
+        ]}}).encode()
+    old = _patch(urllib.request, "urlopen",
+                 _fake_ia_urlopen_factory(payload))
+    try:
+        ok, docs = cloud_dog.ia_search("whatever", rows=2)
+    finally:
+        _patch(urllib.request, "urlopen", old)
+    assert ok is True
+    assert [d["identifier"] for d in docs] == ["abc123", "def456"]
+
+
+def test_ia_search_http_error():
+    import urllib.request
+    old = _patch(urllib.request, "urlopen",
+                 _fake_ia_urlopen_factory(http_code=503))
+    try:
+        ok, detail = cloud_dog.ia_search("whatever")
+    finally:
+        _patch(urllib.request, "urlopen", old)
+    assert ok is False
+    assert "503" in detail
+
+
+def test_ia_search_bad_json_shape():
+    import urllib.request
+    import json as _json
+    payload = _json.dumps({"unexpected": True}).encode()
+    old = _patch(urllib.request, "urlopen",
+                 _fake_ia_urlopen_factory(payload))
+    try:
+        ok, detail = cloud_dog.ia_search("whatever")
+    finally:
+        _patch(urllib.request, "urlopen", old)
+    assert ok is False
+    assert "unexpected JSON" in detail
+
+
+def test_ia_item_files_parses():
+    import urllib.request
+    import json as _json
+    payload = _json.dumps({
+        "metadata": {"identifier": "abc123", "title": "T"},
+        "files": [{"name": "a.bin", "size": "100"},
+                  {"name": "b.bin", "size": 200}]}).encode()
+    old = _patch(urllib.request, "urlopen",
+                 _fake_ia_urlopen_factory(payload))
+    try:
+        ok, files = cloud_dog.ia_item_files("abc123")
+    finally:
+        _patch(urllib.request, "urlopen", old)
+    assert ok is True
+    assert [f["name"] for f in files] == ["a.bin", "b.bin"]
+
+
+def test_ia_item_files_no_file_list():
+    import urllib.request
+    import json as _json
+    payload = _json.dumps({"metadata": {}}).encode()
+    old = _patch(urllib.request, "urlopen",
+                 _fake_ia_urlopen_factory(payload))
+    try:
+        ok, detail = cloud_dog.ia_item_files("abc123")
+    finally:
+        _patch(urllib.request, "urlopen", old)
+    assert ok is False
+    assert "no file list" in detail
+
+
+def test_cmd_mirror_search_json_output():
+    import io, contextlib
+    import json as _json
+    o1 = _patch(cloud_dog, "ia_search",
+                lambda q, rows=10, timeout=60: (True, [
+                    {"identifier": "abc123", "title": "Test Title"}]))
+    o2 = _patch(cloud_dog, "ia_item_files",
+                lambda ident, timeout=60: (True, [
+                    {"name": "a.bin", "size": "100"}]))
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cloud_dog.cmd_mirror_search(
+                type("A", (), {"query": "x", "limit": 5, "json": True})())
+        data = _json.loads(buf.getvalue())
+    finally:
+        _patch(cloud_dog, "ia_search", o1)
+        _patch(cloud_dog, "ia_item_files", o2)
+    assert rc == 0
+    assert len(data) == 1
+    assert data[0]["identifier"] == "abc123"
+    assert data[0]["title"] == "Test Title"
+    dl = data[0]["downloads"][0]
+    assert dl["url"] == "https://archive.org/download/abc123/a.bin"
+    assert dl["size"] == 100
+
+
+def test_cmd_mirror_search_metadata_failure_keeps_going():
+    import io, contextlib
+    o1 = _patch(cloud_dog, "ia_search",
+                lambda q, rows=10, timeout=60: (True, [
+                    {"identifier": "bad1", "title": "Bad"},
+                    {"identifier": "good2", "title": "Good"}]))
+    def fake_files(ident, timeout=60):
+        if ident == "bad1":
+            return False, "IA metadata HTTP 404 for bad1"
+        return True, [{"name": "g.bin", "size": 1}]
+    o2 = _patch(cloud_dog, "ia_item_files", fake_files)
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cloud_dog.cmd_mirror_search(
+                type("A", (), {"query": "x", "limit": 5, "json": False})())
+        out = buf.getvalue()
+    finally:
+        _patch(cloud_dog, "ia_search", o1)
+        _patch(cloud_dog, "ia_item_files", o2)
+    assert rc == 0
+    assert "file list unavailable" in out
+    assert "https://archive.org/download/good2/g.bin" in out
+
+
+def test_cmd_mirror_search_search_failure():
+    import io, contextlib
+    o1 = _patch(cloud_dog, "ia_search",
+                lambda q, rows=10, timeout=60: (False, "IA search HTTP 503"))
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            rc = cloud_dog.cmd_mirror_search(
+                type("A", (), {"query": "x", "limit": 5, "json": False})())
+    finally:
+        _patch(cloud_dog, "ia_search", o1)
+    assert rc == 1
+
+
+def test_cmd_mirror_search_live():
+    """LIVE test: real Internet Archive API, public-domain query."""
+    import io, contextlib
+    import json as _json
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cloud_dog.cmd_mirror_search(
+            type("A", (), {"query": "shakespeare", "limit": 1,
+                            "json": True})())
+    assert rc == 0, "live IA search failed"
+    data = _json.loads(buf.getvalue())
+    assert len(data) >= 1
+    assert data[0]["identifier"], "no identifier returned"
+    assert len(data[0]["downloads"]) >= 1, "no download URLs returned"
+    assert data[0]["downloads"][0]["url"].startswith(
+        "https://archive.org/download/"), data[0]["downloads"][0]["url"]
