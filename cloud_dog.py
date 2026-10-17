@@ -144,6 +144,89 @@ def _b3sum_bin():
     return cand if os.path.isfile(cand) and os.access(cand, os.X_OK) else None
 
 
+def _aria2_bin():
+    """Locate the aria2c binary (optional dependency for direct torrents)."""
+    # Wrapper script sets LD_LIBRARY_PATH for the Debian-extracted binary
+    wrapper = os.path.join(WORKSPACE, "tools", "aria2", "aria2c")
+    if os.path.isfile(wrapper) and os.access(wrapper, os.X_OK):
+        return wrapper
+    found = shutil.which("aria2c")
+    if found:
+        return found
+    return None
+
+
+def aria2_download(magnet, dest_dir, timeout=12 * 3600):
+    """Download a magnet/torrent via aria2c into dest_dir.
+
+    Returns (ok, files_or_error). files is a list of absolute paths to
+    downloaded files. Uses the wrapper script which sets LD_LIBRARY_PATH.
+    """
+    binary = _aria2_bin()
+    if not binary:
+        return False, "aria2c not found (~/workspace/tools/aria2/aria2c)"
+    os.makedirs(dest_dir, exist_ok=True)
+    cmd = [binary, "--dir", dest_dir, "--seed-time", "0",
+           "--max-connection-per-server", "16",
+           "--min-split-size", "1M",
+           magnet]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, f"aria2c timed out after {timeout}s"
+    except Exception as e:
+        return False, f"aria2c failed: {e}"
+    if proc.returncode != 0:
+        return False, f"aria2c exit {proc.returncode}: {proc.stderr.strip()[:300]}"
+    files = []
+    for root, _, fns in os.walk(dest_dir):
+        for fn in fns:
+            if fn.endswith(".aria2"):
+                continue
+            fp = os.path.join(root, fn)
+            if os.path.isfile(fp):
+                files.append(fp)
+    if not files:
+        return False, "aria2c completed but no files found"
+    return True, sorted(files)
+
+
+def stream_file_to_parts(path, staging_dir, part_bytes, chunk=8 << 20,
+                         hasher_factory=None):
+    """Split a local file into rolling part files on disk.
+
+    Yields (index, part_path, size, hexdigest) as each part fills. Same
+    contract as stream_url_to_parts but reads from a local file instead
+    of a URL. Caller uploads+verifies+deletes each part (delete-as-you-go).
+    """
+    import hashlib
+    os.makedirs(staging_dir, exist_ok=True)
+    idx = 0
+    with open(path, "rb") as src:
+        while True:
+            part_path = os.path.join(staging_dir, f"mirror-part-{idx:04d}.bin")
+            hasher = (hasher_factory() if hasher_factory
+                      else hashlib.sha256())
+            written = 0
+            with open(part_path, "wb") as pf:
+                while written < part_bytes:
+                    blk = src.read(min(chunk, part_bytes - written))
+                    if not blk:
+                        break
+                    pf.write(blk)
+                    hasher.update(blk)
+                    written += len(blk)
+            if written == 0:
+                try:
+                    os.unlink(part_path)
+                except OSError:
+                    pass
+                break
+            yield idx, part_path, written, hasher.hexdigest()
+            idx += 1
+
+
 def _blake3_available():
     """True when the optional blake3 pip package is importable."""
     try:
@@ -1578,7 +1661,28 @@ def cmd_mirror(args):
         return 1
 
     # 1. torrent source
-    if args.magnet:
+    via = getattr(args, "via", "torbox")
+    aria2_files = None
+    if via == "aria2":
+        if not args.magnet:
+            return fail("--via aria2 needs --magnet (torrent-id is torbox-only)")
+        print("aria2: downloading torrent directly...")
+        dl_dir = os.path.join(staging, "aria2-dl")
+        ok, res = aria2_download(args.magnet, dl_dir)
+        if not ok:
+            return fail(res)
+        aria2_files = res
+        manifest["source"] = {"kind": "magnet", "via": "aria2",
+                              "files": len(aria2_files)}
+        print(f"aria2: {len(aria2_files)} file(s) downloaded")
+        files = [{"name": os.path.basename(p), "path": p,
+                  "size": os.path.getsize(p)} for p in aria2_files]
+        if args.file:
+            files = [f for f in files
+                     if args.file.lower() in f["name"].lower()]
+            if not files:
+                return fail(f"no torrent file matches --file={args.file!r}")
+    elif args.magnet:
         ok, res = torbox_add_magnet(args.magnet)
         if not ok:
             return fail(res)
@@ -1592,18 +1696,19 @@ def cmd_mirror(args):
     else:
         return fail("need --magnet or --torrent-id")
 
-    # 2. wait for cloud download
-    print("torbox: waiting for cloud download to complete...")
-    ok, info = torbox_wait_complete(torrent_id, poll_secs=args.poll_secs)
-    if not ok:
-        return fail(info)
-    files = info.get("files") or []
-    if args.file:
-        files = [f for f in files
-                 if args.file.lower() in str(f.get("name", "")).lower()]
-        if not files:
-            return fail(f"no torrent file matches --file={args.file!r}")
-    print(f"torbox: {len(files)} file(s) ready")
+    # 2. wait for cloud download (torbox only; aria2 already downloaded)
+    if via == "torbox":
+        print("torbox: waiting for cloud download to complete...")
+        ok, info = torbox_wait_complete(torrent_id, poll_secs=args.poll_secs)
+        if not ok:
+            return fail(info)
+        files = info.get("files") or []
+        if args.file:
+            files = [f for f in files
+                     if args.file.lower() in str(f.get("name", "")).lower()]
+            if not files:
+                return fail(f"no torrent file matches --file={args.file!r}")
+        print(f"torbox: {len(files)} file(s) ready")
 
     # 3. store destination config
     if store == "github":
@@ -1627,19 +1732,28 @@ def cmd_mirror(args):
     try:
         for fi, f in enumerate(files):
             fname = str(f.get("name", f"file-{fi}"))
-            fid = str(f.get("id", ""))
             fsize = int(f.get("size") or 0)
-            ok, link = torbox_requestdl(torrent_id, fid)
-            if not ok:
-                print(f"  SKIP {fname}: {link}")
-                audit_log("mirror_file_skip", run_id=run_id, file=fname,
-                          detail=str(link)[:200])
-                continue
+            # Choose the part stream source: local file (aria2) or URL (torbox)
+            if via == "aria2":
+                local_path = f.get("path")
+                if not local_path or not os.path.isfile(local_path):
+                    print(f"  SKIP {fname}: local file missing")
+                    continue
+                part_iter = stream_file_to_parts(local_path, staging,
+                                                 part_bytes)
+            else:
+                fid = str(f.get("id", ""))
+                ok, link = torbox_requestdl(torrent_id, fid)
+                if not ok:
+                    print(f"  SKIP {fname}: {link}")
+                    audit_log("mirror_file_skip", run_id=run_id, file=fname,
+                              detail=str(link)[:200])
+                    continue
+                part_iter = stream_url_to_parts(link, staging, part_bytes)
             print(f"[{fi + 1}/{len(files)}] {fname} ({human(fsize)})")
             fentry = {"name": fname, "size": fsize, "parts": []}
             base = os.path.splitext(os.path.basename(fname))[0][:60] or "mirror"
-            for pidx, ppath, psize, phash in stream_url_to_parts(
-                    link, staging, part_bytes):
+            for pidx, ppath, psize, phash in part_iter:
                 asset = f"{base}.part-{pidx:04d}"
                 if store == "github":
                     ok, detail = upload_to_store(
@@ -2238,9 +2352,11 @@ def main(argv=None):
                        help="torrent -> cloud store, bounded local footprint")
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--magnet", default="",
-                     help="magnet URI to fetch via TorBox cloud")
+                     help="magnet URI to fetch (via TorBox cloud or aria2)")
     src.add_argument("--torrent-id", default="",
-                     help="existing TorBox torrent id")
+                     help="existing TorBox torrent id (torbox only)")
+    p.add_argument("--via", default="torbox", choices=["torbox", "aria2"],
+                   help="torrent transport: torbox (cloud) or aria2 (direct)")
     p.add_argument("--store", required=True, choices=STORES,
                    help="destination store")
     p.add_argument("--repo", default="", help="github: OWNER/REPO")

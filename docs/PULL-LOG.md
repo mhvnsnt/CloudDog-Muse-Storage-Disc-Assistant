@@ -433,3 +433,15 @@ order, each gets its own researched, tested patch.
   dependency — heavy to build, heavy to test, ~0 payoff for v1/v2 scope.
   Revisit only if a torrent-based *acquisition* lane (PULL-STRAIGHT-TO-STORE
   for the gaps-first pulls) ever becomes a real requirement.
+
+### aria2 — WIRED (2026-10-17)
+- URL: https://aria2.github.io/ — License: **GPL-2.0-or-later** (verified via
+  Debian manpage). Installed from official Debian debs (aria2 1.35.0 +
+  libaria2-0 + libssh2-1 + libc-ares2) to ~/workspace/tools/aria2/ with a
+  wrapper script handling LD_LIBRARY_PATH.
+- Wired as an alternative torrent transport in `mirror --via aria2`: downloads
+  magnets directly (no TorBox cloud needed), then feeds local files through
+  the existing part-upload-verify-delete pipeline via new
+  `stream_file_to_parts()`. This is the TorBox replacement path.
+- 3 new tests (binary probe, file part splitting with reassembly check,
+  missing-binary error).

@@ -1488,3 +1488,50 @@ def test_cmd_agent_audit_json(tmp_path, capsys):
         for p, bak in backups:
             if os.path.exists(bak):
                 os.replace(bak, p)
+
+
+# --------------------------------------------------- aria2 mirror tests
+def test_aria2_bin_finds_wrapper():
+    # The wrapper script should exist from the Debian-extracted install
+    result = cloud_dog._aria2_bin()
+    # Either the wrapper or a system aria2c; None is also acceptable (optional dep)
+    assert result is None or os.path.isfile(result)
+
+
+def test_stream_file_to_parts_splits_correctly():
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as f:
+        # 2.5 parts worth of data (part=1MB)
+        f.write(b"X" * (2 * 1024 * 1024 + 512 * 1024))
+        src = f.name
+    staging = tempfile.mkdtemp(prefix="cdparts-",
+                               dir=os.path.expanduser("~/workspace"))
+    try:
+        parts = list(cloud_dog.stream_file_to_parts(src, staging, 1024 * 1024))
+        assert len(parts) == 3, f"expected 3 parts, got {len(parts)}"
+        assert parts[0][2] == 1024 * 1024  # size
+        assert parts[1][2] == 1024 * 1024
+        assert parts[2][2] == 512 * 1024
+        # hashes are sha256 hex
+        assert len(parts[0][3]) == 64
+        # reassemble and verify
+        reassembled = b""
+        for _, ppath, _, _ in parts:
+            with open(ppath, "rb") as pf:
+                reassembled += pf.read()
+        with open(src, "rb") as sf:
+            assert reassembled == sf.read()
+    finally:
+        import shutil
+        os.unlink(src)
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def test_aria2_download_missing_binary_errors():
+    old = _patch(cloud_dog, "_aria2_bin", lambda: None)
+    try:
+        ok, err = cloud_dog.aria2_download("magnet:?xt=test", "/tmp/nope")
+        assert not ok
+        assert "aria2c not found" in err
+    finally:
+        _patch(cloud_dog, "_aria2_bin", old)
