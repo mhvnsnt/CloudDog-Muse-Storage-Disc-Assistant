@@ -353,6 +353,14 @@ order, each gets its own researched, tested patch.
 - Wire plan (v2 patch): optional dependency, `shutil.which("dust")` probe,
   parse `-j` JSON into `Candidate` objects, tests with a fake `dust`
   executable on PATH. Not wired in v1 — no stacking untested work.
+- **WIRED 2026-10-17** (PR #12): `cloud_dog.py::cmd_scan` now tries
+  `dust -j` first (`_dust_largest`, probes PATH then
+  `~/workspace/tools/dust/dust`), falling back to the stdlib walker when
+  the binary is absent or its output won't parse. 5 new tests (fake-dust
+  executable, bad-JSON fallback, scan integration, stdlib fallback).
+  Live: 22.7s vs ~75s+ for the walker on ~/workspace. Wired into the root
+  engine (the path the guardian cron runs); v3's src/ layout can carry it
+  over.
 
 ### fclones — CANDIDATE (v2, not wired)
 - URL: https://github.com/pkolaczk/fclones — License: **MIT**
