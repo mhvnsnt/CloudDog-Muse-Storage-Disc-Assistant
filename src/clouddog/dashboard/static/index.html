@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CloudDog Dashboard</title>
+<style>
+  :root { color-scheme: dark; }
+  body { background:#0d1117; color:#e6edf3; font-family:system-ui,-apple-system,sans-serif; margin:0; padding:0 16px 64px; }
+  header.top { position:sticky; top:0; background:#0d1117; border-bottom:1px solid #30363d; padding:12px 0; z-index:10; }
+  header.top h1 { margin:0 0 8px; font-size:20px; }
+  .meter { height:18px; background:#21262d; border-radius:9px; overflow:hidden; }
+  .meter > div { height:100%; background:linear-gradient(90deg,#1f6feb,#58a6ff); width:0%; transition:width .5s; }
+  .meter.warn > div { background:linear-gradient(90deg,#9e6a03,#d29922); }
+  .meter.crit > div { background:linear-gradient(90deg,#a40e26,#f85149); }
+  .meter-label { font-size:12px; color:#8b949e; margin-top:4px; }
+  main { max-width:1100px; margin:0 auto; }
+  section.panel { border:1px solid #30363d; border-radius:8px; padding:16px; margin:16px 0; background:#161b22; }
+  section.panel h2 { margin:0 0 12px; font-size:16px; }
+  section.panel .sub { font-size:12px; color:#8b949e; margin:-8px 0 12px; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid #21262d; vertical-align:top; }
+  th { color:#8b949e; font-weight:600; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  code, pre { font-family:ui-monospace,monospace; }
+  pre.out { background:#0d1117; border:1px solid #30363d; border-radius:6px; padding:10px; max-height:320px; overflow:auto; white-space:pre-wrap; word-break:break-word; font-size:12px; }
+  input[type=text], input[type=number], select, textarea { background:#0d1117; color:#e6edf3; border:1px solid #30363d; border-radius:6px; padding:6px 8px; font-size:13px; }
+  textarea { width:100%; box-sizing:border-box; }
+  button { background:#1f6feb; color:#fff; border:none; border-radius:6px; padding:7px 14px; font-size:13px; cursor:pointer; margin:2px 4px 2px 0; }
+  button:hover { background:#388bfd; }
+  button.danger { background:#a40e26; }
+  button.ghost { background:#21262d; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:8px 0; }
+  .err { color:#f85149; font-size:13px; margin:8px 0; }
+  .ok { color:#3fb950; font-size:13px; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; }
+  .pill.live { background:#1a3a22; color:#3fb950; }
+  .pill.degraded { background:#3a2f14; color:#d29922; }
+  .pill.down { background:#3d1a1a; color:#f85149; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  @media (max-width:800px){ .grid2{ grid-template-columns:1fr; } }
+  .kv { font-size:13px; }
+  .kv b { color:#8b949e; font-weight:600; }
+  details.log { font-size:12px; }
+  details.log summary { cursor:pointer; color:#8b949e; }
+</style>
+</head>
+<body>
+<header class="top">
+  <h1>CloudDog Dashboard</h1>
+  <div class="meter" id="disk-meter"><div></div></div>
+  <div class="meter-label" id="disk-meter-label">loading disk…</div>
+</header>
+<main>
+  <section class="panel" id="p-overview">
+    <h2>Storage Overview</h2>
+    <div class="sub">live <code>shutil.disk_usage</code> + top-level du of a path</div>
+    <div class="row">
+      <input type="text" id="du-path" size="40" placeholder="/home/hatch/workspace">
+      <button onclick="loadDU()">du</button>
+      <button class="ghost" onclick="loadOverview()">refresh disk</button>
+    </div>
+    <div class="kv" id="overview-kv"></div>
+    <table id="du-table"><thead><tr><th>path</th><th style="text-align:right">bytes</th><th>mtime</th></tr></thead><tbody></tbody></table>
+  </section>
+
+  <section class="panel" id="p-clutter">
+    <h2>Clutter Table</h2>
+    <div class="sub">real <code>policy.evaluate</code> over top-level entries</div>
+    <div class="row">
+      <input type="text" id="scan-path" size="40" placeholder="/home/hatch/workspace">
+      <button onclick="loadPolicyScan()">scan</button>
+    </div>
+    <div id="clutter-out"></div>
+  </section>
+
+  <section class="panel" id="p-terminal">
+    <h2>Terminal</h2>
+    <div class="sub">POST /api/cli — allowlisted clouddog subcommands only, no shell</div>
+    <div class="row">
+      <input type="text" id="cli-argv" size="60" placeholder='scan --path /home/hatch/workspace'>
+      <button onclick="runCLI()">run</button>
+    </div>
+    <div class="kv">allowed subcommands: <code>scan store reap daemon verify</code></div>
+    <pre class="out" id="cli-out">no command run yet</pre>
+  </section>
+
+  <section class="panel" id="p-daemon">
+    <h2>Daemon Scheduler</h2>
+    <div class="sub">generates real install configs running <code>clouddog daemon --interval N</code></div>
+    <div class="row">
+      <select id="daemon-os">
+        <option value="linux">linux (systemd service+timer)</option>
+        <option value="macos">macos (LaunchAgent plist)</option>
+        <option value="windows">windows (Task Scheduler PS1)</option>
+      </select>
+      <input type="number" id="daemon-interval" value="60" min="1" max="10080" style="width:90px">
+      <span class="kv">minutes</span>
+      <button onclick="genDaemon()">generate</button>
+    </div>
+    <div id="daemon-out"></div>
+  </section>
+
+  <section class="panel" id="p-repos">
+    <h2>Repo Explorer</h2>
+    <div class="sub">live <code>gh api</code></div>
+    <div class="row">
+      <input type="text" id="repo-owner" value="mhvnsnt" size="20">
+      <button onclick="loadRepos()">list repos</button>
+      <input type="text" id="repo-name" size="24" placeholder="repo name">
+      <input type="text" id="repo-subpath" size="24" placeholder="sub path (optional)">
+      <button onclick="loadRepoContents()">browse</button>
+    </div>
+    <div id="repos-out"></div>
+  </section>
+
+  <section class="panel" id="p-torrent">
+    <h2>Torrent Mirror</h2>
+    <div class="sub">real <code>clouddog.torrent</code> availability — no fake torrents</div>
+    <div class="row"><button onclick="loadTorrent()">refresh</button></div>
+    <div id="torrent-out"></div>
+    <div class="row">
+      <input type="text" id="magnet" size="50" placeholder="magnet:?xt=...">
+      <select id="torrent-tier"><option>github</option><option>terabox</option><option>drive</option></select>
+      <input type="text" id="torrent-ref" size="24" placeholder="remote_ref">
+      <button onclick="addTorrent()">add</button>
+    </div>
+    <div id="torrent-add-out"></div>
+  </section>
+
+  <section class="panel" id="p-compute">
+    <h2>Compute</h2>
+    <div class="sub">real /proc + nvidia-smi (GPU shown only if present — never faked)</div>
+    <div class="row"><button class="ghost" onclick="loadSysinfo()">refresh</button></div>
+    <div class="kv" id="compute-out"></div>
+  </section>
+
+  <section class="panel" id="p-reaper">
+    <h2>Emergency Reaper</h2>
+    <div class="sub">upload lanes + one reaper pass + engine sweep (NOT the live disk-space-guardian)</div>
+    <div class="row"><button class="ghost" onclick="loadLanes()">refresh lanes</button></div>
+    <div id="lanes-out"></div>
+    <h3 style="font-size:14px">Reap (one pass)</h3>
+    <div class="row">
+      <input type="text" id="reap-manifest" size="36" placeholder="manifest path or locator">
+      <input type="text" id="reap-src" size="36" placeholder="/home/hatch/workspace/...">
+      <label class="kv"><input type="checkbox" id="reap-dry" checked> dry_run</label>
+      <button class="danger" onclick="runReap()">reap</button>
+    </div>
+    <h3 style="font-size:14px">Engine sweep</h3>
+    <div class="sub">one daemon tick over ~/workspace — may take several minutes on large workspaces; the page waits for the report</div>
+    <div class="row">
+      <label class="kv"><input type="checkbox" id="sweep-dry" checked> dry_run</label>
+      <button onclick="runSweep()">run one engine sweep tick</button>
+    </div>
+    <div id="reaper-out"></div>
+  </section>
+
+  <section class="panel" id="p-broadcast">
+    <h2>Broadcast</h2>
+    <div class="sub">drafts a proposal for owner approval — NEVER writes AGENTS.md/MEMORY.md</div>
+    <div class="row"><input type="text" id="bc-title" size="50" placeholder="proposal title"></div>
+    <div class="row"><textarea id="bc-laws" rows="5" placeholder='[{"name": "LAW NAME", "text": "law text..."}]'></textarea></div>
+    <div class="row"><button onclick="draftBroadcast()">draft</button></div>
+    <pre class="out" id="bc-out">no draft yet</pre>
+  </section>
+
+  <section class="panel" id="p-relocate">
+    <h2>Relocation Wizard</h2>
+    <div class="sub">hash-verify → store each file → only then clear local → writes retrieval shim</div>
+    <div class="row">
+      <input type="text" id="rel-path" size="40" placeholder="/home/hatch/workspace/somedir">
+      <select id="rel-tier"><option>github</option><option>terabox</option><option>drive</option></select>
+      <input type="text" id="rel-ref" size="30" placeholder="remote_ref">
+      <label class="kv"><input type="checkbox" id="rel-dry" checked> dry_run</label>
+      <button onclick="runRelocate()">relocate</button>
+    </div>
+    <div id="relocate-out"></div>
+  </section>
+
+  <section class="panel" id="p-audit">
+    <h2>Audit Journal</h2>
+    <div class="sub">real audit journal entries</div>
+    <div class="row">
+      <input type="number" id="audit-limit" value="100" min="1" max="10000" style="width:90px">
+      <button class="ghost" onclick="loadAudit()">refresh</button>
+    </div>
+    <div id="audit-out"></div>
+  </section>
+
+  <section class="panel" id="p-backends">
+    <h2>Store Backends</h2>
+    <div class="sub">real <code>health()</code> from each backend</div>
+    <div class="row"><button class="ghost" onclick="loadBackends()">refresh</button></div>
+    <div id="backends-out"></div>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>
