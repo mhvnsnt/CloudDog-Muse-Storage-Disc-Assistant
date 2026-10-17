@@ -113,11 +113,11 @@ and `~/workspace/agent-ops/disk-cleanup-log.md`.
 
 | Lane | Agent Name | Current Work & Target | In-Flight Status | Verification & Eviction Policy |
 | :--- | :--- | :--- | :--- | :--- |
-| **Lane 1** | `Scooby Stream Reaper` | 717 total blobs -> GitHub repo | **670 of 717 verified** | Deletes local blob on the spot; 47 blobs to final commit |
-| **Lane 2** | `Priority 8 Files Team` | DOA4 tars, DXMMII parts, MP4s (3.7 GB) | **In-flight (3 of 8 up)** | Local source deletes the second upload hash verifies |
-| **Lane 3** | `Pipeline Nurse` | Adventure Time (15/17 up) & Gumball | **Alive & nursing** | Overcoming proxy flakes; partials pruned |
-| **Lane 0** | `10-Minute Loop Watchdog` | Sweeps all night (7:24, 7:54, 8:04, 8:34, 9:04, 9:24) | **Active loop** | Auto-kills dead downloads, restarts stalled lanes |
-| **Lane 4** | `Multi-Chat Broadcaster` | Broadcasts freed space to all chats | **Broadcasting** | Commits state to MEMORY.md |
+| **Lane 1** | `Scooby Stream Reaper` | 717 total blobs -> GitHub repo | **DONE: 717/717 verified** | All 717 verified; local chunks cleared on the spot (+2.5 GB freed) |
+| **Lane 2** | `Priority 8 Files Team` | DOA4 tars, DXMMII parts, MP4s (3.7 GB) | **Clearing as verified** | Extracted parts clearing as each hash verifies on GitHub |
+| **Lane 3** | `Small Files Team` | 55 files (Zui, proof logs, EP02 media) | **DONE: 55/55 verified** | All 55 cleared (+762 MB freed) across western-heart, cape-jones, TRIPPEDD |
+| **Lane 4** | `Western-Heart #231` | 54k-file restore PR | **GREEN & mergeable** | Ready to merge; passed all CI checks |
+| **Lane 0** | `10-Minute Loop Watchdog` | CloudDog v2 Guardian | **Active loop (v2)** | Sweeps every 10 min; verify-then-delete across GitHub/TeraBox/Kaggle |
 
 ---
 
