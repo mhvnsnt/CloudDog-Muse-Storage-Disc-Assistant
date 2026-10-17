@@ -2366,6 +2366,117 @@ def cmd_dedup(args):
     return 0
 
 
+def _zfec_available():
+    """True when the optional zfec pip package is importable."""
+    try:
+        import zfec  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def cmd_shard(args):
+    """Split a file into m erasure-coded shards (any k reconstruct).
+
+    For irreplaceable files: spread shards across stores via `register`,
+    and the file survives even if (m - k) stores are lost. Uses zfec
+    (GPL-2.0+). Shard files are named <basename>.shard-<i>-of-<m>.
+    A <basename>.shard-meta.json records k, m, size, and sha256.
+    """
+    if not _zfec_available():
+        print("SHARD FAIL: zfec not installed (pip install zfec)",
+              file=sys.stderr)
+        return 1
+    import zfec
+    src = args.file
+    k, m = args.k, args.m
+    if not os.path.isfile(src):
+        print(f"SHARD FAIL: not a file: {src}", file=sys.stderr)
+        return 1
+    if not (1 <= k <= m <= 256):
+        print(f"SHARD FAIL: need 1 <= k <= m <= 256 (got k={k} m={m})",
+              file=sys.stderr)
+        return 1
+    out_dir = args.out or os.path.dirname(os.path.abspath(src))
+    os.makedirs(out_dir, exist_ok=True)
+    with open(src, "rb") as f:
+        data = f.read()
+    # Split into k equal blocks (pad the last)
+    block_size = (len(data) + k - 1) // k  # ceil division
+    blocks = [data[i * block_size:(i + 1) * block_size] for i in range(k)]
+    max_len = max(len(b) for b in blocks)
+    blocks = [b + b"\x00" * (max_len - len(b)) for b in blocks]
+    enc = zfec.Encoder(k, m)
+    shards = enc.encode(blocks)
+    base = os.path.basename(src)
+    for i, s in enumerate(shards):
+        spath = os.path.join(out_dir, f"{base}.shard-{i}-of-{m}")
+        with open(spath, "wb") as sf:
+            sf.write(s)
+    meta = {"k": k, "m": m, "size": len(data),
+            "sha256": sha256_file(src),
+            "file": base}
+    mpath = os.path.join(out_dir, f"{base}.shard-meta.json")
+    with open(mpath, "w") as mf:
+        json.dump(meta, mf, indent=2)
+    print(f"sharded {src} ({human(len(data))}) into {m} shards "
+          f"(any {k} reconstruct) in {out_dir}")
+    audit_log("shard", file=src, k=k, m=m, out=out_dir)
+    return 0
+
+
+def cmd_unshard(args):
+    """Reconstruct a file from any k of its m shards.
+
+    Reads <basename>.shard-meta.json for k/m/size, decodes from the shard
+    files present in --dir, verifies sha256, writes to --out.
+    """
+    if not _zfec_available():
+        print("UNSHARD FAIL: zfec not installed (pip install zfec)",
+              file=sys.stderr)
+        return 1
+    import zfec
+    import glob
+    d = args.dir
+    metas = glob.glob(os.path.join(d, "*.shard-meta.json"))
+    if not metas:
+        print(f"UNSHARD FAIL: no shard-meta.json in {d}", file=sys.stderr)
+        return 1
+    with open(metas[0]) as mf:
+        meta = json.load(mf)
+    k, m, size = meta["k"], meta["m"], meta["size"]
+    base = meta["file"]
+    # Collect available shards
+    shards = []
+    for i in range(m):
+        spath = os.path.join(d, f"{base}.shard-{i}-of-{m}")
+        if os.path.isfile(spath):
+            with open(spath, "rb") as sf:
+                shards.append((i, sf.read()))
+        if len(shards) >= k:
+            break
+    if len(shards) < k:
+        print(f"UNSHARD FAIL: only {len(shards)} shards found, need {k}",
+              file=sys.stderr)
+        return 1
+    dec = zfec.Decoder(k, m)
+    shard_ids = [i for i, _ in shards]
+    blocks = [s for _, s in shards]
+    decoded_blocks = dec.decode(blocks, shard_ids)
+    data = b"".join(decoded_blocks)[:size]
+    out = args.out or os.path.join(d, base + ".reconstructed")
+    with open(out, "wb") as of:
+        of.write(data)
+    # Verify
+    if sha256_file(out) != meta["sha256"]:
+        print(f"UNSHARD FAIL: sha256 mismatch on {out}", file=sys.stderr)
+        return 1
+    print(f"reconstructed {out} ({human(size)}) from {len(shards)} shards, "
+          f"sha256 verified")
+    audit_log("unshard", file=out, shards=len(shards))
+    return 0
+
+
 def cmd_reap_v2(args):
     """v2 reap: verify-then-delete across all store backends.
 
@@ -2517,6 +2628,21 @@ def main(argv=None):
     p.add_argument("--exclude", action="append", default=[],
                    help="fclones --exclude pattern (repeatable)")
 
+    p = sub.add_parser("shard", help="split file into erasure-coded shards")
+    p.add_argument("--file", required=True, help="file to shard")
+    p.add_argument("--k", type=int, default=3,
+                   help="shards needed to reconstruct (default 3)")
+    p.add_argument("--m", type=int, default=5,
+                   help="total shards to create (default 5)")
+    p.add_argument("--out", default="",
+                   help="output dir (default: same as file)")
+
+    p = sub.add_parser("unshard", help="reconstruct file from shards")
+    p.add_argument("--dir", required=True,
+                   help="dir containing shards + .shard-meta.json")
+    p.add_argument("--out", default="",
+                   help="output path (default: <dir>/<file>.reconstructed)")
+
     p = sub.add_parser("enforce", help="full cycle: scan + reap")
     p.add_argument("--apply", action="store_true")
 
@@ -2592,6 +2718,10 @@ def main(argv=None):
             return cmd_reap_v2(args)
         elif args.cmd == "dedup":
             return cmd_dedup(args)
+        elif args.cmd == "shard":
+            return cmd_shard(args)
+        elif args.cmd == "unshard":
+            return cmd_unshard(args)
         elif args.cmd == "mirror":
             return cmd_mirror(args)
         elif args.cmd == "mirror-search":

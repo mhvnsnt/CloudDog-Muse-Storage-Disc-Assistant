@@ -468,3 +468,12 @@ order, each gets its own researched, tested patch.
   skipped. If it matches, BLAKE3 still confirms (xxh3 is not
   collision-safe). New `xxh3_file()` + `_xxhash_available()`.
 - 2 new tests (match/differ, availability check).
+
+### zfec — WIRED (2026-10-17)
+- URL: https://github.com/tahoe-lafs/zfec — License: **GPL-2.0-or-later**
+  (verified via PyPI). k-of-m erasure coding.
+- Wired as `shard` / `unshard` commands: split irreplaceable files into m
+  shards (any k reconstruct), spread across stores via `register`. Survives
+  (m-k) store losses. Round-trip verified live (2-of-4 reconstruct, sha256
+  match).
+- 2 new tests (round-trip with deleted shards, missing-zfec error).
