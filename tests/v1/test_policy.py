@@ -80,26 +80,26 @@ def test_not_sacred_when_old_and_small(tmp_path: Path):
     assert evaluate(str(f)).action is not Action.SACRED
 
 
-# ----------------------------------------------------------- never_delete ---
-def test_never_delete_iso_under_teardown_dir(tmp_path: Path):
+# ----------------------------------------- store_and_clear_strict (game files) ---
+def test_game_file_iso_under_teardown_dir_is_strict(tmp_path: Path):
     f = make_file(tmp_path / "teardown" / "tekken3" / "disc.iso", 600 * 1024 * 1024, mtime=OLD)
     d = evaluate(str(f))
-    assert d.action is Action.NEVER_DELETE
-    assert "NEVER-DELETE-GAME-FILES" in d.reason
+    assert d.action is Action.STORE_AND_CLEAR_STRICT
+    assert "strict" in d.reason
 
 
-def test_never_delete_bare_iso(tmp_path: Path):
+def test_game_file_bare_iso_is_strict(tmp_path: Path):
     # .iso qualifies on extension alone, no path hint needed
     f = make_file(tmp_path / "random-folder" / "game.iso", 600 * 1024 * 1024, mtime=OLD)
     d = evaluate(str(f))
-    assert d.action is Action.NEVER_DELETE
-    assert "NEVER-DELETE-GAME-FILES" in d.reason
+    assert d.action is Action.STORE_AND_CLEAR_STRICT
+    assert "strict" in d.reason
 
 
-def test_never_delete_rom_extension_in_rom_dir(tmp_path: Path):
+def test_game_file_rom_extension_in_rom_dir_is_strict(tmp_path: Path):
     f = make_file(tmp_path / "rom" / "no-mercy.z64", 100, mtime=OLD)
     d = evaluate(str(f))
-    assert d.action is Action.NEVER_DELETE
+    assert d.action is Action.STORE_AND_CLEAR_STRICT
 
 
 def test_bin_needs_game_component(tmp_path: Path):
@@ -110,14 +110,23 @@ def test_bin_needs_game_component(tmp_path: Path):
 
     f2 = make_file(tmp_path / "chimera" / "data.bin", 20 * 1024 * 1024, mtime=OLD)
     d2 = evaluate(str(f2))
-    assert d2.action is Action.NEVER_DELETE
+    assert d2.action is Action.STORE_AND_CLEAR_STRICT
 
 
-def test_never_delete_may_still_store(tmp_path: Path):
+def test_game_file_strict_may_still_store(tmp_path: Path):
     f = make_file(tmp_path / "teardown" / "x.chd", 600 * 1024 * 1024, mtime=OLD)
     d = evaluate(str(f))
-    assert d.action is Action.NEVER_DELETE
-    assert d.tier == "terabox"  # may store, never auto-delete
+    assert d.action is Action.STORE_AND_CLEAR_STRICT
+    assert d.tier == "terabox"  # may store, clears only at the strict bar
+
+
+def test_game_file_strict_reason_names_the_bar(tmp_path: Path):
+    f = make_file(tmp_path / "teardown" / "game.iso", 600 * 1024 * 1024, mtime=OLD)
+    d = evaluate(str(f))
+    assert "100% byte-verified store" in d.reason
+    assert "retrievability" in d.reason
+    assert "owner surfaced" in d.reason
+    assert "never" in d.reason and "auto-deleted" in d.reason
 
 
 # ------------------------------------------------------------- keep_local ---

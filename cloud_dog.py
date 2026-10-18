@@ -66,6 +66,43 @@ except ImportError:  # pragma: no cover - defensive; package ships in-repo
     decide_delete = None  # type: ignore
     _POLICY_AVAILABLE = False
 
+# V1 policy engine (src/clouddog/policy.py) as the FRONT DECIDER for reap:
+# evaluate(path) runs first for every candidate (law-ordered, with reasons);
+# V2's registry + decide_delete + live verify-then-delete is the execution.
+# Loaded by file path because the sibling root-level `clouddog/` package
+# shadows the src/ tree on sys.path. Fail closed if the load breaks: reap
+# refuses to run rather than silently losing guards.
+def _load_v1_policy():
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    policy_path = os.path.join(here, "src", "clouddog", "policy.py")
+    spec = importlib.util.spec_from_file_location("_clouddog_v1_policy", policy_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load v1 policy engine from {policy_path}")
+    module = importlib.util.module_from_spec(spec)
+    # dataclass processing looks the module up in sys.modules by __name__;
+    # register it before exec_module or @dataclass blows up.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+try:
+    _V1_POLICY = _load_v1_policy()
+    _v1_evaluate = _V1_POLICY.evaluate
+    _V1_ACTION_SACRED = _V1_POLICY.Action.SACRED.value
+    _V1_ACTION_STORE = _V1_POLICY.Action.STORE.value
+    _V1_ACTION_STORE_AND_CLEAR = _V1_POLICY.Action.STORE_AND_CLEAR.value
+    _V1_ACTION_STORE_AND_CLEAR_STRICT = _V1_POLICY.Action.STORE_AND_CLEAR_STRICT.value
+    _V1_ACTION_KEEP_LOCAL = _V1_POLICY.Action.KEEP_LOCAL.value
+    _EVALUATE_AVAILABLE = True
+except Exception:  # pragma: no cover - defensive; module ships in-repo
+    _V1_POLICY = None
+    _v1_evaluate = None
+    _V1_ACTION_SACRED = _V1_ACTION_STORE = _V1_ACTION_STORE_AND_CLEAR = None
+    _V1_ACTION_STORE_AND_CLEAR_STRICT = _V1_ACTION_KEEP_LOCAL = None
+    _EVALUATE_AVAILABLE = False
+
 # ---------------------------------------------------------------- locations
 HOME = os.path.expanduser("~")
 WORKSPACE = os.path.join(HOME, "workspace")
@@ -2591,25 +2628,70 @@ def cmd_unshard(args):
 def cmd_reap_v2(args):
     """v2 reap: verify-then-delete across all store backends.
 
+    The V1 policy engine (src/clouddog/policy.py::evaluate) is the FRONT
+    DECIDER: it runs first for every candidate, before the registry /
+    decide_delete flow:
+      - SACRED -> blocked + audit-logged (in ADDITION to V2's existing
+        sacred/veto/in-flight checks — both systems apply, belt and
+        suspenders).
+      - KEEP_LOCAL or STORE -> skipped (not reap-eligible; STORE is
+        mirror-only).
+      - STORE_AND_CLEAR_STRICT (game files) -> routed through decide_delete
+        with the strict params (retrievability_proven, owner_surfaced).
+      - STORE_AND_CLEAR -> the existing decide_delete + live-verify flow,
+        unchanged.
     Every candidate additionally passes the owner's law engine
     (clouddog.policy.laws.decide_delete). The gate can only BLOCK, never
     approve: the live per-store verify_entry remains the proof of the
     ONE-STORE RULE. Unattended runs never satisfy requires_owner.
     """
-    if not _POLICY_AVAILABLE:
-        print("POLICY ENGINE UNAVAILABLE: clouddog.policy.laws failed to "
-              "import; reap disabled (fail-closed).", file=sys.stderr)
+    if not (_POLICY_AVAILABLE and _EVALUATE_AVAILABLE):
+        print("POLICY ENGINE UNAVAILABLE: clouddog.policy.laws and/or "
+              "src/clouddog/policy.evaluate failed to import; reap "
+              "disabled (fail-closed).", file=sys.stderr)
         audit_log("reap_policy_unavailable")
         return 1
     apply = args.apply
     owner_approved = getattr(args, "owner_approved", False)
+    retrievability_proven = getattr(args, "retrievability_proven", False)
+    owner_surfaced = getattr(args, "owner_surfaced", False)
     search_root = (os.path.abspath(args.path)
                    if getattr(args, "path", "") else None)
     reaped, skipped, failed, blocked = [], [], [], []
     for path, entry in reap_candidates(search_root):
+        # FRONT DECIDER (V1 evaluate, law-ordered with reasons). evaluate()
+        # never raises on bad input. evaluate's tier suggestion is recorded
+        # on the audit events so a future store step can use it; store
+        # behavior itself is unchanged by this patch.
+        v1 = _v1_evaluate(path)
+        v1_action = v1.action.value
+        if v1_action == _V1_ACTION_SACRED:
+            reason = f"evaluate(SACRED): {v1.reason}"
+            blocked.append((path, reason))
+            audit_log("reap_policy_block", path=path, store=entry.get("store"),
+                      detail=reason[:200])
+            continue
+        if v1_action in (_V1_ACTION_KEEP_LOCAL, _V1_ACTION_STORE):
+            reason = (f"evaluate({v1_action}): not reap-eligible "
+                      f"({v1.reason})")
+            skipped.append((path, reason))
+            audit_log("reap_policy_skip", path=path, store=entry.get("store"),
+                      detail=reason[:200])
+            continue
         claimed = [entry["store"]] if entry.get("store") else []
+        strict_kwargs = {}
+        if v1_action == _V1_ACTION_STORE_AND_CLEAR_STRICT:
+            # Game-file strict bar: 100% byte-verified store +
+            # retrievability proven (pull-back actually tested) + owner
+            # surfaced. decide_delete names exactly which condition is
+            # missing when it blocks.
+            strict_kwargs = dict(
+                retrievability_proven=retrievability_proven,
+                owner_surfaced=owner_surfaced,
+            )
         decision = decide_delete(path, verified_stores=claimed,
-                                 owner_approved=owner_approved)
+                                 owner_approved=owner_approved,
+                                 **strict_kwargs)
         # Gate blocks unless the laws allow AND any owner-approval
         # requirement is satisfied by this run's --owner-approved flag.
         # (requires_owner=True on an allowed decision merely records that
@@ -2619,13 +2701,13 @@ def cmd_reap_v2(args):
             reason = "; ".join(decision.reasons)
             blocked.append((path, reason))
             audit_log("reap_policy_block", path=path, store=entry.get("store"),
-                      detail=reason[:200])
+                      evaluate_tier=v1.tier, detail=reason[:200])
             continue
         ok, detail = verify_entry(entry, path)
         if not ok:
             failed.append((path, detail))
             audit_log("reap_keep", path=path, store=entry.get("store"),
-                      detail=detail[:200])
+                      evaluate_tier=v1.tier, detail=detail[:200])
             continue
         size = entry.get("size", 0) or (
             os.path.getsize(path) if os.path.exists(path) else 0)
@@ -2641,6 +2723,7 @@ def cmd_reap_v2(args):
                 log_action(msg)
                 audit_log("reap", path=path, store=entry.get("store"),
                           size=size, sha256=entry.get("sha256", "")[:16],
+                          evaluate_tier=v1.tier,
                           dest=entry.get("repo") or entry.get("remote_dir")
                           or entry.get("dataset"))
                 reaped.append((path, size))
@@ -2652,11 +2735,14 @@ def cmd_reap_v2(args):
     total = sum(s for _, s in reaped)
     mode = "APPLY" if apply else "DRY-RUN"
     print(f"[{mode}] reaped={len(reaped)} ({human(total)}) "
-          f"failed-verify={len(failed)} blocked-policy={len(blocked)}")
+          f"failed-verify={len(failed)} blocked-policy={len(blocked)} "
+          f"skipped-evaluate={len(skipped)}")
     for path, detail in failed:
         print(f"  KEEP (unverified): {path} - {detail}")
     for path, reason in blocked:
         print(f"  BLOCKED (policy): {path} - {reason[:160]}")
+    for path, reason in skipped:
+        print(f"  SKIP (evaluate): {path} - {reason[:160]}")
     if apply and reaped:
         log_action(f"cloud_dog reap: {len(reaped)} files, {human(total)} freed")
         audit_log("reap_summary", count=len(reaped), bytes_freed=total)
@@ -2732,6 +2818,14 @@ def main(argv=None):
     p.add_argument("--owner-approved", action="store_true",
                    help="owner approval for protected game files "
                         "(NEVER-DELETE-GAME-FILES: unattended runs must omit)")
+    p.add_argument("--retrievability-proven", action="store_true",
+                   help="game-file strict bar: pull-back was actually tested "
+                        "(asset downloadable / manifest fetched — a listing is "
+                        "NOT proof). Required to reap protected game files.")
+    p.add_argument("--owner-surfaced", action="store_true",
+                   help="game-file strict bar: the store event was surfaced "
+                        "to the owner (never silent). --owner-approved "
+                        "implies this.")
 
     p = sub.add_parser("dedup", help="find duplicate files (fclones), "
                                      "delete down to one copy per group")

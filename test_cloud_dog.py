@@ -561,8 +561,9 @@ def _reap_dry(args):
 
 
 def test_policy_gate_blocks_protected_game_file():
-    """A .iso with a claimed store is BLOCKED by decide_delete (rule 3),
-    before any live verify runs. The file must survive."""
+    """A .iso with a claimed store is BLOCKED by decide_delete (game-file
+    strict bar: retrievability_proven missing), before any live verify
+    runs. The file must survive."""
     d, cleanup = _policy_test_setup()
     try:
         iso = _old_file(d, "game.iso")
@@ -573,17 +574,30 @@ def test_policy_gate_blocks_protected_game_file():
         assert "blocked-policy=1" in out, out
         assert "BLOCKED (policy)" in out, out
         assert "protected game file" in out, out
+        assert "retrievability_proven" in out, out
         assert os.path.exists(iso), "policy-blocked file must never be deleted"
     finally:
         cleanup()
 
 
+def _cold_big_file(directory, name, size_mb=12):
+    """Sparse file >= 10MB with mtime old enough to be STORE_AND_CLEAR."""
+    import time
+    p = os.path.join(directory, name)
+    with open(p, "wb") as f:
+        f.truncate(size_mb * 1024 * 1024)
+    old = time.time() - 7200
+    os.utime(p, (old, old))
+    return p
+
+
 def test_policy_gate_passes_ordinary_file_to_verify():
-    """An ordinary file with a claimed store passes the gate and reaches
-    live verification (fails locally without creds — no network)."""
+    """A cold >= 10MB ordinary file evaluates STORE_AND_CLEAR, passes the
+    gate, and reaches live verification (fails locally without creds —
+    no network)."""
     d, cleanup = _policy_test_setup()
     try:
-        dat = _old_file(d, "ordinary.dat")
+        dat = _cold_big_file(d, "ordinary.dat")
         assert _register(dat) == 0
         rc, out = _reap_dry(type("A", (), {
             "apply": False, "path": "", "owner_approved": False})())
@@ -596,17 +610,73 @@ def test_policy_gate_passes_ordinary_file_to_verify():
 
 
 def test_policy_gate_owner_approved_allows_game_file_past_gate():
-    """With --owner-approved, a protected game file passes the POLICY gate
-    (rule 3 satisfied) and proceeds to live verification."""
+    """With --owner-approved AND --retrievability-proven, a protected game
+    file passes the POLICY gate (strict bar satisfied) and proceeds to
+    live verification."""
     d, cleanup = _policy_test_setup()
     try:
         iso = _old_file(d, "game2.iso")
         assert _register(iso) == 0
         rc, out = _reap_dry(type("A", (), {
-            "apply": False, "path": "", "owner_approved": True})())
+            "apply": False, "path": "", "owner_approved": True,
+            "retrievability_proven": True})())
         assert rc == 0
         assert "blocked-policy=0" in out, out
         assert os.path.exists(iso)
+    finally:
+        cleanup()
+
+
+def test_policy_gate_game_file_blocked_without_retrievability_proven():
+    """Owner approval alone no longer clears the game-file strict bar:
+    retrievability_proven is required, and the block names it."""
+    d, cleanup = _policy_test_setup()
+    try:
+        iso = _old_file(d, "game3.iso")
+        assert _register(iso) == 0
+        rc, out = _reap_dry(type("A", (), {
+            "apply": False, "path": "", "owner_approved": True})())
+        assert rc == 0
+        assert "blocked-policy=1" in out, out
+        assert "retrievability_proven" in out, out
+        assert os.path.exists(iso), "strict-bar-blocked file must survive"
+    finally:
+        cleanup()
+
+
+def test_evaluate_sacred_blocks_path_v2_would_pass():
+    """V1's evaluate runs FIRST: a stale .downloading file (suffix V2 does
+    not treat as transient, mtime old enough to pass V2's in-flight check)
+    is blocked as evaluate(SACRED) even though every V2 check would pass."""
+    d, cleanup = _policy_test_setup()
+    try:
+        stale = _old_file(d, "stale-download.downloading")
+        assert _register(stale) == 0
+        rc, out = _reap_dry(type("A", (), {
+            "apply": False, "path": "", "owner_approved": False})())
+        assert rc == 0
+        assert "blocked-policy=1" in out, out
+        assert "evaluate(SACRED)" in out, out
+        assert os.path.exists(stale), "evaluate-SACRED file must survive"
+    finally:
+        cleanup()
+
+
+def test_evaluate_keep_local_skips():
+    """V1 evaluate(KEEP_LOCAL) skips the candidate before decide_delete:
+    a small file modified 10 min ago (passes V2's in-flight check) is
+    'hot' under V1 and is not reap-eligible."""
+    d, cleanup = _policy_test_setup()
+    try:
+        hot = _old_file(d, "hot.dat")
+        assert _register(hot) == 0
+        rc, out = _reap_dry(type("A", (), {
+            "apply": False, "path": "", "owner_approved": False})())
+        assert rc == 0
+        assert "skipped-evaluate=1" in out, out
+        assert "SKIP (evaluate)" in out, out
+        assert "keep_local" in out, out
+        assert os.path.exists(hot), "evaluate-skipped file must survive"
     finally:
         cleanup()
 
@@ -623,6 +693,21 @@ def test_policy_unavailable_fails_closed():
         assert "fail-closed" in buf.getvalue()
     finally:
         _patch(cloud_dog, "_POLICY_AVAILABLE", old)
+
+
+def test_evaluate_unavailable_fails_closed():
+    """If the V1 front decider cannot import, reap refuses to run at all —
+    it must not silently lose the evaluate guard."""
+    import io, contextlib
+    old = _patch(cloud_dog, "_EVALUATE_AVAILABLE", False)
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            rc = cloud_dog.cmd_reap_v2(type("A", (), {"apply": True})())
+        assert rc == 1
+        assert "fail-closed" in buf.getvalue()
+    finally:
+        _patch(cloud_dog, "_EVALUATE_AVAILABLE", old)
 
 
 # ---------------------------------------------------- dust scan wiring tests
