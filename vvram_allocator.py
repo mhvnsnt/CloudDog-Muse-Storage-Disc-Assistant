@@ -50,6 +50,7 @@ def _blake3_new():
     """Fresh BLAKE3 hasher, or None if the optional package is missing."""
     try:
         import blake3
+
         return blake3.blake3()
     except ImportError:
         return None
@@ -65,6 +66,7 @@ def _new_hasher(algorithm):
     if algorithm == "xxh3":
         try:
             import xxhash
+
             return xxhash.xxh3_64()
         except ImportError:
             algorithm = "sha256"
@@ -96,8 +98,8 @@ def probe_compute():
     if shutil.which("nvidia-smi"):
         try:
             out = subprocess.run(
-                ["nvidia-smi", "-L"], capture_output=True, text=True,
-                timeout=10, check=False)
+                ["nvidia-smi", "-L"], capture_output=True, text=True, timeout=10, check=False
+            )
             if out.returncode == 0 and out.stdout.strip():
                 info["gpu"] = out.stdout.strip().splitlines()
                 info["cuda"] = True
@@ -129,12 +131,11 @@ def mmap_hash_file(path, algorithm="blake3"):
             for blk in iter(lambda: f.read(_CHUNK), b""):
                 hasher.update(blk)
         return hasher.hexdigest()
-    with open(path, "rb") as f, mmap.mmap(
-        f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+    with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
         # Feed the hasher in _CHUNK slices; the slices are views into
         # the mapping — no userspace copy of the whole file.
         for off in range(0, size, _CHUNK):
-            hasher.update(mm[off:off + _CHUNK])
+            hasher.update(mm[off : off + _CHUNK])
     return hasher.hexdigest()
 
 
@@ -154,6 +155,7 @@ def parallel_hash(paths, algorithm="blake3", workers=None):
     a single bad file; the caller decides).
     """
     from concurrent.futures import ProcessPoolExecutor
+
     paths = list(paths)
     if not paths:
         return {}
@@ -161,8 +163,7 @@ def parallel_hash(paths, algorithm="blake3", workers=None):
         workers = min(os.cpu_count() or 1, len(paths))
     results = {}
     with ProcessPoolExecutor(max_workers=workers) as ex:
-        for path, digest in ex.map(_hash_one,
-                                   [(p, algorithm) for p in paths]):
+        for path, digest in ex.map(_hash_one, [(p, algorithm) for p in paths]):
             results[path] = digest
     return results
 
@@ -212,6 +213,7 @@ class VVRAMAllocator:
 if __name__ == "__main__":
     import json
     import sys
+
     if len(sys.argv) > 1 and sys.argv[1] == "probe":
         print(json.dumps(probe_compute(), indent=2, default=str))
     elif len(sys.argv) > 2 and sys.argv[1] == "hash":
