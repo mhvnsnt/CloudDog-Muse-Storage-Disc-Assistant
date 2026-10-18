@@ -734,6 +734,8 @@ def cmd_register(args):
         "dataset": getattr(args, "dataset", "") or "",
         "restic_repo": getattr(args, "restic_repo", "") or "",
         "snapshot_id": getattr(args, "snapshot_id", "") or "",
+        "b2_bucket": getattr(args, "b2_bucket", "") or "",
+        "b2_path": getattr(args, "b2_path", "") or "",
         "sha256": args.sha256 or "",
         "size": args.size or 0,
         "note": args.note or "",
@@ -757,6 +759,22 @@ def cmd_register(args):
             print(f"restic backup ok: snapshot {snapshot_id[:8]}")
         entry["restic_repo"] = repo
         entry["snapshot_id"] = snapshot_id
+    if args.store == "b2":
+        # b2 register performs the upload now and records bucket+path
+        # (a registry claim alone is never proof; the upload IS the proof).
+        bucket = getattr(args, "b2_bucket", "") or ""
+        if not bucket:
+            print("register --store b2 needs --b2-bucket", file=sys.stderr)
+            return 1
+        remote_path = (getattr(args, "b2_path", "") or ""
+                       or os.path.basename(path))
+        ok, res = b2_upload(path, bucket, remote_path)
+        if not ok:
+            print(f"register: b2 upload failed: {res}", file=sys.stderr)
+            return 1
+        entry["b2_bucket"] = bucket
+        entry["b2_path"] = remote_path
+        print(f"b2 upload ok: {res}")
     if os.path.exists(path) and not args.sha256:
         try:
             entry["sha256"] = sha256_file(path)
@@ -767,18 +785,23 @@ def cmd_register(args):
     reg["entries"][path] = entry
     save_registry(reg)
     dest = {"github": f"{args.repo}@{args.release}",
-            "terabox": entry["remote_dir"],
-            "kaggle": entry["dataset"],
-            "restic": f"{entry['restic_repo']}#{entry['snapshot_id'][:8]}",
+            "terabox": entry.get("remote_dir", ""),
+            "kaggle": entry.get("dataset", ""),
+            "restic": f"{entry.get('restic_repo', '')}"
+                      f"#{entry.get('snapshot_id', '')[:8]}",
+            "b2": f"{entry.get('b2_bucket', '')}/{entry.get('b2_path', '')}",
             }.get(args.store, "")
     print(f"Registered: {path} -> {args.store}:{dest}")
     audit_log("register", path=path, store=args.store,
               repo=args.repo, release=args.release, asset=args.asset,
               remote_dir=getattr(args, "remote_dir", "") or "",
               dataset=getattr(args, "dataset", "") or "",
-              restic_repo=entry["restic_repo"],
-              snapshot_id=entry["snapshot_id"][:16],
-              sha256=entry["sha256"][:16], size=entry["size"])
+              restic_repo=entry.get("restic_repo", ""),
+              snapshot_id=entry.get("snapshot_id", "")[:16],
+              b2_bucket=entry.get("b2_bucket", ""),
+              b2_path=entry.get("b2_path", ""),
+              sha256=entry.get("sha256", "")[:16],
+              size=entry.get("size", 0))
     return 0
 
 
@@ -956,7 +979,7 @@ AUDIT_PATH = os.path.join(AGENT_OPS, "cloud-dog-audit.jsonl")
 MIRROR_STAGING = os.path.join(AGENT_OPS, "mirror-staging")
 DAEMON_PIDFILE = os.path.join(AGENT_OPS, "cloud-dog-daemon.pid")
 
-STORES = ("github", "terabox", "kaggle", "restic")
+STORES = ("github", "terabox", "kaggle", "restic", "b2")
 
 UA_BROWSER = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -1097,6 +1120,92 @@ def restic_repo_ready(repo, password=None):
     rc, _, _ = run([binary, "-r", repo, "cat", "config"],
                    timeout=60, env=env)
     return rc == 0
+
+
+def _rclone_binary():
+    """Locate the rclone binary (optional dependency for B2/S3 stores)."""
+    found = shutil.which("rclone")
+    if found:
+        return found
+    known = os.path.join(WORKSPACE, "tools", "rclone", "rclone")
+    if os.path.isfile(known) and os.access(known, os.X_OK):
+        return known
+    return None
+
+
+def _b2_env():
+    """Env vars for rclone B2 backend (credentials from environment)."""
+    env = dict(os.environ)
+    account = os.environ.get("B2_ACCOUNT_ID", "")
+    key = os.environ.get("B2_ACCOUNT_KEY", "")
+    if account and key:
+        # rclone B2 backend via env-var config (no config file needed)
+        env["RCLONE_CONFIG_B2_TYPE"] = "b2"
+        env["RCLONE_CONFIG_B2_ACCOUNT"] = account
+        env["RCLONE_CONFIG_B2_KEY"] = key
+    return env
+
+
+def b2_upload(local_path, bucket, remote_path):
+    """Upload one file to Backblaze B2 via rclone.
+
+    Returns (ok, detail). Credentials from B2_ACCOUNT_ID / B2_ACCOUNT_KEY
+    env vars. Uses rclone's B2 backend (10GB free tier, S3-compatible).
+    """
+    binary = _rclone_binary()
+    if not binary:
+        return False, "rclone binary not found (PATH or ~/workspace/tools/rclone)"
+    env = _b2_env()
+    if not env.get("RCLONE_CONFIG_B2_ACCOUNT"):
+        return False, "B2_ACCOUNT_ID / B2_ACCOUNT_KEY env vars not set"
+    if not bucket:
+        return False, "B2 bucket required (--b2-bucket)"
+    if not os.path.isfile(local_path):
+        return False, f"local file missing: {local_path}"
+    remote = f"b2:{bucket}/{remote_path.lstrip('/')}"
+    rc, out, err = run([binary, "copyto", local_path, remote,
+                        "--progress=false"],
+                       timeout=7200, env=env)
+    if rc != 0:
+        tail = (err.strip().splitlines() or [f"exit {rc}"])[-1]
+        return False, f"rclone copyto failed: {tail[:200]}"
+    return True, f"b2:{bucket}/{remote_path.lstrip('/')}"
+
+
+def b2_verify(entry, local_path=None):
+    """Verify a registry entry against Backblaze B2.
+
+    Entry needs: b2_bucket, b2_path. Passes only if the object exists
+    AND its size matches the registry. A registry claim alone is never proof.
+    """
+    binary = _rclone_binary()
+    if not binary:
+        return False, "rclone binary not found (PATH or ~/workspace/tools/rclone)"
+    bucket = entry.get("b2_bucket", "")
+    remote_path = entry.get("b2_path", "")
+    if not bucket or not remote_path:
+        return False, "b2 entry needs b2_bucket + b2_path"
+    env = _b2_env()
+    if not env.get("RCLONE_CONFIG_B2_ACCOUNT"):
+        return False, "B2_ACCOUNT_ID / B2_ACCOUNT_KEY env vars not set"
+    expected_size = int(entry.get("size", 0) or 0)
+    remote = f"b2:{bucket}/{remote_path.lstrip('/')}"
+    rc, out, err = run([binary, "lsjson", remote], timeout=300, env=env)
+    if rc != 0:
+        return False, f"b2 object not found: {remote}"
+    try:
+        info = json.loads(out)
+    except ValueError:
+        return False, "rclone lsjson output was not JSON"
+    # lsjson on a single file returns a one-element list
+    objs = info if isinstance(info, list) else [info]
+    if not objs:
+        return False, f"b2 object not found: {remote}"
+    actual_size = int(objs[0].get("Size", -1))
+    if expected_size and actual_size != expected_size:
+        return False, (f"b2 size mismatch: expected {expected_size}, "
+                       f"got {actual_size}")
+    return True, f"b2:{bucket}/{remote_path} ({actual_size} bytes)"
 
 
 def restic_backup(local_path, repo, password=None):
@@ -1360,6 +1469,8 @@ def verify_entry(entry, local_path):
         return verify_kaggle_entry(entry, local_path)
     if store == "restic":
         return restic_verify(entry, local_path)
+    if store == "b2":
+        return b2_verify(entry, local_path)
     return False, f"unknown store {store}"
 
 
@@ -2601,6 +2712,11 @@ def main(argv=None):
     p.add_argument("--snapshot-id", default="",
                    help="restic: record a pre-existing snapshot instead of "
                         "backing up now")
+    p.add_argument("--b2-bucket", default="",
+                   help="b2: Backblaze B2 bucket name (creds via "
+                        "B2_ACCOUNT_ID / B2_ACCOUNT_KEY env vars)")
+    p.add_argument("--b2-path", default="",
+                   help="b2: remote path in bucket (default: basename)")
     p.add_argument("--sha256", default="")
     p.add_argument("--size", type=int, default=0)
     p.add_argument("--note", default="")

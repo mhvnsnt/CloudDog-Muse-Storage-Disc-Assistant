@@ -477,3 +477,29 @@ order, each gets its own researched, tested patch.
   (m-k) store losses. Round-trip verified live (2-of-4 reconstruct, sha256
   match).
 - 2 new tests (round-trip with deleted shards, missing-zfec error).
+
+### Debrid alternatives — RESEARCHED, not wired (2026-10-17)
+- Researched free debrid services with API access (2026): World-Debrid has
+  a permanent free plan but limited to 1 debrid/month (not useful for
+  automation); Debrid-Link is paid-only; AllDebrid is 7-day trial only;
+  Real-Debrid has no free plan (API requires premium); TorBox free tier
+  exists but API requires paid plan (verified: owner's account shows
+  "Upgrade to Access API").
+- Verdict: **no debrid service offers a free API tier wirth wiring**.
+  CloudDog's `mirror --direct` (aria2, PR #23) is the debrid replacement —
+  it downloads torrents directly without any debrid service.
+
+### Backblaze B2 — WIRED (2026-10-17)
+- URL: https://www.backblaze.com/cloud-storage — License: **proprietary
+  (Backblaze)**; the S3-compatible API is open, accessed via rclone
+  (MIT-licensed, already in ~/workspace/tools/rclone/).
+- Free tier (verified 2026): **10GB storage free forever**, egress free up
+  to 3x stored data/month, S3-compatible API. rclone's B2 backend is mature.
+- Wired as `register --store b2 --b2-bucket BUCKET [--b2-path PATH]`:
+  uploads now via `rclone copyto`, records bucket+path; `verify_entry`
+  dispatches to `b2_verify()` which checks object exists AND size matches
+  via `rclone lsjson`. Credentials from B2_ACCOUNT_ID / B2_ACCOUNT_KEY
+  env vars (never on command line, never logged).
+- Also supports Cloudflare R2 via the same rclone path (S3-compatible;
+  10GB free + zero egress) — user configures rclone remote, same code works.
+- 6 new tests (binary probe, credential gating, dispatch).

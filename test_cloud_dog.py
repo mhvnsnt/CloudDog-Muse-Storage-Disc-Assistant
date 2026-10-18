@@ -1562,3 +1562,92 @@ def test_shard_needs_zfec():
         assert rc == 1
     finally:
         _patch(cloud_dog, "_zfec_available", old)
+
+
+# --------------------------------------------------- b2 store tests
+def test_rclone_binary_found():
+    result = cloud_dog._rclone_binary()
+    # Should find ~/workspace/tools/rclone/rclone on this VM
+    assert result is not None, "rclone binary should be found"
+    assert os.path.isfile(result)
+
+
+def test_b2_upload_needs_credentials():
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".dat") as f:
+        f.write(b"b2-test")
+        p = f.name
+    # Ensure no creds in env
+    old_id = os.environ.pop("B2_ACCOUNT_ID", None)
+    old_key = os.environ.pop("B2_ACCOUNT_KEY", None)
+    try:
+        ok, err = cloud_dog.b2_upload(p, "test-bucket", "test/path.dat")
+        assert not ok
+        assert "B2_ACCOUNT_ID" in err
+    finally:
+        if old_id:
+            os.environ["B2_ACCOUNT_ID"] = old_id
+        if old_key:
+            os.environ["B2_ACCOUNT_KEY"] = old_key
+        os.unlink(p)
+
+
+def test_b2_upload_needs_binary():
+    import tempfile
+    old = _patch(cloud_dog, "_rclone_binary", lambda: None)
+    try:
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            p = f.name
+        try:
+            ok, err = cloud_dog.b2_upload(p, "b", "p")
+            assert not ok
+            assert "rclone" in err.lower()
+        finally:
+            os.unlink(p)
+    finally:
+        _patch(cloud_dog, "_rclone_binary", old)
+
+
+def test_b2_verify_needs_credentials():
+    old_id = os.environ.pop("B2_ACCOUNT_ID", None)
+    old_key = os.environ.pop("B2_ACCOUNT_KEY", None)
+    try:
+        entry = {"store": "b2", "b2_bucket": "b", "b2_path": "p", "size": 100}
+        ok, err = cloud_dog.b2_verify(entry)
+        assert not ok
+        assert "B2_ACCOUNT_ID" in err
+    finally:
+        if old_id:
+            os.environ["B2_ACCOUNT_ID"] = old_id
+        if old_key:
+            os.environ["B2_ACCOUNT_KEY"] = old_key
+
+
+def test_b2_verify_needs_bucket_and_path():
+    # With fake creds, should fail on missing bucket/path before network
+    os.environ["B2_ACCOUNT_ID"] = "fake-id"
+    os.environ["B2_ACCOUNT_KEY"] = "fake-key"
+    try:
+        entry = {"store": "b2", "size": 100}  # no bucket/path
+        ok, err = cloud_dog.b2_verify(entry)
+        assert not ok
+        assert "b2_bucket" in err
+    finally:
+        del os.environ["B2_ACCOUNT_ID"]
+        del os.environ["B2_ACCOUNT_KEY"]
+
+
+def test_verify_entry_dispatches_b2():
+    # verify_entry should route b2 store to b2_verify (fails on creds, not unknown store)
+    old_id = os.environ.pop("B2_ACCOUNT_ID", None)
+    old_key = os.environ.pop("B2_ACCOUNT_KEY", None)
+    try:
+        entry = {"store": "b2", "b2_bucket": "b", "b2_path": "p", "size": 1}
+        ok, err = cloud_dog.verify_entry(entry, "/tmp/x")
+        assert not ok
+        assert "unknown store" not in err, f"should dispatch to b2, got: {err}"
+    finally:
+        if old_id:
+            os.environ["B2_ACCOUNT_ID"] = old_id
+        if old_key:
+            os.environ["B2_ACCOUNT_KEY"] = old_key
