@@ -22,10 +22,16 @@ import vvram_allocator as V
 
 
 @pytest.fixture
-def ws_tmp():
-    d = tempfile.mkdtemp(prefix="vvram-test-", dir=os.path.expanduser("~/workspace"))
-    yield d
-    shutil.rmtree(d, ignore_errors=True)
+def ws_tmp(tmp_path):
+    """Temp dir under ~/workspace if present (this VM's /tmp is a tiny
+    tmpfs); else pytest's tmp_path (CI runners)."""
+    ws = os.path.expanduser("~/workspace")
+    if os.path.isdir(ws):
+        d = tempfile.mkdtemp(prefix="vvram-test-", dir=ws)
+        yield d
+        shutil.rmtree(d, ignore_errors=True)
+    else:
+        yield str(tmp_path)
 
 
 def _write(path, data):
