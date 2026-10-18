@@ -57,13 +57,70 @@ def test_marker_on_ancestor_blocks_delete(tmp_path):
     assert decision.allowed is False
 
 
-def test_protected_game_file_needs_owner_and_store():
+def test_protected_game_file_strict_bar_all_three_conditions_allowed():
+    """Owner 2026-10-17: game files clear at the strict bar — 100% verified
+    store + retrievability proven + owner surfaced."""
     path = "/x/teardown/game.iso"
-    denied = laws.decide_delete(path, verified_stores=["terabox"], owner_approved=False)
-    assert denied.allowed is False
-    assert denied.requires_owner is True
-    approved = laws.decide_delete(path, verified_stores=["terabox"], owner_approved=True)
-    assert approved.allowed is True
+    decision = laws.decide_delete(
+        path,
+        verified_stores=["terabox"],
+        retrievability_proven=True,
+        owner_surfaced=True,
+    )
+    assert decision.allowed is True
+    assert decision.requires_owner is True
+
+
+def test_protected_game_file_owner_approved_satisfies_owner_surfaced():
+    """Backward compat: owner_approved=True counts as owner_surfaced."""
+    path = "/x/teardown/game.iso"
+    decision = laws.decide_delete(
+        path,
+        verified_stores=["terabox"],
+        owner_approved=True,
+        retrievability_proven=True,
+    )
+    assert decision.allowed is True
+
+
+def test_protected_game_file_missing_store_names_verified_stores():
+    path = "/x/teardown/game.iso"
+    decision = laws.decide_delete(
+        path,
+        verified_stores=[],
+        retrievability_proven=True,
+        owner_surfaced=True,
+    )
+    assert decision.allowed is False
+    assert decision.requires_owner is True
+    assert "verified_stores" in decision.reasons[0]
+
+
+def test_protected_game_file_missing_retrievability_names_it():
+    path = "/x/teardown/game.iso"
+    decision = laws.decide_delete(
+        path,
+        verified_stores=["github"],
+        retrievability_proven=False,
+        owner_surfaced=True,
+    )
+    assert decision.allowed is False
+    assert decision.requires_owner is True
+    assert "retrievability_proven" in decision.reasons[0]
+    assert "a listing is NOT proof" in decision.reasons[0]
+
+
+def test_protected_game_file_missing_owner_surfaced_names_it():
+    path = "/x/teardown/game.iso"
+    decision = laws.decide_delete(
+        path,
+        verified_stores=["github"],
+        retrievability_proven=True,
+        owner_surfaced=False,
+    )
+    assert decision.allowed is False
+    assert decision.requires_owner is True
+    assert "owner_surfaced" in decision.reasons[0]
 
 
 def test_require_execute_raises_without_yes():

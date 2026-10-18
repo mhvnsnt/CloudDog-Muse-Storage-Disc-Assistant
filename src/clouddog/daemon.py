@@ -7,7 +7,7 @@ dry-run mode, never for protected actions).
 
 Iron rules enforced here, defense in depth:
   * NEVER delete on a failed verify.
-  * NEVER touch SACRED / NEVER_DELETE / KEEP_LOCAL (_delete_local raises
+  * NEVER touch SACRED / STORE_AND_CLEAR_STRICT / KEEP_LOCAL (_delete_local raises
     PolicyViolation for anything but STORE_AND_CLEAR).
   * Silent ticks: tick() returns a TickReport; run_forever() only prints
     when a tick is critical or recorded errors.
@@ -244,7 +244,7 @@ class Daemon:
         if not path:
             return
         if action not in _STORE_ACTIONS:
-            # SACRED / NEVER_DELETE / KEEP_LOCAL (and anything unknown):
+            # SACRED / STORE_AND_CLEAR_STRICT / KEEP_LOCAL (and anything unknown):
             # counted, never touched.
             report.skipped_sacred += 1
             return
@@ -412,7 +412,7 @@ class Daemon:
             self._journal("skipped", ",".join(self.roots), 0, "",
                           f"skipped {report.skipped_sacred} protected entr"
                           f"{'y' if report.skipped_sacred == 1 else 'ies'} "
-                          f"(sacred/never_delete/keep_local)")
+                          f"(sacred/store_and_clear_strict/keep_local)")
 
         report.disk_after_pct = self._disk_pct()
 

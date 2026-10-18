@@ -4,8 +4,14 @@ Law sources (owner's verbatim rules, ~/AGENTS.md):
 - NEVER-DELETE-GAME-FILES LAW (2026-10-14): "GAME FILES ARE NEVER AUTO-DELETED."
   Covers ISOs, ROMs, game archives (.zip/.rar/.7z of full games), teardown
   source files, anything in game-reverse-engineering/, chimera-roms/, or any
-  teardown lane's source material. "No disk cleanup worker, guardian cron, or
-  subagent may delete a game file. Ever."
+  teardown lane's source material. REFINED 2026-10-17 (not deleted): owner
+  verbatim — "it can deal with game files, only if it's a hundred percent
+  saved into the repos... it has to be a hundred percent stored somewhere
+  where it's savable and where we can get back to it, that's really the
+  biggest deal." The blanket ban is now the strictest bar in the system:
+  deletion allowed ONLY at 100% byte-verified store (hash+size) +
+  retrievability proven (pull-back actually tested; a listing is NOT proof)
+  + owner surfaced (never silent).
 - NEVER-KILL-IN-PROGRESS LAW (2026-10-15) / NO-SWEEP-INFLIGHT LAW (2026-10-16):
   "NEVER delete, move, or 'clean up' anything that is downloading, uploading,
   rendering, extracting, or otherwise in-flight -- no matter how full the disk
@@ -168,6 +174,8 @@ def decide_delete(
     *,
     verified_stores: list[str],
     owner_approved: bool = False,
+    retrievability_proven: bool = False,
+    owner_surfaced: bool = False,
     extra_patterns: tuple = (),
 ) -> Decision:
     """Decide whether deleting *path* is allowed under the owner's laws.
@@ -176,8 +184,19 @@ def decide_delete(
     1. In-progress -> never allowed (NEVER-KILL-IN-PROGRESS / NO-SWEEP-INFLIGHT;
        no override exists, not even the owner's).
     2. .DO_NOT_DELETE marker in ancestry -> not allowed; owner must handle it.
-    3. Protected game file -> needs owner approval AND at least one verified
-       store (ONE-STORE RULE + NEVER-DELETE-GAME-FILES).
+    3. Protected game file -> GAME-FILE STRICT BAR (owner 2026-10-17,
+       refines the 2026-10-14 blanket ban): "it can deal with game files,
+       only if it's a hundred percent saved into the repos... it has to be
+       a hundred percent stored somewhere where it's savable and where we
+       can get back to it, that's really the biggest deal." Allowed ONLY
+       when ALL three hold: (a) verified_stores non-empty — callers pass
+       ONLY fully 100% byte-verified (hash+size) stores; (b)
+       retrievability_proven=True — pull-back actually tested (asset
+       downloadable / manifest fetched; a listing is NOT proof);
+       (c) owner_surfaced=True — the store event was surfaced to the owner,
+       never silent (owner_approved=True satisfies this for backward
+       compat). Any condition missing -> not allowed, requires_owner=True,
+       and the reasons name exactly which condition is missing.
     4. Ordinary file verified 100% on at least one store -> allowed
        (ONE-STORE RULE; no per-file ask).
     5. Nothing verified on any store -> not allowed
@@ -211,26 +230,44 @@ def decide_delete(
     protected, why = is_protected_game_file(path, extra_patterns)
     if protected:
         stores = list(verified_stores)
-        if owner_approved and stores:
-            reasons = [
-                (f"protected game file ({why}); NEVER-DELETE-GAME-FILES owner approval present"),
-                f"ONE-STORE RULE: verified 100% on {', '.join(stores)}",
-            ]
-            return Decision(allowed=True, requires_owner=True, reasons=reasons)
+        # owner_approved implies the owner saw (and approved) this deletion,
+        # so it satisfies owner_surfaced for backward compatibility.
+        surfaced = bool(owner_surfaced or owner_approved)
         missing = []
-        if not owner_approved:
-            missing.append("owner approval missing")
         if not stores:
-            missing.append("no verified store")
+            missing.append(
+                "verified_stores: no 100% byte-verified store (hash+size) on GitHub OR TeraBox"
+            )
+        if not retrievability_proven:
+            missing.append(
+                "retrievability_proven: pull-back must be actually tested "
+                "(asset downloadable / manifest fetched) — a listing is NOT proof"
+            )
+        if not surfaced:
+            missing.append(
+                "owner_surfaced: the store event must be surfaced to the owner, "
+                "never silent (owner_approved also satisfies this)"
+            )
+        if missing:
+            return Decision(
+                allowed=False,
+                requires_owner=True,
+                reasons=[
+                    (
+                        f"protected game file ({why}); GAME-FILE STRICT BAR "
+                        f"(owner 2026-10-17): missing {', '.join(missing)}; "
+                        "ONE-STORE RULE requires 100% verification on GitHub OR TeraBox"
+                    ),
+                ],
+            )
         return Decision(
-            allowed=False,
+            allowed=True,
             requires_owner=True,
             reasons=[
-                (
-                    f"protected game file ({why}); NEVER-DELETE-GAME-FILES: "
-                    f"{', '.join(missing)}; "
-                    "ONE-STORE RULE requires 100% verification on GitHub OR TeraBox"
-                ),
+                (f"protected game file ({why}); GAME-FILE STRICT BAR (owner 2026-10-17) satisfied"),
+                f"verified_stores: 100% byte-verified on {', '.join(stores)} (hash+size)",
+                "retrievability_proven: pull-back actually tested",
+                "owner_surfaced: store event surfaced to the owner",
             ],
         )
 

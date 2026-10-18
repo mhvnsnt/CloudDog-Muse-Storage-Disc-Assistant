@@ -5,8 +5,15 @@ Encodes the owner's disk laws verbatim-grounded, nothing invented:
 - NEVER-KILL-IN-PROGRESS: anything in flight (partial-download suffixes,
   recently modified large files, paths under a ``.DO_NOT_DELETE*`` marker)
   is SACRED — do not touch it at all.
-- NEVER-DELETE-GAME-FILES: game files (ISOs/ROMs/teardown sources) may be
-  mirrored to a store but are never auto-deleted.
+- NEVER-DELETE-GAME-FILES (2026-10-14) REFINED 2026-10-17: the blanket
+  NEVER_DELETE terminal action is REMOVED (the law is refined, not deleted).
+  Owner verbatim 2026-10-17: "it can deal with game files, only if it's a
+  hundred percent saved into the repos... it has to be a hundred percent
+  stored somewhere where it's savable and where we can get back to it,
+  that's really the biggest deal." Game files are clearable ONLY at the
+  strictest bar in the system: 100% byte-verified store (hash+size) +
+  retrievability proven (pull-back actually tested; a listing is NOT proof)
+  + owner surfaced (never silent). Never auto-deleted.
 - Disk is a cache, not storage: big cold files are STORE_AND_CLEAR once
   byte-verified on a store; small hot files and tooling KEEP_LOCAL.
 
@@ -73,9 +80,17 @@ class Action(Enum):
 
     STORE = "store"  # mirror to tier; keep local for now
     STORE_AND_CLEAR = "store_and_clear"  # eligible to clear after byte-verified store
+    # Game files: the strictest bar in the system. The 2026-10-14 blanket
+    # NEVER_DELETE terminal action was REMOVED by the owner's 2026-10-17
+    # refinement: "it can deal with game files, only if it's a hundred
+    # percent saved into the repos... it has to be a hundred percent stored
+    # somewhere where it's savable and where we can get back to it, that's
+    # really the biggest deal." Clearable ONLY at 100% byte-verified store
+    # + retrievability proven (pull-back actually tested) + owner surfaced.
+    # Never auto-deleted.
+    STORE_AND_CLEAR_STRICT = "store_and_clear_strict"
     KEEP_LOCAL = "keep_local"  # active work / small / tooling
     SACRED = "sacred"  # in-flight or protected: do not touch at all
-    NEVER_DELETE = "never_delete"  # game files: may store, never auto-delete
 
 
 @dataclass
@@ -191,8 +206,8 @@ def evaluate(path: str, scan_root: str | None = None) -> Decision:
     """Evaluate one path and return a Decision. Never raises on bad input.
 
     Check order mirrors the owner's laws: SACRED (in-flight/protected) wins
-    over everything, then NEVER-DELETE-GAME-FILES, then KEEP_LOCAL (tooling /
-    hot small files), then the size-based default.
+    over everything, then the refined GAME-FILE strict bar, then KEEP_LOCAL
+    (tooling / hot small files), then the size-based default.
     """
     if not path or not str(path).strip():
         return Decision(
@@ -216,10 +231,23 @@ def evaluate(path: str, scan_root: str | None = None) -> Decision:
         return Decision(Action.SACRED, None, sacred_reason)
 
     if _is_game_file(p):
+        # GAME-FILE STRICT BAR (owner 2026-10-17, refines the 2026-10-14 law):
+        # "it can deal with game files, only if it's a hundred percent saved
+        # into the repos... it has to be a hundred percent stored somewhere
+        # where it's savable and where we can get back to it, that's really
+        # the biggest deal." The blanket NEVER_DELETE terminal action is
+        # gone; game files clear ONLY at the strictest bar: 100%
+        # byte-verified store + retrievability proven (pull-back actually
+        # tested; a listing is NOT proof) + owner surfaced (never silent).
         return Decision(
-            Action.NEVER_DELETE,
+            Action.STORE_AND_CLEAR_STRICT,
             suggest_tier(p, size),
-            "never_delete: game file (NEVER-DELETE-GAME-FILES) — may mirror to store, never auto-delete",
+            "store_and_clear_strict: game file — clearable ONLY at the strict "
+            "bar (owner 2026-10-17: 'it has to be a hundred percent stored "
+            "somewhere where it's savable and where we can get back to it'). "
+            "Requires 100% byte-verified store (hash+size) + retrievability "
+            "proven (pull-back actually tested) + owner surfaced; never "
+            "auto-deleted.",
         )
 
     components = {part.lower() for part in p.parts}
