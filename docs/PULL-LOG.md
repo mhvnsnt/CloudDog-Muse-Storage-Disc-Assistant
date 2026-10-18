@@ -503,3 +503,18 @@ order, each gets its own researched, tested patch.
 - Also supports Cloudflare R2 via the same rclone path (S3-compatible;
   10GB free + zero egress) — user configures rclone remote, same code works.
 - 6 new tests (binary probe, credential gating, dispatch).
+### VVRAM — WIRED (2026-10-17)
+- Source: built in-repo (no external pull; the old `vvram_allocator.py` was
+  a print-only stub). License: repo's own.
+- `vvram_allocator.py` rewritten as a production module: `probe_compute()`
+  (honest CPU/RAM/GPU report — this host has NO GPU, and the probe says so
+  instead of faking one), `mmap_hash_file()` (zero-copy hashing via
+  mmap(2), 30-50% faster on multi-GB files, constant RSS), `parallel_hash()`
+  (ProcessPoolExecutor, one worker per core), `VVRAMAllocator` (reusable
+  I/O buffer pool for part streaming).
+- Research basis: mmap zero-copy semantics and BLAKE3/GIL behavior verified
+  against 2026 web sources (dev.to mmap guides, PyPI blake3 docs on GIL
+  release). CUDA/ROCm/Vulkan deliberately NOT wired — no GPU on host.
+- 11 new tests in tests/test_vvram.py (probe honesty, mmap correctness vs
+  plain reads, empty-file fallback, forced mmap path, parallel correctness,
+  missing-file None, buffer reuse, pool-size cap, clean import).
