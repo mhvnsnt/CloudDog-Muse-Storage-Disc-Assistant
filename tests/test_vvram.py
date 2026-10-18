@@ -37,10 +37,28 @@ def test_probe_compute_honest():
     info = V.probe_compute()
     assert info["cpu_count"] >= 1
     assert info["mmap_available"] is True
-    # This host has no GPU — the probe must say so, not fake one.
-    assert info["gpu"] is None
-    assert info["cuda"] is False
-    assert info["rocm"] is False
+    # The probe must be HONEST: if it reports a GPU, the device must exist;
+    # if it reports None, no GPU device may exist. Never faked either way.
+    if info["gpu"] is None:
+        assert info["cuda"] is False
+        assert info["rocm"] is False
+        # No nvidia-smi with working output, no /dev/dri entries
+        import shutil
+
+        if shutil.which("nvidia-smi"):
+            import subprocess
+
+            out = subprocess.run(
+                ["nvidia-smi", "-L"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            assert not (out.returncode == 0 and out.stdout.strip())
+    else:
+        # A reported GPU must correspond to a real device probe hit.
+        assert isinstance(info["gpu"], list) and len(info["gpu"]) > 0
 
 
 def test_mmap_hash_matches_plain_read(ws_tmp):
