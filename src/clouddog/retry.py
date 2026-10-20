@@ -11,11 +11,13 @@ failures — its HTTP client is single-attempt. Any wrapper around ``gh``
 (or curl/aria2/tbupload subprocesses) must BE the retry layer. This module
 is that layer, shared by all backends.
 """
+
 from __future__ import annotations
 
 import random
 import time
-from typing import Callable, TypeVar
+from collections.abc import Callable
+from typing import TypeVar
 
 T = TypeVar("T")
 
@@ -88,8 +90,14 @@ def classify_error(
     low = (text or "").lower()
     if "401" in low or "unauthorized" in low:
         strong_transient = (
-            "connection", "stream", "proxy", "timeout", "timed out",
-            "temporarily", "reset", "eof",
+            "connection",
+            "stream",
+            "proxy",
+            "timeout",
+            "timed out",
+            "temporarily",
+            "reset",
+            "eof",
         )
         return any(h in low for h in strong_transient)
     if any(h in low for h in permanent_hints):
@@ -132,14 +140,14 @@ def with_backoff(
     before each retry sleep (logging hook).
     """
     if is_transient is None:
-        is_transient = lambda exc: isinstance(exc, TransientError)  # noqa: E731
+        is_transient = lambda exc: isinstance(exc, TransientError)
     rand = rng if rng is not None else random
     start = clock()
     attempt = 0
     while True:
         try:
             return fn()
-        except BaseException as exc:  # noqa: BLE001 - re-raised unless transient
+        except BaseException as exc:
             if not is_transient(exc):
                 raise
             attempt += 1

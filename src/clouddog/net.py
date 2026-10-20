@@ -12,6 +12,7 @@ agent-ops/research-friction-20261019/01-resilient-transfer.md (W3/W6):
 segmented, resumable, retry-heavy flag sets lanes can call by name.
 ``gh`` has no retry flags at all — that retry layer lives in retry.py.
 """
+
 from __future__ import annotations
 
 import os
@@ -61,8 +62,14 @@ def proxy_env(base: dict[str, str] | None = None) -> dict[str, str]:
     """
     env = dict(os.environ if base is None else base)
     if env.get(BYPASS_ENV) == "*":
-        for key in ("http_proxy", "https_proxy", "all_proxy",
-                    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        for key in (
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+        ):
             env.pop(key, None)
         env["no_proxy"] = "*"
         env["NO_PROXY"] = "*"
@@ -76,8 +83,7 @@ def proxy_env(base: dict[str, str] | None = None) -> dict[str, str]:
 def proxy_endpoint(env: dict[str, str] | None = None) -> str:
     """Redacted host:port of the effective proxy, for attempt logging."""
     env = os.environ if env is None else env
-    for key in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY",
-                "all_proxy", "ALL_PROXY"):
+    for key in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"):
         if env.get(key):
             return _redacted_proxy(env[key])
     return "direct"
@@ -90,14 +96,20 @@ def proxy_endpoint(env: dict[str, str] | None = None) -> str:
 #: curl: retry everything retryable incl. connection-refused (our exact
 #: proxy symptom), kill silent stalls via speed floor, box total time.
 CURL_RESILIENT: tuple[str, ...] = (
-    "--retry", "8",
+    "--retry",
+    "8",
     "--retry-all-errors",
     "--retry-connrefused",
-    "--retry-delay", "5",
-    "--retry-max-time", "1800",
-    "--speed-limit", "10000",
-    "--speed-time", "60",
-    "--connect-timeout", "30",
+    "--retry-delay",
+    "5",
+    "--retry-max-time",
+    "1800",
+    "--speed-limit",
+    "10000",
+    "--speed-time",
+    "60",
+    "--connect-timeout",
+    "30",
 )
 
 #: aria2 download: segmented, resumable via .aria2 control file, retries
@@ -122,11 +134,16 @@ ARIA2_RESILIENT: tuple[str, ...] = (
 
 #: rclone: two-tier retry (operation + low-level HTTP), generous timeouts.
 RCLONE_RESILIENT: tuple[str, ...] = (
-    "--retries", "10",
-    "--retries-sleep", "30s",
-    "--low-level-retries", "20",
-    "--timeout", "300s",
-    "--contimeout", "60s",
+    "--retries",
+    "10",
+    "--retries-sleep",
+    "30s",
+    "--low-level-retries",
+    "20",
+    "--timeout",
+    "300s",
+    "--contimeout",
+    "60s",
 )
 
 FLAG_PRESETS: dict[str, tuple[str, ...]] = {
@@ -141,9 +158,7 @@ def preset(tool: str) -> list[str]:
     try:
         return list(FLAG_PRESETS[tool])
     except KeyError:
-        raise ValueError(
-            f"unknown flag preset {tool!r}; have {sorted(FLAG_PRESETS)}"
-        ) from None
+        raise ValueError(f"unknown flag preset {tool!r}; have {sorted(FLAG_PRESETS)}") from None
 
 
 _PROXY_HOST_RE = re.compile(r"^[A-Za-z0-9.\-]+(:\d+)?$")

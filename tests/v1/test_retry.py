@@ -4,6 +4,7 @@ Includes simulated proxy flakes: gh-style subprocess failures whose stderr
 matches the egress-proxy symptoms (ECONNREFUSED, stream CANCEL, injected
 401) must be classified transient and ridden through by with_backoff.
 """
+
 from __future__ import annotations
 
 import random
@@ -23,27 +24,33 @@ from clouddog.retry import (
 # ------------------------------------------------------------------ #
 # classifier
 # ------------------------------------------------------------------ #
-@pytest.mark.parametrize("text", [
-    "dial tcp: connect: connection refused",
-    "Post https://uploads.github.com: EOF",
-    "HTTP 503 Service Unavailable",
-    "error: 429 Too Many Requests",
-    "stream error: stream ID 7; CANCEL",
-    "empty reply from server",
-    "context deadline exceeded",
-    "i/o timeout",
-    "502 Bad Gateway via proxy",
-])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "dial tcp: connect: connection refused",
+        "Post https://uploads.github.com: EOF",
+        "HTTP 503 Service Unavailable",
+        "error: 429 Too Many Requests",
+        "stream error: stream ID 7; CANCEL",
+        "empty reply from server",
+        "context deadline exceeded",
+        "i/o timeout",
+        "502 Bad Gateway via proxy",
+    ],
+)
 def test_transient_texts(text):
     assert classify_error(text) is True
 
 
-@pytest.mark.parametrize("text", [
-    "404 Not Found",
-    "422 Unprocessable Entity: validation failed",
-    "open /nope: no such file or directory",
-    "permission denied",
-])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "404 Not Found",
+        "422 Unprocessable Entity: validation failed",
+        "open /nope: no such file or directory",
+        "permission denied",
+    ],
+)
 def test_permanent_texts(text):
     assert classify_error(text) is False
 
@@ -108,8 +115,7 @@ def test_backoff_respects_max_elapsed():
         raise TransientError("timeout")
 
     with pytest.raises(TransientError):
-        with_backoff(always, max_elapsed_s=60.0, clock=lambda: next(ticks),
-                     sleep=lambda s: None)
+        with_backoff(always, max_elapsed_s=60.0, clock=lambda: next(ticks), sleep=lambda s: None)
 
 
 def test_before_sleep_hook_fires():
@@ -122,8 +128,7 @@ def test_before_sleep_hook_fires():
             raise TransientError("eof")
         return 1
 
-    with_backoff(fn, sleep=lambda s: None,
-                 before_sleep=lambda a, d, e: seen.append(a))
+    with_backoff(fn, sleep=lambda s: None, before_sleep=lambda a, d, e: seen.append(a))
     assert seen == [1, 2]
 
 
@@ -169,7 +174,6 @@ def test_flag_presets():
     assert "--low-level-retries" in rclone
     with pytest.raises(ValueError):
         net.preset("wget")
-
 
 
 # ------------------------------------------------------------------ #
