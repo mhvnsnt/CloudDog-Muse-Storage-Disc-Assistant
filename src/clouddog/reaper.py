@@ -83,7 +83,16 @@ class Reaper:
         store_verify: Callable[[str, str], bool] | None = None,
         protected_suffixes: tuple[str, ...] = (".py", ".log", ".json", ".sha256"),
         protected_names: tuple[str, ...] | None = None,
+        claim_check: Callable[[str], tuple[bool, str]] | None = None,
     ) -> None:
+        # claim_check (the Tekken 5 fix): optional callable consulted
+        # before any delete; takes the guarded absolute path, returns
+        # (blocked, reason). Blocked => never deleted; a checker that
+        # raises fails closed (skip). Build one with
+        # clouddog.claims.make_claim_checker(); the clouddog CLI always
+        # passes one, so production reaps consult the claims store.
+        # None = legacy gate-less behavior (unit tests, direct use).
+        self._claim_check = claim_check
         if hash_algo not in ("git-sha1", "sha256"):
             raise ValueError(f"unknown hash_algo: {hash_algo!r}")
         src_real = os.path.realpath(src_dir)
@@ -224,6 +233,20 @@ class Reaper:
             )
             return "mismatch", spot_count
         size = os.path.getsize(guarded)
+        # Claims gate (the Tekken 5 fix): a live work claim on this path
+        # (or an ancestor dir) is a HARD BLOCK. Checked before the
+        # dry-run branch so a dry run never prints WOULD-REAP for a file
+        # a live run would refuse. A checker that raises fails CLOSED,
+        # same as the store_verify contract below.
+        if self._claim_check is not None:
+            try:
+                claimed, why = self._claim_check(guarded)
+            except Exception as e:  # noqa: BLE001
+                self.log("CLAIMS-UNREADABLE %s (%s) NOT deleted" % (rel, e))
+                return "skipped", spot_count
+            if claimed:
+                self.log("CLAIMED-SKIP %s (%s) NOT deleted" % (rel, why))
+                return "skipped", spot_count
         if dry_run:
             self.log("WOULD-REAP %s %s %d" % (rel, sha, size))
             return "skipped", spot_count

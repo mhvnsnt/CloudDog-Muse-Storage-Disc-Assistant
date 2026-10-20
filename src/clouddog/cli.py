@@ -1,6 +1,7 @@
 """CloudDog command-line interface.
 
-Subcommands: scan, store, reap, stream, daemon, verify, dashboard, du, dedupe.
+Subcommands: scan, store, reap, stream, daemon, verify, dashboard, du, dedupe,
+claims (work-claim check: exit 0 = claimed/BLOCKED, 1 = free).
 
 Global flags:
   --dry-run   no destructive action anywhere (store/reap/daemon all honor it)
@@ -303,9 +304,14 @@ def cmd_reap(args: argparse.Namespace) -> int:
                                 size=os.path.getsize(full), sha256="")
                 return _b.verify(full, ref)
 
+    # Claims gate (the Tekken 5 fix): production reaps ALWAYS consult the
+    # claims store; a live claim — or an unreadable store — blocks deletes.
+    from clouddog.claims import make_claim_checker
+
     try:
         reaper = Reaper(args.src_dir, manifest, log_path,
-                        hash_algo=args.hash_algo, store_verify=store_verify)
+                        hash_algo=args.hash_algo, store_verify=store_verify,
+                        claim_check=make_claim_checker())
         report = reaper.reap_once(dry_run=args.dry_run)
     except CloudDogError as exc:
         print(f"[clouddog] reap failed: {exc}", file=sys.stderr)
@@ -335,6 +341,28 @@ def cmd_reap(args: argparse.Namespace) -> int:
     if rep.get("halted") or rep.get("mismatches"):
         return 3
     return 0
+
+
+# ---------------------------------------------------------------- claims
+
+def cmd_claims(args: argparse.Namespace) -> int:
+    """`clouddog claims check <path>` — the sweep-lane one-liner.
+
+    For non-CloudDog lanes that are about to delete something they did
+    not create: exit 0 = BLOCKED (claimed, or the claims store is
+    unreadable and we fail closed), exit 1 = FREE.
+    """
+    from clouddog.claims import check_claimed, default_claims_db
+
+    blocked, detail = check_claimed(default_claims_db(), args.path)
+    if args.json:
+        print(json.dumps({"path": os.path.abspath(args.path),
+                          "blocked": blocked, "detail": detail}, indent=2))
+    elif blocked:
+        print(f"BLOCKED {os.path.abspath(args.path)} — {detail}")
+    else:
+        print(f"FREE {os.path.abspath(args.path)}")
+    return 0 if blocked else 1
 
 
 # ---------------------------------------------------------------- stream
@@ -731,6 +759,14 @@ def build_parser() -> argparse.ArgumentParser:
     dd.add_argument("--min-size", default="1M",
                     help="minimum file size to consider (default 1M)")
     dd.set_defaults(func=cmd_dedupe)
+
+    cl = sub.add_parser("claims",
+                        help="work-claim check: is this path claimed by a lane?")
+    _add_common_flags(cl)
+    cl.add_argument("action", choices=["check"],
+                    help="claim check for sweep lanes")
+    cl.add_argument("path", help="file or directory to check")
+    cl.set_defaults(func=cmd_claims)
 
     return p
 
