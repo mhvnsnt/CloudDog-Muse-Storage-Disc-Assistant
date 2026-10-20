@@ -594,14 +594,26 @@ def test_github_resolve_asset_name_exact_and_ambiguous(monkeypatch):
 
 
 def test_github_scratch_tmpdir_avoids_tmpfs(monkeypatch, tmp_path):
-    """Release download/verify scratch must NOT live on /tmp (a 512MB
-    tmpfs): a full /tmp made verify fail with 'no space left on device'
-    while the disk itself had gigabytes free."""
+    """Release download/verify scratch must NOT live on the /tmp tmpfs: a
+    full /tmp made verify fail with 'no space left on device' while the
+    disk itself had gigabytes free.
+
+    Asserts the production invariant directly: the scratch dir is rooted
+    under the user's home (~/.clouddog/tmp) and NEVER under
+    tempfile.gettempdir(). (The previous version hardcoded '/tmp' as the
+    forbidden prefix, which fails on CI runners whose pytest tmp_path is
+    itself under /tmp — the scratch correctly followed the faked HOME;
+    main's CI has been red on it since PR #36.)
+    """
+    import tempfile
+
     from clouddog.stores import github as gh_mod
 
     fake_home = tmp_path / "home"
+    fake_temp = tmp_path / "os-tempdir"
     monkeypatch.setattr(os.path, "expanduser", lambda p: str(fake_home) + p[1:])
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fake_temp))
     with gh_mod._scratch_tmpdir("probe-") as d:
         real = os.path.realpath(d)
         assert real.startswith(os.path.realpath(str(fake_home)) + os.sep), real
-        assert not real.startswith("/tmp" + os.sep), real
+        assert not real.startswith(os.path.realpath(str(fake_temp)) + os.sep), real
