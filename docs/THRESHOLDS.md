@@ -1,7 +1,6 @@
 # CloudDog Thresholds — Research Consensus
 
-**Status: PROPOSED — not yet approved.** Current code values stay exactly as-is
-until the owner approves a change. This document records the team's multi-angle
+**Status: APPROVED by owner 2026-10-17 23:50 CDT** ("Approve — keep all four"). Current code values are the approved values; any future change needs a new owner decision. This document records the team's multi-angle
 research (owner order 2026-10-17 ~20:48 CDT: "the whole agent team... what they
 all agree on... best research... different directions... don't be lazy").
 
