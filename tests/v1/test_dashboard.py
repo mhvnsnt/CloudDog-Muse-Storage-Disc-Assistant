@@ -274,7 +274,7 @@ def test_sweep_returns_job_immediately(base_url):
 # test time — a constant pretending to be data fails these tests.
 # ---------------------------------------------------------------------------
 
-import os  # noqa: E402
+import os
 
 
 def _registry_live_file():
@@ -351,34 +351,22 @@ def test_registry_lane_reflects_live_registry(base_url):
     assert reg["uploaded"] <= reg["total"]
 
 
-def test_policy_fallback_scan_reports_live_bytes():
+def test_policy_fallback_scan_reports_live_bytes(tmp_path):
     """The policy/scan evaluate() fallback must report real sizes from a
     live stat, not a hardcoded 0."""
-    import os as _os
-
-    from clouddog.dashboard.server import _policy_evaluate_scan
     from clouddog import policy
+    from clouddog.dashboard.server import _policy_evaluate_scan
 
-    import tempfile
-
-    d = tempfile.mkdtemp(prefix="clouddog-policy-scan-")
-    try:
-        blob = _os.path.join(d, "blob.bin")
-        with open(blob, "wb") as fh:
-            fh.write(b"x" * 2048)
-        sub = _os.path.join(d, "sub")
-        _os.mkdir(sub)
-        with open(_os.path.join(sub, "n.txt"), "w") as fh:
-            fh.write("y" * 100)
-        res = _policy_evaluate_scan(policy, d)
-        got = {r["path"]: r["bytes"] for r in res}
-        assert got[blob] == 2048
-        assert got[sub] == 100
-        assert all(r["bytes"] > 0 for r in res if _os.path.isdir(r["path"]))
-    finally:
-        import shutil as _shutil
-
-        _shutil.rmtree(d, ignore_errors=True)
+    blob = tmp_path / "blob.bin"
+    blob.write_bytes(b"x" * 2048)
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "n.txt").write_text("y" * 100)
+    res = _policy_evaluate_scan(policy, str(tmp_path))
+    got = {r["path"]: r["bytes"] for r in res}
+    assert got[str(blob)] == 2048
+    assert got[str(sub)] == 100
+    assert all(r["bytes"] > 0 for r in res if os.path.isdir(r["path"]))
 
 
 def test_disk_numbers_match_live_reading(base_url):
