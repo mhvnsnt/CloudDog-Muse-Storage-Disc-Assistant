@@ -359,6 +359,12 @@ def test_terabox_bad_remote_ref(monkeypatch, local_file):
 
 
 def test_terabox_verify_true(monkeypatch, local_file):
+    # Owner decision 2026-10-19: name+size is REMOVED as a verification
+    # basis. Even a perfectly matching listing must NOT pass — verify()
+    # fails closed (VerificationFailed) because TeraBox has no
+    # byte-level re-download wired.
+    from clouddog.errors import VerificationFailed
+
     patch_tb(monkeypatch, make_tb_fake(ls_entries=[(FILE_NAME, len(FILE_BYTES))]))
     stored = StoredRef(
         backend="terabox",
@@ -366,10 +372,13 @@ def test_terabox_verify_true(monkeypatch, local_file):
         size=len(FILE_BYTES),
         sha256=FILE_SHA256,
     )
-    assert TeraBoxBackend().verify(local_file, stored) is True
+    with pytest.raises(VerificationFailed, match="fail closed"):
+        TeraBoxBackend().verify(local_file, stored)
 
 
 def test_terabox_verify_false(monkeypatch, local_file):
+    from clouddog.errors import VerificationFailed
+
     patch_tb(monkeypatch, make_tb_fake(ls_entries=[("other.bin", 9)]))
     stored = StoredRef(
         backend="terabox",
@@ -377,7 +386,8 @@ def test_terabox_verify_false(monkeypatch, local_file):
         size=len(FILE_BYTES),
         sha256=FILE_SHA256,
     )
-    assert TeraBoxBackend().verify(local_file, stored) is False
+    with pytest.raises(VerificationFailed, match="fail closed"):
+        TeraBoxBackend().verify(local_file, stored)
 
 
 # ---------------------------------------------------------------------- #

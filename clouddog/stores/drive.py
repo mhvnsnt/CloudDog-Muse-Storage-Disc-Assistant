@@ -117,9 +117,38 @@ class DriveStore(Store):
         return ref
 
     def verify(self, ref: StoredRef) -> bool:
-        """Re-check Drive NOW; True iff the file exists with matching byte size."""
-        size = self._remote_size(ref.remote_path)
-        return size is not None and size == ref.size
+        """Re-download the stored bytes NOW and sha256-check them.
+
+        Owner decision 2026-10-19: FULL RE-DOWNLOAD VERIFY, EVERY TIME.
+        The old basis (``rclone lsjson`` existence + size) was metadata,
+        not proof, and is removed. True iff the pulled-back bytes match
+        the recorded size AND sha256. A ref with no recorded sha256
+        cannot be byte-proven: VerificationFailed (fail closed).
+        """
+        if not ref.sha256:
+            raise VerificationFailed(
+                "drive: StoredRef has no recorded sha256; cannot prove "
+                "byte-identity by re-download (fail closed, owner "
+                "decision 2026-10-19)."
+            )
+        import tempfile
+
+        scratch = os.path.expanduser("~/.clouddog/tmp")
+        try:
+            os.makedirs(scratch, exist_ok=True)
+        except OSError:
+            scratch = None
+        with tempfile.TemporaryDirectory(dir=scratch) as td:
+            dest = os.path.join(td, "pullback.bin")
+            proc = self._rclone(
+                ["copyto", f"{self.remote}:{ref.remote_path}", dest],
+                timeout=UPLOAD_TIMEOUT,
+            )
+            if proc.returncode != 0:
+                return False
+            if os.path.getsize(dest) != ref.size:
+                return False
+            return sha256_of(dest) == ref.sha256
 
     def exists(self, remote_dir: str, remote_name: str) -> StoredRef | None:
         path, _ = self._target(remote_dir, remote_name)

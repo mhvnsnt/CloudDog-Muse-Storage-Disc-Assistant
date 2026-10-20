@@ -42,15 +42,22 @@ def test_github_split_bytes_is_the_shared_constant():
     assert github_mod.SPLIT_BYTES == 100 * MB
 
 
-def test_github_split_produces_100mb_parts(tmp_path):
-    """A real split of a >100MB file yields 100 MiB parts (last = rest)."""
+def test_github_split_produces_chunk_sized_parts(tmp_path, monkeypatch):
+    """_split must read the shared constant, not a hardcoded size.
+
+    SPLIT_BYTES is patched down to 4 MiB so the test stays tiny on disk
+    (the real 100 MiB value is asserted separately above); the split of
+    a 10 MiB + 123 file must then yield [4 MiB, 4 MiB, 2 MiB + 123].
+    If _split ignored the constant, the parts would not match.
+    """
+    monkeypatch.setattr(github_mod, "SPLIT_BYTES", 4 * MB)
     target = tmp_path / "big.bin"
-    size = 250 * MB + 123
+    size = 10 * MB + 123
     with open(target, "wb") as fh:
-        fh.truncate(size)  # sparse: no 250MB of real writes
+        fh.truncate(size)  # sparse source; parts are small real files
     parts = GitHubReleaseBackend()._split(str(target), str(tmp_path))
     sizes = [os.path.getsize(p) for p in parts]
-    assert sizes == [100 * MB, 100 * MB, 50 * MB + 123]
+    assert sizes == [4 * MB, 4 * MB, 2 * MB + 123]
 
 
 def test_cloud_dog_part_bytes_mirrors_the_shared_constant():
