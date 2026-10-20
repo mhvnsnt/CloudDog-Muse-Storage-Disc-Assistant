@@ -908,7 +908,20 @@ def cmd_verify(args):
 
 
 def reap_candidates(search_root=None):
-    """Yield registry entries whose local file exists and may be reaped."""
+    """Yield registry entries whose local file exists and may be reaped.
+
+    CLAIMS GATE (the Tekken 5 fix): a live work claim is a HARD BLOCK —
+    a lane that claimed the path (or any ancestor dir) owns it until the
+    lease lapses. If the claims store cannot be read at all, this yields
+    NOTHING (fail closed: if you can't read claims, you don't reap).
+    is_inflight() stays as a second net for lanes that never claimed.
+    """
+    readable, probe_reason = _regmod.claims_readable(
+        REGISTRY_DB_PATH, json_path=REGISTRY_PATH)
+    if not readable:
+        print(f"REAP DISABLED: {probe_reason}", file=sys.stderr)
+        log_action(f"cloud_dog reap blocked: {probe_reason}")
+        return
     reg = load_registry()
     for path, entry in reg["entries"].items():
         if search_root and not path.startswith(os.path.abspath(search_root)):
@@ -921,6 +934,12 @@ def reap_candidates(search_root=None):
         if is_sacred(path):
             continue
         if has_veto_marker(path):
+            continue
+        allowed, claim_reason = _regmod.claim_gate(
+            REGISTRY_DB_PATH, path, json_path=REGISTRY_PATH)
+        if not allowed:
+            print(f"CLAIM-BLOCK {path} — {claim_reason}")
+            log_action(f"cloud_dog reap claim-block: {path} — {claim_reason}")
             continue
         inflight, reason = is_inflight(path)
         if inflight:
@@ -1010,6 +1029,72 @@ def cmd_registry_migrate(args):
         print(f"  skipped {len(res['skipped'])} non-absolute-path rows")
     print(f"  JSON backup kept (never deleted): {res['json_path']}")
     return 0
+
+
+def _claims_db():
+    """The sqlite claims store: always REGISTRY_DB_PATH (single source of
+    truth, whatever the entries backend is)."""
+    return REGISTRY_DB_PATH, REGISTRY_PATH
+
+
+def cmd_claims(args):
+    """Work claims CLI (the Tekken 5 fix).
+
+    `check` is for non-CloudDog sweep lanes: exit 0 = do NOT delete
+    (claimed, or the claims store is unreadable and we fail closed),
+    exit 1 = free.
+    """
+    sub = getattr(args, "claims_cmd", None)
+    db_path, json_path = _claims_db()
+    if sub == "claim":
+        ok, claim = _regmod.claim_path(
+            db_path, args.path, args.owner, args.action,
+            note=args.note, ttl_s=args.ttl, json_path=json_path)
+        if ok:
+            print(f"CLAIMED {claim['path']} owner={claim['owner']}"
+                  f" action={claim['action']} epoch={claim['epoch']}"
+                  f" ttl_s={claim['ttl_s']} claim_id={claim['claim_id']}")
+            return 0
+        print(f"HELD {claim['path']} by {claim['owner']} ({claim['action']})"
+              f" since {claim['claimed_at']} heartbeat={claim['heartbeat_at']}"
+              f" ttl_s={claim['ttl_s']} — defer, do not force",
+              file=sys.stderr)
+        return 3
+    if sub == "check":
+        allowed, reason = _regmod.claim_gate(
+            db_path, args.path, json_path=json_path)
+        if allowed:
+            print(f"FREE {os.path.abspath(args.path)}")
+            return 1
+        print(f"BLOCKED {os.path.abspath(args.path)} — {reason}")
+        return 0
+    if sub == "heartbeat":
+        ok = _regmod.heartbeat_claim(
+            db_path, args.path, args.claim_id, json_path=json_path)
+        print(("HEARTBEAT-OK " if ok else "HEARTBEAT-REJECTED ")
+              + os.path.abspath(args.path))
+        return 0 if ok else 3
+    if sub == "release":
+        ok = _regmod.release_claim(
+            db_path, args.path, args.claim_id, json_path=json_path)
+        print(("RELEASED " if ok else "RELEASE-NOP ")
+              + os.path.abspath(args.path))
+        return 0 if ok else 3
+    if sub == "list":
+        for c in _regmod.list_claims(db_path, json_path=json_path):
+            state = "live" if c["live"] else "lapsed"
+            print(f"{c['path']} [{state}] owner={c['owner']}"
+                  f" action={c['action']} epoch={c['epoch']}"
+                  f" heartbeat={c['heartbeat_at']} ttl_s={c['ttl_s']}"
+                  f" claim_id={c['claim_id']} note={c['note']}")
+        return 0
+    if sub == "sweep":
+        n = _regmod.expire_claims(db_path, json_path=json_path)
+        print(f"expired {n} lapsed claim(s)")
+        return 0
+    print("usage: cloud_dog.py claims {claim|check|heartbeat|release|list|sweep}",
+          file=sys.stderr)
+    return 2
 
 
 def cmd_registry(args):
@@ -2930,6 +3015,37 @@ def main(argv=None):
     p.add_argument("--force", action="store_true",
                    help="re-import even if a migration already ran")
 
+    p = sub.add_parser(
+        "claims",
+        help="work claims: lease/heartbeat ownership records that HARD-BLOCK "
+             "reaping (the Tekken 5 fix). Non-CloudDog sweep lanes: run "
+             "'claims check <path>' before deleting anything you did not create.")
+    pc = p.add_subparsers(dest="claims_cmd")
+    q = pc.add_parser("claim",
+                      help="claim a path for a lane (exit 3 if held by another owner)")
+    q.add_argument("path", help="file or directory to claim")
+    q.add_argument("--owner", required=True,
+                   help="lane/checkpoint id, e.g. t5-iso-dl")
+    q.add_argument("--action", required=True,
+                   help="download|upload|render|extract|reap|other")
+    q.add_argument("--ttl", type=int, default=600,
+                   help="lease seconds without a heartbeat (default 600)")
+    q.add_argument("--note", default="", help="human line, e.g. what is downloading")
+    q = pc.add_parser("check",
+                      help="is this path claimed? exit 0 = claimed/BLOCKED "
+                           "(or claims unreadable: fail closed), 1 = free")
+    q.add_argument("path", help="file or directory to check")
+    q = pc.add_parser("heartbeat",
+                      help="renew a claim's lease (needs the claim_id from claim)")
+    q.add_argument("path")
+    q.add_argument("--claim-id", required=True)
+    q = pc.add_parser("release",
+                      help="release a claim (needs the claim_id from claim)")
+    q.add_argument("path")
+    q.add_argument("--claim-id", required=True)
+    pc.add_parser("list", help="list claims (live and lapsed)")
+    pc.add_parser("sweep", help="expire lapsed claims (journaled)")
+
     p = sub.add_parser("mirror",
                        help="torrent -> cloud store, bounded local footprint")
     src = p.add_mutually_exclusive_group(required=True)
@@ -3016,6 +3132,8 @@ def main(argv=None):
             return cmd_registry(args)
         elif args.cmd == "registry-migrate":
             return cmd_registry_migrate(args)
+        elif args.cmd == "claims":
+            return cmd_claims(args)
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         return 130

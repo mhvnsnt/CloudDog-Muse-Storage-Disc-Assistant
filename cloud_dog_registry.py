@@ -31,6 +31,15 @@ sqlite schema:
              verified_at, updated_at, extra TEXT JSON)
     journal (id INTEGER PK, ts, action, local_path, detail)  -- audit trail
     meta    (k TEXT PK, v TEXT)  -- migration/schema flags
+    claims  (path TEXT PK, owner, action, claim_id, epoch, claimed_at,
+             heartbeat_at, ttl_s, note)  -- work-claim leases: lane X owns
+             path Y until heartbeat+TTL lapses. Reapers MUST check this
+             table before deleting (claim_gate); a live claim BLOCKS a
+             reap. Written because a cleanup lane deleted an in-progress
+             Tekken 5 ISO whose only protection was the 5-minute mtime
+             heuristic in is_inflight() — a paused/resumable download
+             older than 5 minutes looked reapable. Claims are
+             authoritative; the heuristic stays as a second net.
 
 Migration: `migrate_json_to_sqlite()` is the one-shot JSON->sqlite
 importer. It preserves every entry (both legacy JSON shapes: the
@@ -67,6 +76,7 @@ import random
 import sqlite3
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 
 try:
@@ -119,6 +129,22 @@ _SCHEMA_STATEMENTS = (
     CREATE TABLE IF NOT EXISTS meta (
         k TEXT PRIMARY KEY,
         v TEXT NOT NULL
+    )
+    """,
+    # Work claims (lane-coordination, the Tekken 5 fix): "lane X owns
+    # path Y until the lease lapses". Reapers MUST consult this table
+    # before deleting (see the claims API + claim_gate below).
+    """
+    CREATE TABLE IF NOT EXISTS claims (
+        path         TEXT PRIMARY KEY,
+        owner        TEXT NOT NULL,
+        action       TEXT NOT NULL,
+        claim_id     TEXT NOT NULL UNIQUE,
+        epoch        INTEGER NOT NULL,
+        claimed_at   TEXT NOT NULL,
+        heartbeat_at TEXT NOT NULL,
+        ttl_s        INTEGER NOT NULL DEFAULT 600,
+        note         TEXT NOT NULL DEFAULT ''
     )
     """,
 )
@@ -613,6 +639,293 @@ def journal_tail(db_path, limit=50):
         conn.close()
 
 
+# ---------------------------------------------------------------- claims
+# Work claims: leased, heartbeated ownership records in the SAME sqlite
+# registry (no second store). A lane claims a path (or a whole directory)
+# when it starts work; every delete path must consult claim_gate() first.
+# A live claim is a HARD BLOCK, never advisory. Leases die on their own
+# when heartbeats stop (ttl_s), so a crashed lane never wedges the disk.
+#
+# Fencing: every successful claim issues a fresh uuid4 claim_id and a
+# per-path monotonically increasing epoch (kept in meta so it survives
+# release). heartbeat/release must present the claim_id they were
+# issued — a stale holder whose lease lapsed and was re-claimed cannot
+# revive or release the new owner's claim.
+#
+# Claims are sqlite-only BY DESIGN (single source of truth). The JSON
+# entries backend is not mirrored: two claim stores that can disagree
+# would be worse than one. Functions take db_path directly, whatever
+# backend the entries use.
+
+DEFAULT_CLAIM_TTL_S = 600
+_CLAIM_EPOCH_META_PREFIX = "claim_epoch:"
+_CLAIM_COLS = ("path, owner, action, claim_id, epoch, claimed_at,"
+               " heartbeat_at, ttl_s, note")
+
+
+def _iso_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _iso_parse(text):
+    """Parse an ISO-8601 stamp to an aware datetime; None if unparseable."""
+    try:
+        dt = datetime.fromisoformat(str(text))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _normalize_claim_path(path):
+    return os.path.normpath(os.path.abspath(str(path)))
+
+
+def _claim_row_to_dict(row):
+    (path, owner, action, claim_id, epoch, claimed_at, heartbeat_at,
+     ttl_s, note) = row
+    return {
+        "path": path, "owner": owner, "action": action,
+        "claim_id": claim_id, "epoch": int(epoch),
+        "claimed_at": claimed_at, "heartbeat_at": heartbeat_at,
+        "ttl_s": int(ttl_s), "note": note,
+    }
+
+
+def _claim_is_live(claim, now=None):
+    now = now or datetime.now(timezone.utc)
+    hb = _iso_parse(claim["heartbeat_at"])
+    if hb is None:
+        return False  # unparseable heartbeat = dead claim, never a live one
+    return (now - hb).total_seconds() <= max(1, int(claim["ttl_s"]))
+
+
+def claim_path(db_path, path, owner, action, note="",
+               ttl_s=DEFAULT_CLAIM_TTL_S, json_path=None):
+    """Claim `path` for `owner`. Returns (True, claim) on success.
+
+    Returns (False, existing) when a DIFFERENT owner holds a live claim —
+    the caller must defer, never force. Re-claiming your own live claim
+    (e.g. a lane restarting) succeeds and issues a fresh claim_id +
+    epoch, fencing off the previous incarnation. Claiming over an
+    EXPIRED claim succeeds the same way.
+    """
+    norm = _normalize_claim_path(path)
+    ttl_s = int(ttl_s)
+    if ttl_s <= 0:
+        raise ValueError("ttl_s must be positive")
+    if not owner or not action:
+        raise ValueError("owner and action are required")
+    conn = _open_db(db_path, json_path=json_path)
+    try:
+        outcome = {}
+
+        def _do_claim():
+            with _write_txn(conn):
+                row = conn.execute(
+                    f"SELECT {_CLAIM_COLS} FROM claims WHERE path=?",
+                    (norm,)).fetchone()
+                existing = _claim_row_to_dict(row) if row else None
+                if (existing and existing["owner"] != owner
+                        and _claim_is_live(existing)):
+                    outcome.update(claimed=False, claim=existing)
+                    return
+                erow = conn.execute(
+                    "SELECT v FROM meta WHERE k=?",
+                    (_CLAIM_EPOCH_META_PREFIX + norm,)).fetchone()
+                epoch = (int(erow[0]) if erow else 0) + 1
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)",
+                    (_CLAIM_EPOCH_META_PREFIX + norm, str(epoch)))
+                now = _iso_now()
+                claim = {
+                    "path": norm, "owner": str(owner), "action": str(action),
+                    "claim_id": uuid.uuid4().hex, "epoch": epoch,
+                    "claimed_at": now, "heartbeat_at": now,
+                    "ttl_s": ttl_s, "note": str(note or ""),
+                }
+                conn.execute(
+                    "INSERT OR REPLACE INTO claims (path, owner, action,"
+                    " claim_id, epoch, claimed_at, heartbeat_at, ttl_s,"
+                    " note) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (norm, claim["owner"], claim["action"],
+                     claim["claim_id"], epoch, now, now, ttl_s,
+                     claim["note"]))
+                _journal(conn, "claim", local_path=norm,
+                         detail=(f"owner={claim['owner']}"
+                                 f" action={claim['action']}"
+                                 f" epoch={epoch} ttl_s={ttl_s}"
+                                 f" note={claim['note']}")[:300])
+                outcome.update(claimed=True, claim=claim)
+
+        _retry_locked(_do_claim)
+        return outcome["claimed"], outcome["claim"]
+    finally:
+        conn.close()
+
+
+def heartbeat_claim(db_path, path, claim_id, json_path=None):
+    """Renew a claim's lease. True only for the current claim_id holder:
+    a stale holder (lease lapsed, path re-claimed) is rejected."""
+    norm = _normalize_claim_path(path)
+    conn = _open_db(db_path, json_path=json_path)
+    try:
+        result = {}
+
+        def _do_hb():
+            with _write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE claims SET heartbeat_at=? WHERE path=?"
+                    " AND claim_id=?",
+                    (_iso_now(), norm, claim_id))
+                result["ok"] = cur.rowcount == 1
+
+        _retry_locked(_do_hb)
+        return result["ok"]
+    finally:
+        conn.close()
+
+
+def release_claim(db_path, path, claim_id, json_path=None):
+    """Release a claim. Idempotent and claim_id-guarded: releasing with a
+    stale claim_id deletes nothing and returns False."""
+    norm = _normalize_claim_path(path)
+    conn = _open_db(db_path, json_path=json_path)
+    try:
+        result = {}
+
+        def _do_release():
+            with _write_txn(conn):
+                row = conn.execute(
+                    "SELECT owner, epoch FROM claims WHERE path=?"
+                    " AND claim_id=?", (norm, claim_id)).fetchone()
+                if not row:
+                    result["ok"] = False
+                    return
+                conn.execute(
+                    "DELETE FROM claims WHERE path=? AND claim_id=?",
+                    (norm, claim_id))
+                _journal(conn, "claim-release", local_path=norm,
+                         detail=f"owner={row[0]} epoch={row[1]}")
+                result["ok"] = True
+
+        _retry_locked(_do_release)
+        return result["ok"]
+    finally:
+        conn.close()
+
+
+def get_claim(db_path, path, json_path=None, include_expired=False):
+    """The claim covering `path`: exact match, or a claim on any ancestor
+    directory (a lane working a whole tree claims the tree root). Returns
+    the most specific LIVE claim dict, or None."""
+    norm = _normalize_claim_path(path)
+    conn = _open_db(db_path, json_path=json_path)
+    try:
+        rows = conn.execute(f"SELECT {_CLAIM_COLS} FROM claims").fetchall()
+    finally:
+        conn.close()
+    best = None
+    for row in rows:
+        claim = _claim_row_to_dict(row)
+        cp = claim["path"]
+        if norm == cp or norm.startswith(cp + os.sep):
+            if include_expired or _claim_is_live(claim):
+                if best is None or len(cp) > len(best["path"]):
+                    best = claim
+    return best
+
+
+def is_claimed(db_path, path, json_path=None):
+    """(True, claim) when a live claim covers `path`, else (False, None)."""
+    claim = get_claim(db_path, path, json_path=json_path)
+    return (claim is not None), claim
+
+
+def list_claims(db_path, json_path=None, include_expired=True):
+    """All claims, each annotated with a computed "live" flag."""
+    conn = _open_db(db_path, json_path=json_path)
+    try:
+        rows = conn.execute(f"SELECT {_CLAIM_COLS} FROM claims").fetchall()
+    finally:
+        conn.close()
+    out = []
+    for row in rows:
+        claim = _claim_row_to_dict(row)
+        claim["live"] = _claim_is_live(claim)
+        if include_expired or claim["live"]:
+            out.append(claim)
+    return out
+
+
+def expire_claims(db_path, json_path=None):
+    """Delete claims whose lease lapsed (heartbeat older than ttl_s).
+    Journaled per claim. Returns the number of claims expired."""
+    conn = _open_db(db_path, json_path=json_path)
+    try:
+        result = {}
+
+        def _do_expire():
+            with _write_txn(conn):
+                rows = conn.execute(
+                    f"SELECT {_CLAIM_COLS} FROM claims").fetchall()
+                dead = [c for c in (_claim_row_to_dict(r) for r in rows)
+                        if not _claim_is_live(c)]
+                for c in dead:
+                    conn.execute(
+                        "DELETE FROM claims WHERE path=? AND claim_id=?",
+                        (c["path"], c["claim_id"]))
+                    _journal(conn, "claim-expire", local_path=c["path"],
+                             detail=(f"owner={c['owner']} epoch={c['epoch']}"
+                                     f" heartbeat_at={c['heartbeat_at']}"
+                                     f" ttl_s={c['ttl_s']}"))
+                result["n"] = len(dead)
+
+        _retry_locked(_do_expire)
+        return result["n"]
+    finally:
+        conn.close()
+
+
+def claims_readable(db_path, json_path=None):
+    """(True, "") when the claims store can be read; (False, reason) else.
+
+    Reap lanes probe this once up front so a broken claims store produces
+    one loud "REAP DISABLED" instead of silently looking like "nothing to
+    reap" (or worse, reaping blind).
+    """
+    try:
+        conn = _open_db(db_path, json_path=json_path)
+        try:
+            conn.execute("SELECT COUNT(*) FROM claims").fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 - any failure means unreadable
+        return False, f"claims unreadable ({exc}); failing closed"
+    return True, ""
+
+
+def claim_gate(db_path, path, json_path=None):
+    """Reaper pre-delete gate. Returns (allowed, reason).
+
+    allowed is True ONLY when the claims store was read successfully AND
+    no live claim covers `path`. ANY failure to read claims (missing or
+    corrupt DB, lock exhaustion, anything) returns (False, reason):
+    fail CLOSED. If you can't read claims, you don't reap.
+    """
+    try:
+        claimed, claim = is_claimed(db_path, path, json_path=json_path)
+    except Exception as exc:  # noqa: BLE001 - any read failure blocks
+        return False, f"claims unreadable ({exc}); failing closed"
+    if claimed:
+        return False, (f"claimed by {claim['owner']} ({claim['action']});"
+                       f" claimed_at={claim['claimed_at']}"
+                       f" heartbeat_at={claim['heartbeat_at']}"
+                       f" ttl_s={claim['ttl_s']}")
+    return True, ""
+
+
 # ---------------------------------------------------------------- unified API
 def load_registry(json_path, db_path, backend=None):
     backend = select_backend(backend)
@@ -674,6 +987,27 @@ class Registry:
         if self.backend != "sqlite":
             raise ValueError("journal is only available on the sqlite backend")
         return journal_tail(self.db_path, limit=limit)
+
+    # -- work claims (sqlite store regardless of the entries backend) --
+
+    def claim(self, path, owner, action, note="", ttl_s=DEFAULT_CLAIM_TTL_S):
+        return claim_path(self.db_path, path, owner, action, note=note,
+                          ttl_s=ttl_s, json_path=self.json_path)
+
+    def heartbeat_claim(self, path, claim_id):
+        return heartbeat_claim(self.db_path, path, claim_id,
+                               json_path=self.json_path)
+
+    def release_claim(self, path, claim_id):
+        return release_claim(self.db_path, path, claim_id,
+                             json_path=self.json_path)
+
+    def get_claim(self, path, include_expired=False):
+        return get_claim(self.db_path, path, json_path=self.json_path,
+                         include_expired=include_expired)
+
+    def expire_claims(self):
+        return expire_claims(self.db_path, json_path=self.json_path)
 
     def close(self):
         pass  # connections are short-lived; nothing to hold
