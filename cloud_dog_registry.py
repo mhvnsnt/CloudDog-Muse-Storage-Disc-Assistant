@@ -888,21 +888,58 @@ def expire_claims(db_path, json_path=None):
         conn.close()
 
 
-def claims_readable(db_path, json_path=None):
-    """(True, "") when the claims store can be read; (False, reason) else.
+def ensure_claims_schema(db_path, json_path=None):
+    """Migration: guarantee the claims table exists in the registry DB.
 
-    Reap lanes probe this once up front so a broken claims store produces
-    one loud "REAP DISABLED" instead of silently looking like "nothing to
-    reap" (or worse, reaping blind).
+    PR #43 added the claims table to the schema DDL, but a registry DB
+    created by pre-claims code — or swapped/restored while a long-lived
+    process holds a stale per-process schema-init cache — can lack it,
+    and every reap then fails closed forever ("claims unreadable (no
+    such table: claims); failing closed" — seen live 2026-10-20). This
+    runs the idempotent schema init with the init cache bypassed and
+    verifies the table is really there. Returns (ok, detail).
     """
     try:
+        _schema_init_done.discard(os.path.abspath(db_path))
         conn = _open_db(db_path, json_path=json_path)
         try:
             conn.execute("SELECT COUNT(*) FROM claims").fetchone()
         finally:
             conn.close()
+    except Exception as exc:  # noqa: BLE001 - reported, not raised
+        return False, f"claims migration failed ({exc})"
+    return True, "claims table present"
+
+
+def claims_readable(db_path, json_path=None):
+    """(True, "") when the claims store can be read; (False, reason) else.
+
+    Reap lanes probe this once up front so a broken claims store produces
+    one loud "REAP DISABLED" instead of silently looking like "nothing to
+    reap" (or worse, reaping blind). A DB that merely lacks the claims
+    table is migrated on the spot (see ensure_claims_schema) and probed
+    again — the gates must actually RUN, not fail closed forever.
+    """
+
+    def _probe():
+        conn = _open_db(db_path, json_path=json_path)
+        try:
+            conn.execute("SELECT COUNT(*) FROM claims").fetchone()
+        finally:
+            conn.close()
+
+    try:
+        _probe()
     except Exception as exc:  # noqa: BLE001 - any failure means unreadable
-        return False, f"claims unreadable ({exc}); failing closed"
+        if "no such table" not in str(exc):
+            return False, f"claims unreadable ({exc}); failing closed"
+        ok, _detail = ensure_claims_schema(db_path, json_path=json_path)
+        if not ok:
+            return False, f"claims unreadable ({exc}); failing closed"
+        try:
+            _probe()
+        except Exception as exc2:  # noqa: BLE001
+            return False, f"claims unreadable ({exc2}); failing closed"
     return True, ""
 
 
@@ -917,7 +954,16 @@ def claim_gate(db_path, path, json_path=None):
     try:
         claimed, claim = is_claimed(db_path, path, json_path=json_path)
     except Exception as exc:  # noqa: BLE001 - any read failure blocks
-        return False, f"claims unreadable ({exc}); failing closed"
+        if "no such table" not in str(exc):
+            return False, f"claims unreadable ({exc}); failing closed"
+        # Pre-claims DB: migrate, then judge for real (never wave through).
+        ok, _detail = ensure_claims_schema(db_path, json_path=json_path)
+        if not ok:
+            return False, f"claims unreadable ({exc}); failing closed"
+        try:
+            claimed, claim = is_claimed(db_path, path, json_path=json_path)
+        except Exception as exc2:  # noqa: BLE001
+            return False, f"claims unreadable ({exc2}); failing closed"
     if claimed:
         return False, (f"claimed by {claim['owner']} ({claim['action']});"
                        f" claimed_at={claim['claimed_at']}"

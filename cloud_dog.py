@@ -961,6 +961,20 @@ def cmd_reap(args):
     search_root = os.path.abspath(args.path) if getattr(args, "path", "") else None
     reaped, skipped, failed = [], [], []
     for path, entry in reap_candidates(search_root):
+        # DELETE GATE policy leg (2026-10-20 incident fix): cmd_reap
+        # historically skipped the V1 evaluate() front-decider that
+        # cmd_reap_v2 runs. A fresh verdict other than STORE_AND_CLEAR
+        # (SACRED / KEEP_LOCAL / STORE / STRICT) blocks the reap here
+        # too — registry membership + verify alone are not the whole
+        # invariant.
+        if _POLICY_AVAILABLE and _EVALUATE_AVAILABLE:
+            v1_action = _v1_evaluate(path).action.value
+            if v1_action != "store_and_clear":
+                skipped.append(path)
+                audit_log("reap_policy_skip", path=path,
+                          store=entry.get("store"),
+                          detail=f"cmd_reap: evaluate({v1_action}) blocks reap")
+                continue
         if entry["store"] == "github":
             ok, detail = verify_github_asset(
                 entry["repo"], entry["release"], entry["asset"],
@@ -1100,7 +1114,11 @@ def cmd_claims(args):
         n = _regmod.expire_claims(db_path, json_path=json_path)
         print(f"expired {n} lapsed claim(s)")
         return 0
-    print("usage: cloud_dog.py claims {claim|check|heartbeat|release|list|sweep}",
+    if sub == "migrate":
+        ok, detail = _regmod.ensure_claims_schema(db_path, json_path=json_path)
+        print(f"claims schema: {detail} ({db_path})")
+        return 0 if ok else 3
+    print("usage: cloud_dog.py claims {claim|check|heartbeat|release|list|sweep|migrate}",
           file=sys.stderr)
     return 2
 
@@ -3008,6 +3026,8 @@ def main(argv=None):
     q.add_argument("--claim-id", required=True)
     pc.add_parser("list", help="list claims (live and lapsed)")
     pc.add_parser("sweep", help="expire lapsed claims (journaled)")
+    pc.add_parser("migrate", help="migration: ensure the claims table exists "
+                                  "in the registry DB (idempotent)")
 
     p = sub.add_parser("mirror",
                        help="torrent -> cloud store, bounded local footprint")

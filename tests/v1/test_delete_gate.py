@@ -109,9 +109,13 @@ def test_registry_digest_binding_for_reaper_style_entries():
 
     digest = _h.sha1(b"blob %d\0" % SIZE + DATA).hexdigest()
     entry = {"digest": digest, "digest_algo": "git-sha1", "size": SIZE, "status": "registered"}
-    v = _verdict(registry_entry=entry, local_sha256="", local_digest=digest, local_digest_algo="git-sha1")
+    v = _verdict(
+        registry_entry=entry, local_sha256="", local_digest=digest, local_digest_algo="git-sha1"
+    )
     assert v.allowed is True
-    v2 = _verdict(registry_entry=entry, local_sha256="", local_digest="0" * 40, local_digest_algo="git-sha1")
+    v2 = _verdict(
+        registry_entry=entry, local_sha256="", local_digest="0" * 40, local_digest_algo="git-sha1"
+    )
     assert v2.allowed is False
     assert "registry" in _legs(v2)
 
@@ -173,7 +177,9 @@ def test_policy_unknown_action_blocks():
 
 
 def test_multiple_failures_all_reported():
-    v = _verdict(registry_entry=None, live_verify_ok=False, claim_check=_claimed, policy_action="sacred")
+    v = _verdict(
+        registry_entry=None, live_verify_ok=False, claim_check=_claimed, policy_action="sacred"
+    )
     assert v.allowed is False
     assert _legs(v) == {"registry", "verify", "claims", "policy"}
 
@@ -185,9 +191,9 @@ def test_multiple_failures_all_reported():
 # the file died unregistered. Now it must survive, the block must be
 # journaled, and the daemon's store must land in the registry instead.
 
-from clouddog import registry as registry_mod  # noqa: E402
-from clouddog.daemon import Daemon  # noqa: E402
-from clouddog.stores.base import Health, HealthStatus, StoreBackend, StoredRef  # noqa: E402
+from clouddog import registry as registry_mod
+from clouddog.daemon import Daemon
+from clouddog.stores.base import Health, HealthStatus, StoreBackend, StoredRef
 
 BAD_LOCATOR = "other/repo@old-tag/big.bin"
 
@@ -202,8 +208,11 @@ class _Backend(StoreBackend):
         with open(local_path, "rb") as fh:
             digest = hashlib.sha256(fh.read()).hexdigest()
         return StoredRef(
-            backend="fake", locator=remote_ref,
-            size=os.path.getsize(local_path), sha256=digest, extra={},
+            backend="fake",
+            locator=remote_ref,
+            size=os.path.getsize(local_path),
+            sha256=digest,
+            extra={},
         )
 
     def verify(self, local_path, stored):
@@ -301,9 +310,14 @@ def test_daemon_claimed_registered_file_survives(tmp_path):
     data = target.read_bytes()
     registry_mod.register_entry(
         str(target),
-        {"store": "github", "repo": "mhvnsnt/clouddog-storage",
-         "release": "clouddog-20261020", "asset": "big.bin",
-         "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)},
+        {
+            "store": "github",
+            "repo": "mhvnsnt/clouddog-storage",
+            "release": "clouddog-20261020",
+            "asset": "big.bin",
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "size": len(data),
+        },
         json_path=str(registry_json),
     )
     _claims_db_with_live_claim(tmp_path / "claims.db", target)
@@ -323,9 +337,14 @@ def test_daemon_entry_sha_mismatch_survives(tmp_path):
     registry_json = tmp_path / "registry.json"
     registry_mod.register_entry(
         str(target),
-        {"store": "github", "repo": "mhvnsnt/clouddog-storage",
-         "release": "clouddog-20261020", "asset": "big.bin",
-         "sha256": "0" * 64, "size": target.stat().st_size},
+        {
+            "store": "github",
+            "repo": "mhvnsnt/clouddog-storage",
+            "release": "clouddog-20261020",
+            "asset": "big.bin",
+            "sha256": "0" * 64,
+            "size": target.stat().st_size,
+        },
         json_path=str(registry_json),
     )
     journal = _Journal()
@@ -345,8 +364,12 @@ def test_daemon_entry_copy_failing_live_verify_survives(tmp_path):
     data = target.read_bytes()
     registry_mod.register_entry(
         str(target),
-        {"store": "github", "locator": BAD_LOCATOR,
-         "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)},
+        {
+            "store": "github",
+            "locator": BAD_LOCATOR,
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "size": len(data),
+        },
         json_path=str(registry_json),
     )
     journal = _Journal()
@@ -366,7 +389,7 @@ def test_daemon_entry_copy_failing_live_verify_survives(tmp_path):
 
 # ============================================================ reaper level
 
-from clouddog.reaper import Reaper, compute_hash  # noqa: E402
+from clouddog.reaper import Reaper, compute_hash
 
 
 def _reaper(tmp_path, rel="a.bin", data=b"reaper-gate-data", **kw):
@@ -378,8 +401,11 @@ def _reaper(tmp_path, rel="a.bin", data=b"reaper-gate-data", **kw):
     kw.setdefault("store_verify", lambda r, full: True)
     kw.setdefault("claim_check", lambda path: (False, ""))
     r = Reaper(
-        str(src), manifest, str(tmp_path / "reaper.log"),
-        state_path=str(tmp_path / "state.json"), **kw,
+        str(src),
+        manifest,
+        str(tmp_path / "reaper.log"),
+        state_path=str(tmp_path / "state.json"),
+        **kw,
     )
     return r, p
 
@@ -409,7 +435,9 @@ def test_reaper_default_claims_wiring_blocks_claimed_file(tmp_path):
     _claims_db_with_live_claim(claims_db, p)
     manifest = {"a.bin": compute_hash(str(p), "git-sha1")}
     r = Reaper(
-        str(src), manifest, str(tmp_path / "reaper.log"),
+        str(src),
+        manifest,
+        str(tmp_path / "reaper.log"),
         state_path=str(tmp_path / "state.json"),
         store_verify=lambda rel, full: True,
         claims_db=str(claims_db),
@@ -435,7 +463,7 @@ def test_reaper_all_legs_hold_still_reaps(tmp_path):
 
 # ========================================================== streamer level
 
-from clouddog.streamer import Streamer  # noqa: E402
+from clouddog.streamer import Streamer
 
 
 class _StreamBackend:
@@ -447,7 +475,9 @@ class _StreamBackend:
         return StoredRef(
             backend="fake",
             locator=f"{remote_ref}/{os.path.basename(local_path)}",
-            size=os.path.getsize(local_path), sha256=digest, extra={},
+            size=os.path.getsize(local_path),
+            sha256=digest,
+            extra={},
         )
 
     def verify(self, local_path, stored):
@@ -463,8 +493,12 @@ def test_streamer_claimed_file_streams_but_never_clears(tmp_path):
     os.utime(p, (old, old))
     events = []
     streamer = Streamer(
-        str(wd), _StreamBackend(), repo="o/r", tag="t1",
-        settle_secs=300, apply=True,
+        str(wd),
+        _StreamBackend(),
+        repo="o/r",
+        tag="t1",
+        settle_secs=300,
+        apply=True,
         journal=lambda *a: events.append(a),
         claim_check=lambda path: (True, "claimed by download-lane"),
     )

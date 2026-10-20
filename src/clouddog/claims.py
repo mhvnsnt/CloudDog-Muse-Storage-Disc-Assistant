@@ -9,8 +9,13 @@ claim on a directory covers everything under it.
 
 Fail CLOSED: any failure to read the claims store (corrupt DB, lock,
 I/O error) reports the path as claimed. If you can't read claims, you
-don't reap. A *missing* DB (nobody has ever claimed anything) or a DB
-with no ``claims`` table (pre-claims registry) means no claims — free.
+don't reap. A *missing* DB (nobody has ever claimed anything) means no
+claims — free. An existing DB with no ``claims`` table (a pre-claims
+registry, or one swapped in under a long-lived process) is MIGRATED on
+the spot (idempotent CREATE TABLE, mirroring cloud_dog_registry's
+schema) and then read; if the migration itself is impossible the path
+reports claimed — fail closed, aligned with the writer side's
+``claim_gate`` (which never treated a missing table as "free").
 
 CLI for non-CloudDog sweep lanes:
 
@@ -29,6 +34,50 @@ from datetime import datetime, timezone
 
 DEFAULT_CLAIMS_DB = os.path.expanduser("~/workspace/agent-ops/cloud-dog-registry.db")
 ENV_CLAIMS_DB = "CLOUDEDOG_CLAIMS_DB"
+
+# The claims table, byte-identical in shape to the writer side
+# (cloud_dog_registry.py _SCHEMA_STATEMENTS). Kept as a literal here so
+# this read-side module can self-migrate a pre-claims DB without
+# importing the root package.
+_CLAIMS_DDL = """
+CREATE TABLE IF NOT EXISTS claims (
+    path         TEXT PRIMARY KEY,
+    owner        TEXT NOT NULL,
+    action       TEXT NOT NULL,
+    claim_id     TEXT NOT NULL UNIQUE,
+    epoch        INTEGER NOT NULL,
+    claimed_at   TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    ttl_s        INTEGER NOT NULL DEFAULT 600,
+    note         TEXT NOT NULL DEFAULT ''
+)
+"""
+
+
+def _ensure_claims_table(db_path) -> None:
+    """Migration: create the claims table when a pre-claims DB lacks it.
+
+    Idempotent. Raises on real failures (read-only DB, corrupt file) —
+    the caller turns that into a fail-closed verdict.
+    """
+    conn = sqlite3.connect(db_path, timeout=30)
+    try:
+        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute(_CLAIMS_DDL)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _read_claim_rows(db_path):
+    conn = sqlite3.connect(db_path, timeout=30)
+    try:
+        conn.execute("PRAGMA busy_timeout=30000;")
+        return conn.execute(
+            "SELECT path, owner, action, heartbeat_at, ttl_s FROM claims"
+        ).fetchall()
+    finally:
+        conn.close()
 
 
 def default_claims_db() -> str:
@@ -55,17 +104,17 @@ def check_claimed(db_path, path):
         return False, ""
     norm = os.path.normpath(os.path.abspath(str(path)))
     try:
-        conn = sqlite3.connect(db_path, timeout=30)
         try:
-            conn.execute("PRAGMA busy_timeout=30000;")
-            rows = conn.execute(
-                "SELECT path, owner, action, heartbeat_at, ttl_s FROM claims"
-            ).fetchall()
-        finally:
-            conn.close()
+            rows = _read_claim_rows(db_path)
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc):
+                raise
+            # Pre-claims registry: migrate (idempotent), then read for
+            # real. A DB that cannot be migrated is unreadable — the
+            # outer handler fails closed, like the writer side.
+            _ensure_claims_table(db_path)
+            rows = _read_claim_rows(db_path)
     except sqlite3.OperationalError as exc:
-        if "no such table" in str(exc):
-            return False, ""  # pre-claims registry: no claims can exist
         return True, f"claims unreadable ({exc}); failing closed"
     except Exception as exc:  # noqa: BLE001 - any read failure blocks
         return True, f"claims unreadable ({exc}); failing closed"

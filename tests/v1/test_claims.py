@@ -60,6 +60,22 @@ def test_check_claimed_missing_db_and_pre_claims_db_are_free(tmp_path):
     conn.close()
     blocked, _ = check_claimed(dp, "/w/f")
     assert not blocked
+    # Migration (2026-10-20 fix): the pre-claims DB GAINED the claims
+    # table as a side effect — the gate now reads a real store instead
+    # of treating a missing table as "free" (the writer side never did).
+    conn = sqlite3.connect(dp)
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        conn.close()
+    assert "claims" in tables
+
+
+def test_check_claimed_unopenable_db_fails_closed(tmp_path):
+    # A path that exists but cannot be opened as a DB at all (here: a
+    # directory) is unreadable — fail closed, never "free".
+    blocked, detail = check_claimed(str(tmp_path), "/w/f")
+    assert blocked and "failing closed" in detail
 
 
 def test_check_claimed_corrupt_db_fails_closed(tmp_path):
