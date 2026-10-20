@@ -42,6 +42,9 @@ class TickReport:
     cleared: int
     freed_bytes: int
     skipped_sacred: int
+    stream_files: int = 0
+    stream_chunks: int = 0
+    stream_freed_bytes: int = 0
     errors: list[str] = field(default_factory=list)
     critical: bool = False
     critical_msg: str = ""
@@ -131,6 +134,7 @@ class Daemon:
         disk_path: str = "/home/hatch",
         dry_run: bool = False,
         pidfile: str | None = None,
+        stream_backend: "StoreBackend | None" = None,
     ) -> None:
         self.roots = list(roots)
         self.interval_s = interval_s
@@ -140,6 +144,8 @@ class Daemon:
         self.dry_run = dry_run
         self.pidfile = pidfile or os.path.expanduser("~/.clouddog/daemon.pid")
         self.heartbeat_path = os.path.expanduser("~/.clouddog/heartbeat.json")
+        self.stream_backend = stream_backend
+        self.stream_dirs_path = os.path.expanduser("~/.clouddog/stream-dirs.json")
 
     # ------------------------------------------------------------ internals
 
@@ -373,6 +379,114 @@ class Daemon:
             self._journal("cleared", path, freed, stored.locator,
                           f"backend={tier} verified then cleared")
 
+    def _stream_journal(self):
+        """Journal wrapper for stream passes: normal audit journal plus the
+        human-readable disk-cleanup log on every 'cleared' (repo rule 7).
+        """
+        def _fn(kind: str, path: str, size: int, locator: str,
+                note: str = "") -> None:
+            self._journal(kind, path, size, locator, note)
+            if kind == "cleared":
+                try:
+                    from clouddog.cli import log_deletion_md
+                except ImportError:
+                    return  # journaling must never break a stream
+                log_deletion_md(path, size, locator, note)
+        return _fn
+
+    def _run_stream_dirs(self, report: TickReport, flags: dict) -> None:
+        """Config-file-driven watch-dir stream passes.
+
+        ``~/.clouddog/stream-dirs.json`` (read every tick; the running
+        daemon needs no restart to pick up a new watch dir):
+            [{"watch_dir": "/path", "repo": "o/r", "tag": "t",
+              "tier": "github", "chunk_mb": 100, "settle_secs": 300,
+              "apply": true}]
+        Absent file = no-op. apply is AND-ed with the daemon's dry_run.
+        tier defaults to github; tiers without content verification
+        (TeraBox) are refused for live streams (H2). Any per-dir failure
+        is journaled; a bad dir never breaks the tick.
+        """
+        from clouddog import streamer as _streamer
+
+        try:
+            with open(self.stream_dirs_path, encoding="utf-8") as fh:
+                entries = json.load(fh)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as exc:
+            self._journal("error", self.stream_dirs_path, 0, "",
+                          f"bad stream-dirs.json: {exc}")
+            return
+        if not isinstance(entries, list):
+            self._journal("error", self.stream_dirs_path, 0, "",
+                          "stream-dirs.json must be a JSON list")
+            return
+        backend = self.stream_backend
+        if backend is None:
+            try:
+                from clouddog.stores.github import GitHubReleaseBackend
+
+                backend = GitHubReleaseBackend()
+            except ImportError:
+                self._journal("error", self.stream_dirs_path, 0, "",
+                              "github backend unavailable; stream dirs skipped")
+                return
+        try:
+            hs = backend.health()
+        except Exception as exc:
+            self._journal("error", self.stream_dirs_path, 0, "",
+                          f"stream backend health probe failed: {exc}")
+            return
+        if hs.health is not Health.LIVE:
+            self._journal("error", self.stream_dirs_path, 0, "",
+                          f"stream backend not LIVE (health={hs.health.value}); "
+                          f"stream dirs skipped")
+            return
+        journal_fn = self._stream_journal()
+        for ent in entries:
+            if not isinstance(ent, dict) or not ent.get("watch_dir"):
+                continue
+            _chunk_mb = ent.get("chunk_mb")
+            _settle = ent.get("settle_secs")
+            live = bool(ent.get("apply", True)) and not self.dry_run
+            if live and not backend.supports_content_verify:
+                # H2: name+size-only verification is not byte-proof; store
+                # but never clear the local copy on such tiers.
+                self._journal("error", str(ent.get("watch_dir")), 0, "",
+                              "stream refused: backend has no content "
+                              "verification; kept local")
+                continue
+            try:
+                st = _streamer.Streamer(
+                    str(ent["watch_dir"]),
+                    backend,
+                    repo=str(ent.get("repo") or _streamer.DEFAULT_REPO),
+                    tag=ent.get("tag"),
+                    chunk_bytes=int(100 if _chunk_mb is None else _chunk_mb)
+                    * 1024
+                    * 1024,
+                    settle_secs=int(300 if _settle is None else _settle),
+                    apply=live,
+                    journal=journal_fn,
+                )
+                rep = st.stream_once()
+            except Exception as exc:  # noqa: BLE001 - one dir must not break the tick
+                self._record_error(report, flags, str(ent.get("watch_dir")),
+                                   f"stream-dir pass failed: {exc}")
+                continue
+            # chunks_uploaded counts chunks stored+byte-verified.
+            report.stored += rep.chunks_uploaded
+            report.verified += rep.chunks_uploaded
+            report.cleared += rep.files_cleared
+            report.freed_bytes += rep.freed_bytes
+            report.stream_files += rep.files_streamed
+            report.stream_chunks += rep.chunks_uploaded
+            report.stream_freed_bytes += rep.freed_bytes
+            for e in rep.errors:
+                self._record_error(report, flags, str(ent.get("watch_dir")),
+                                   f"stream: {e}")
+
     # ------------------------------------------------------------------ API
 
     def tick(self) -> TickReport:
@@ -408,6 +522,8 @@ class Daemon:
                 except Exception as exc:
                     self._record_error(report, flags, str(entry.get("path", "")),
                                        f"unexpected error on {entry.get('path', '')}: {exc}")
+
+        self._run_stream_dirs(report, flags)
 
         if report.skipped_sacred:
             # One summary event per tick instead of one per skipped file.
@@ -451,6 +567,9 @@ class Daemon:
                 "verified": report.verified,
                 "cleared": report.cleared,
                 "freed_bytes": report.freed_bytes,
+                "stream_files": report.stream_files,
+                "stream_chunks": report.stream_chunks,
+                "stream_freed_bytes": report.stream_freed_bytes,
                 "skipped_sacred": report.skipped_sacred,
                 "errors": len(report.errors),
                 "critical": report.critical,
