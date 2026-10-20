@@ -169,3 +169,51 @@ def test_flag_presets():
     assert "--low-level-retries" in rclone
     with pytest.raises(ValueError):
         net.preset("wget")
+
+
+
+# ------------------------------------------------------------------ #
+# github backend wiring: _run_gh retries via with_backoff and passes
+# the sanitized proxy env to subprocess
+# ------------------------------------------------------------------ #
+def test_run_gh_retries_proxy_flake_and_sanitizes_env(monkeypatch):
+    import subprocess as sp
+
+    from clouddog.stores import github as gh_mod
+
+    monkeypatch.setenv("no_proxy", "localhost,::1,[::1]")
+    seen_envs = []
+    calls = {"n": 0}
+
+    def fake_run(cmd, **kwargs):
+        calls["n"] += 1
+        seen_envs.append(kwargs.get("env"))
+        if calls["n"] < 3:  # two proxy flakes, then success
+            return sp.CompletedProcess(cmd, 1, "", "dial tcp: connection refused")
+        return sp.CompletedProcess(cmd, 0, "ok", "")
+
+    monkeypatch.setattr(gh_mod.subprocess, "run", fake_run)
+    backend = gh_mod.GitHubReleaseBackend()
+    proc = backend._run_gh(["release", "view", "v1"])
+    assert proc.returncode == 0
+    assert calls["n"] == 3
+    assert seen_envs[0]["no_proxy"] == "localhost"
+
+
+def test_run_gh_permanent_failure_fails_fast(monkeypatch):
+    import subprocess as sp
+
+    from clouddog.stores import github as gh_mod
+    from clouddog.errors import CloudDogError
+
+    calls = {"n": 0}
+
+    def fake_run(cmd, **kwargs):
+        calls["n"] += 1
+        return sp.CompletedProcess(cmd, 1, "", "404 Not Found")
+
+    monkeypatch.setattr(gh_mod.subprocess, "run", fake_run)
+    backend = gh_mod.GitHubReleaseBackend()
+    with pytest.raises(CloudDogError):
+        backend._run_gh(["release", "view", "v1"])
+    assert calls["n"] == 1
