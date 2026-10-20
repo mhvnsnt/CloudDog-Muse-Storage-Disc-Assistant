@@ -203,8 +203,8 @@ def test_run_gh_retries_proxy_flake_and_sanitizes_env(monkeypatch):
 def test_run_gh_permanent_failure_fails_fast(monkeypatch):
     import subprocess as sp
 
-    from clouddog.stores import github as gh_mod
     from clouddog.errors import CloudDogError
+    from clouddog.stores import github as gh_mod
 
     calls = {"n": 0}
 
