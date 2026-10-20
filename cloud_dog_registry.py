@@ -44,14 +44,35 @@ updated_at, from the 2026-10-17 v3 lane) are detected on open and
 exploded into the columnar schema; the old table is renamed to
 entries_legacy_v3 and kept, never dropped.
 
+Concurrency (the CI "database is locked" flake fix, 2026-10-20):
+Python's sqlite3 default starts transactions DEFERRED; a deferred
+read that upgrades to a write while another connection holds the write
+lock gets SQLITE_BUSY *immediately*, bypassing busy_timeout entirely
+(SQLite deadlock avoidance). So this module connects with
+isolation_level=None (autocommit) and controls transactions itself:
+every write runs under an explicit BEGIN IMMEDIATE (the write lock is
+taken up front, where busy_timeout actually applies), whole write
+operations retry on residual "locked" errors with exponential backoff
++ jitter, and first-open schema DDL is serialized behind a
+process-wide lock + a cross-process flock so N racing openers no
+longer stampede CREATE TABLE / the v3 upgrade / the JSON seed.
+
 Stdlib only (sqlite3, json, os, time).
 """
 
+import contextlib
 import json
 import os
+import random
 import sqlite3
+import threading
 import time
 from datetime import datetime, timezone
+
+try:
+    import fcntl
+except ImportError:  # non-POSIX: the threading lock still serializes in-process
+    fcntl = None
 
 REGISTRY_VERSION = 4
 ENV_VAR = "CLOUDEDOG_REGISTRY"
@@ -64,34 +85,111 @@ COLUMNS = (
     "registered_at", "reaped_at", "verified_at",
 )
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS entries (
-    local_path    TEXT PRIMARY KEY,
-    store         TEXT NOT NULL DEFAULT '',
-    repo          TEXT NOT NULL DEFAULT '',
-    release       TEXT NOT NULL DEFAULT '',
-    asset         TEXT NOT NULL DEFAULT '',
-    size          INTEGER NOT NULL DEFAULT 0,
-    sha256        TEXT NOT NULL DEFAULT '',
-    status        TEXT NOT NULL DEFAULT 'registered',
-    registered_at TEXT NOT NULL DEFAULT '',
-    reaped_at     TEXT NOT NULL DEFAULT '',
-    verified_at   TEXT NOT NULL DEFAULT '',
-    updated_at    TEXT NOT NULL DEFAULT '',
-    extra         TEXT NOT NULL DEFAULT '{}'
-);
-CREATE TABLE IF NOT EXISTS journal (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts         TEXT NOT NULL,
-    action     TEXT NOT NULL,
-    local_path TEXT NOT NULL DEFAULT '',
-    detail     TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS meta (
-    k TEXT PRIMARY KEY,
-    v TEXT NOT NULL
-);
-"""
+# Individual statements (not one executescript blob) so schema init can
+# run inside an explicit BEGIN IMMEDIATE transaction — executescript
+# implicitly COMMITs any pending transaction first, which would break it.
+_SCHEMA_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS entries (
+        local_path    TEXT PRIMARY KEY,
+        store         TEXT NOT NULL DEFAULT '',
+        repo          TEXT NOT NULL DEFAULT '',
+        release       TEXT NOT NULL DEFAULT '',
+        asset         TEXT NOT NULL DEFAULT '',
+        size          INTEGER NOT NULL DEFAULT 0,
+        sha256        TEXT NOT NULL DEFAULT '',
+        status        TEXT NOT NULL DEFAULT 'registered',
+        registered_at TEXT NOT NULL DEFAULT '',
+        reaped_at     TEXT NOT NULL DEFAULT '',
+        verified_at   TEXT NOT NULL DEFAULT '',
+        updated_at    TEXT NOT NULL DEFAULT '',
+        extra         TEXT NOT NULL DEFAULT '{}'
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS journal (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts         TEXT NOT NULL,
+        action     TEXT NOT NULL,
+        local_path TEXT NOT NULL DEFAULT '',
+        detail     TEXT NOT NULL DEFAULT ''
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS meta (
+        k TEXT PRIMARY KEY,
+        v TEXT NOT NULL
+    )
+    """,
+)
+
+_SCHEMA = ";\n".join(s.strip() for s in _SCHEMA_STATEMENTS) + ";\n"
+
+
+# ------------------------------------------------------- sqlite locking
+# See the module docstring: DEFERRED lock-upgrades bypass busy_timeout,
+# so writes take the lock up front (BEGIN IMMEDIATE) and whole operations
+# retry on residual lock contention. Schema init is serialized so racing
+# first-openers don't stampede the DDL.
+
+_BUSY_ATTEMPTS = 5
+_BUSY_BASE_S = 0.05
+_BUSY_CAP_S = 2.0
+
+_SCHEMA_INIT_LOCK = threading.Lock()
+_schema_init_done = set()  # abspaths whose init completed in this process
+
+
+def _is_locked(exc):
+    return isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
+
+
+def _retry_locked(fn, attempts=_BUSY_ATTEMPTS):
+    """Run fn(); retry sqlite "database is locked" with backoff + jitter."""
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except sqlite3.OperationalError as exc:
+            if not _is_locked(exc) or attempt == attempts - 1:
+                raise
+            delay = min(_BUSY_CAP_S, _BUSY_BASE_S * (2**attempt))
+            time.sleep(delay + random.uniform(0, _BUSY_BASE_S))
+
+
+@contextlib.contextmanager
+def _write_txn(conn):
+    """Explicit BEGIN IMMEDIATE write transaction on an autocommit conn.
+
+    BEGIN IMMEDIATE takes the write lock up front, so busy_timeout
+    applies; a DEFERRED transaction upgrading mid-flight would return
+    SQLITE_BUSY immediately instead. Rolls back on any error so callers
+    can retry the whole operation via _retry_locked.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+
+
+@contextlib.contextmanager
+def _schema_init_guard(db_path):
+    """Serialize first-open schema init across threads AND processes."""
+    with _SCHEMA_INIT_LOCK:
+        fh = None
+        if fcntl is not None:
+            fh = open(db_path + ".init.lock", "a+")  # noqa: SIM115 - fd held across the yield, closed in finally
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fh is not None:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                finally:
+                    fh.close()
 
 
 def _stamp():
@@ -227,7 +325,8 @@ def _maybe_upgrade_v3(conn):
         return 0  # no table yet, or already the columnar schema
     stamp = _stamp()
     conn.execute("ALTER TABLE entries RENAME TO entries_legacy_v3")
-    conn.executescript(_SCHEMA)
+    for stmt in _SCHEMA_STATEMENTS:
+        conn.execute(stmt)
     n = 0
     for path, data in conn.execute(
             "SELECT local_path, data FROM entries_legacy_v3"):
@@ -253,52 +352,91 @@ def _maybe_upgrade_v3(conn):
     return n
 
 
+def _seed_from_json(conn, json_path):
+    """One-shot seed from the legacy JSON file inside an open write txn.
+
+    The file itself is never modified or deleted here — it stays as a backup.
+    Idempotent: guarded by the json_migrated meta flag.
+    """
+    row = conn.execute("SELECT v FROM meta WHERE k='json_migrated'").fetchone()
+    if row:
+        return
+    reg = json_load(json_path)
+    stamp = _stamp()
+    for path, entry in reg["entries"].items():
+        cols, extra = _explode_entry(path, entry)
+        conn.execute(
+            "INSERT OR REPLACE INTO entries (local_path,"
+            " store, repo, release, asset, size, sha256,"
+            " status, registered_at, reaped_at,"
+            " verified_at, updated_at, extra)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (path, cols["store"], cols["repo"],
+             cols["release"], cols["asset"], cols["size"],
+             cols["sha256"], cols["status"],
+             cols["registered_at"], cols["reaped_at"],
+             cols["verified_at"], stamp, extra))
+    _journal(conn, "auto-migrate",
+             detail=f"seeded {len(reg['entries'])} entries"
+                    f" from {json_path} (file kept as backup)")
+    conn.execute("INSERT INTO meta (k, v) VALUES ('json_migrated', '1')")
+
+
+def _init_schema(conn, db_path, auto_migrate_json, json_path):
+    """First-open schema/upgrade/seed, serialized and lock-retried.
+
+    The schema DDL runs only under the init guard — racing openers no
+    longer stampede CREATE TABLE / the v3 upgrade. A per-process flag
+    skips the guard on later opens of the same DB. The JSON-seed check
+    is NOT cached: it stays an every-open meta-flag read (cheap SELECT),
+    matching the pre-flake-fix behavior exactly, and only takes the
+    write path when the DB has never been seeded.
+    """
+    key = os.path.abspath(db_path)
+    if key not in _schema_init_done:
+        with _schema_init_guard(db_path):
+            if key not in _schema_init_done:
+
+                def _do_schema():
+                    with _write_txn(conn):
+                        for stmt in _SCHEMA_STATEMENTS:
+                            conn.execute(stmt)
+                        _maybe_upgrade_v3(conn)
+
+                _retry_locked(_do_schema)
+                _schema_init_done.add(key)
+    if auto_migrate_json and json_path and os.path.exists(json_path):
+        row = conn.execute(
+            "SELECT v FROM meta WHERE k='json_migrated'").fetchone()
+        if not row:
+            def _do_seed():
+                with _write_txn(conn):
+                    _seed_from_json(conn, json_path)
+
+            with _schema_init_guard(db_path):
+                _retry_locked(_do_seed)
+
+
 def _open_db(db_path, auto_migrate_json=True, json_path=None):
     """Open the registry DB: WAL, busy timeout, schema, upgrades, JSON seed.
 
     Raises on real errors; the caller must close the returned connection.
+
+    The connection is in autocommit mode (isolation_level=None): writes
+    take an explicit BEGIN IMMEDIATE via _write_txn so the lock is held up
+    front where busy_timeout applies (the DEFERRED upgrade path bypasses
+    it entirely — the root cause of the CI "database is locked" flake).
     """
     parent = os.path.dirname(db_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    # Default (deferred) isolation: DML opens an implicit transaction and
-    # `with conn:` blocks COMMIT/ROLLBACK atomically around each write.
-    conn = sqlite3.connect(db_path, timeout=30)
+    conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA busy_timeout=30000;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("PRAGMA foreign_keys=ON;")
-        conn.executescript(_SCHEMA)
-        _maybe_upgrade_v3(conn)
-        conn.commit()  # persist schema/upgrade DDL+DML before any reads
-        if auto_migrate_json and json_path and os.path.exists(json_path):
-            row = conn.execute(
-                "SELECT v FROM meta WHERE k='json_migrated'").fetchone()
-            if not row:
-                # One-shot seed from the legacy JSON file. The file itself
-                # is never modified or deleted here — it stays as a backup.
-                reg = json_load(json_path)
-                stamp = _stamp()
-                with conn:  # atomic
-                    for path, entry in reg["entries"].items():
-                        cols, extra = _explode_entry(path, entry)
-                        conn.execute(
-                            "INSERT OR REPLACE INTO entries (local_path,"
-                            " store, repo, release, asset, size, sha256,"
-                            " status, registered_at, reaped_at,"
-                            " verified_at, updated_at, extra)"
-                            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                            (path, cols["store"], cols["repo"],
-                             cols["release"], cols["asset"], cols["size"],
-                             cols["sha256"], cols["status"],
-                             cols["registered_at"], cols["reaped_at"],
-                             cols["verified_at"], stamp, extra))
-                    _journal(conn, "auto-migrate",
-                             detail=f"seeded {len(reg['entries'])} entries"
-                                    f" from {json_path} (file kept as backup)")
-                    conn.execute("INSERT INTO meta (k, v)"
-                                 " VALUES ('json_migrated', '1')")
+        _init_schema(conn, db_path, auto_migrate_json, json_path)
     except Exception:
         conn.close()
         raise
@@ -326,21 +464,25 @@ def sqlite_save(reg, db_path, json_path=None):
     try:
         stamp = _stamp()
         entries = reg.get("entries", {})
-        with conn:  # atomic replace
-            conn.execute("DELETE FROM entries")
-            for path, entry in entries.items():
-                cols, extra = _explode_entry(path, entry)
-                conn.execute(
-                    "INSERT INTO entries (local_path, store, repo, release,"
-                    " asset, size, sha256, status, registered_at, reaped_at,"
-                    " verified_at, updated_at, extra)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (path, cols["store"], cols["repo"], cols["release"],
-                     cols["asset"], cols["size"], cols["sha256"],
-                     cols["status"], cols["registered_at"], cols["reaped_at"],
-                     cols["verified_at"], stamp, extra))
-            _journal(conn, "save",
-                     detail=f"registry replaced with {len(entries)} entries")
+
+        def _do_save():
+            with _write_txn(conn):  # atomic replace
+                conn.execute("DELETE FROM entries")
+                for path, entry in entries.items():
+                    cols, extra = _explode_entry(path, entry)
+                    conn.execute(
+                        "INSERT INTO entries (local_path, store, repo, release,"
+                        " asset, size, sha256, status, registered_at, reaped_at,"
+                        " verified_at, updated_at, extra)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (path, cols["store"], cols["repo"], cols["release"],
+                         cols["asset"], cols["size"], cols["sha256"],
+                         cols["status"], cols["registered_at"], cols["reaped_at"],
+                         cols["verified_at"], stamp, extra))
+                _journal(conn, "save",
+                         detail=f"registry replaced with {len(entries)} entries")
+
+        _retry_locked(_do_save)
     finally:
         conn.close()
 
@@ -350,27 +492,31 @@ def sqlite_upsert(db_path, path, entry, json_path=None):
     conn = _open_db(db_path, json_path=json_path)
     try:
         cols, extra = _explode_entry(path, entry)
-        with conn:
-            conn.execute(
-                "INSERT INTO entries (local_path, store, repo, release,"
-                " asset, size, sha256, status, registered_at, reaped_at,"
-                " verified_at, updated_at, extra)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
-                " ON CONFLICT(local_path) DO UPDATE SET"
-                " store=excluded.store, repo=excluded.repo,"
-                " release=excluded.release, asset=excluded.asset,"
-                " size=excluded.size, sha256=excluded.sha256,"
-                " status=excluded.status,"
-                " registered_at=excluded.registered_at,"
-                " reaped_at=excluded.reaped_at,"
-                " verified_at=excluded.verified_at,"
-                " updated_at=excluded.updated_at, extra=excluded.extra",
-                (path, cols["store"], cols["repo"], cols["release"],
-                 cols["asset"], cols["size"], cols["sha256"], cols["status"],
-                 cols["registered_at"], cols["reaped_at"], cols["verified_at"],
-                 _stamp(), extra))
-            _journal(conn, "upsert", local_path=path,
-                     detail=f"store={cols['store']} status={cols['status']}")
+
+        def _do_upsert():
+            with _write_txn(conn):
+                conn.execute(
+                    "INSERT INTO entries (local_path, store, repo, release,"
+                    " asset, size, sha256, status, registered_at, reaped_at,"
+                    " verified_at, updated_at, extra)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                    " ON CONFLICT(local_path) DO UPDATE SET"
+                    " store=excluded.store, repo=excluded.repo,"
+                    " release=excluded.release, asset=excluded.asset,"
+                    " size=excluded.size, sha256=excluded.sha256,"
+                    " status=excluded.status,"
+                    " registered_at=excluded.registered_at,"
+                    " reaped_at=excluded.reaped_at,"
+                    " verified_at=excluded.verified_at,"
+                    " updated_at=excluded.updated_at, extra=excluded.extra",
+                    (path, cols["store"], cols["repo"], cols["release"],
+                     cols["asset"], cols["size"], cols["sha256"], cols["status"],
+                     cols["registered_at"], cols["reaped_at"], cols["verified_at"],
+                     _stamp(), extra))
+                _journal(conn, "upsert", local_path=path,
+                         detail=f"store={cols['store']} status={cols['status']}")
+
+        _retry_locked(_do_upsert)
     finally:
         conn.close()
 
@@ -397,31 +543,37 @@ def migrate_json_to_sqlite(json_path, db_path, force=False):
             row = None
         reg = json_load(json_path)
         stamp = _stamp()
-        migrated, skipped = 0, []
-        with conn:  # atomic
-            for path, entry in reg["entries"].items():
-                if not path or not str(path).startswith("/"):
-                    skipped.append(path)
-                    continue
-                cols, extra = _explode_entry(path, entry)
-                conn.execute(
-                    "INSERT OR REPLACE INTO entries (local_path, store,"
-                    " repo, release, asset, size, sha256, status,"
-                    " registered_at, reaped_at, verified_at, updated_at,"
-                    " extra) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (path, cols["store"], cols["repo"], cols["release"],
-                     cols["asset"], cols["size"], cols["sha256"],
-                     cols["status"], cols["registered_at"], cols["reaped_at"],
-                     cols["verified_at"], stamp, extra))
-                migrated += 1
-            _journal(conn, "migrate",
-                     detail=f"one-shot import: {migrated} entries from"
-                            f" {json_path} (skipped={len(skipped)});"
-                            " JSON file kept as backup, not deleted")
-            if row is None:
-                conn.execute("INSERT OR REPLACE INTO meta (k, v)"
-                             " VALUES ('json_migrated', '1')")
-        return {"migrated": migrated, "skipped": skipped,
+        result = {}
+
+        def _do_migrate():
+            migrated, skipped = 0, []
+            with _write_txn(conn):  # atomic
+                for path, entry in reg["entries"].items():
+                    if not path or not str(path).startswith("/"):
+                        skipped.append(path)
+                        continue
+                    cols, extra = _explode_entry(path, entry)
+                    conn.execute(
+                        "INSERT OR REPLACE INTO entries (local_path, store,"
+                        " repo, release, asset, size, sha256, status,"
+                        " registered_at, reaped_at, verified_at, updated_at,"
+                        " extra) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (path, cols["store"], cols["repo"], cols["release"],
+                         cols["asset"], cols["size"], cols["sha256"],
+                         cols["status"], cols["registered_at"], cols["reaped_at"],
+                         cols["verified_at"], stamp, extra))
+                    migrated += 1
+                _journal(conn, "migrate",
+                         detail=f"one-shot import: {migrated} entries from"
+                                f" {json_path} (skipped={len(skipped)});"
+                                " JSON file kept as backup, not deleted")
+                if row is None:
+                    conn.execute("INSERT OR REPLACE INTO meta (k, v)"
+                                 " VALUES ('json_migrated', '1')")
+            result.update(migrated=migrated, skipped=skipped)
+
+        _retry_locked(_do_migrate)
+        return {"migrated": result["migrated"], "skipped": result["skipped"],
                 "json_path": json_path, "db_path": db_path}
     finally:
         conn.close()
