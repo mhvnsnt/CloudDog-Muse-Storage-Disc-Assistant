@@ -423,3 +423,94 @@ day? Six patterns, each with a production pedigree and a CloudDog form:
 **Mechanism this shapes:** journal attribution (`actor`/`grade`/legs),
 hash-chain + external head anchor, per-run circuit-breaker caps,
 two-signal rule for the irreversible tier, and a choke-point kill switch.
+
+## Candidate summary — license + honest verdict
+
+| Candidate / pattern | License | Verdict |
+|---|---|---|
+| OPA / Rego | Apache-2.0 | ❌ Skip as dependency (Go sidecar/binary; no Python embedding). ✅ Adapt: decision/enforcement split + decision logs. |
+| AWS Cedar | Apache-2.0 | ❌ Skip as dependency (Rust/Go; no mature Python binding in sources reviewed). ✅ Adapt: principal–action–resource grammar, default-deny, forbid-trumps-permit. |
+| Casbin (pycasbin) | Apache-2.0 | ❌ Skip — solves multi-subject authz; CloudDog's hard questions are temporal/evidentiary, which it doesn't model. |
+| durable_rules | **Not verified** in sources reviewed | ❌ Skip regardless — C-extension Rete engine, wildly oversized for ~12 rules; breaks single-reader auditability. |
+| Small Python rule libs (MIT) | MIT | ❌ Skip — duplicate `policy.py` with less domain fit. ✅ Adapt decision-table form for the *test corpus*. |
+| Inspect (UK AISI) | MIT | ❌ Not pulled into the daemon (it's an eval framework for ML models). ✅ Adapt: Dataset/Solver/Scorer shape + re-scorable eval logs for the incident corpus. |
+| promptfoo | MIT | ❌ Not pulled (Node/YAML LLM-eval tooling). ✅ Adapt: CI pass-rate gate form — at a 100% bar for safety cases. |
+| Langfuse | MIT core (enterprise modules separate) | ❌ Skip (hosted/self-host platform; CloudDog must not export its grades). ✅ Adapt: production-failure → regression-test workflow; trace+score persistence shape. |
+| Harness AI Evals / other SaaS eval & observability | Commercial | ❌ Skip — same shape, wrong deployment model for a single-host stdlib tool. |
+| Trust ladder / error-budget throttle (SRE practice; Google SRE Workbook; CSA Agentic Profile over NIST AI RMF) | Practice/frameworks, no code license involved | ✅ **Adapt — this is the core recommendation.** Rungs = existing modes; revocation = budget freeze applied to actors. |
+| RLHF / reward shaping (InstructGPT etc.) | Papers | ✅ Adapt the decomposition (reward signal, shaping warnings, feedback dataset); ❌ no ML, no online learning, ever, for this tool. |
+| Hash-chained journal + external anchor | Pattern (stdlib `hashlib` suffices) | ✅ Adapt in stdlib — chain, canonical JSON, anchored head; claim tamper-evidence only with the anchor. |
+| Circuit breaker (Nygard/Fowler), two-person rule (NIST SP 800-12), choke point, kill switch | Patterns | ✅ Adapt in stdlib at the existing gate. |
+
+## Consensus recommendation
+
+**Change no behavior until the owner approves.** When approved, build in
+this order — each step is independently useful and independently
+revertible:
+
+| Step | Build | One-line rationale |
+|---|---|---|
+| 1 | **Journal attribution**: add `actor`, `invocation_id`, `grade`, and gate-leg fields to `AuditEvent`; every delete-class event carries them | Nothing else (scorecard, ladder, blame-free review) is possible while actions are anonymous |
+| 2 | **Scorecard**: `scorecard` table in the registry + `clouddog score` CLI (per actor × action-kind × window; grades per Angle B) | Turns "is it behaving?" into a query; makes the reward signal real and *safe-shaped* (no bytes-freed anywhere in it) |
+| 3 | **Incident corpus**: JSONL eval corpus (facts → expected action/verdict/grade) + CI gate at 100% for safety cases; standing rule that every `violation`/`near_miss` adds a case before the incident closes | The deterministic training set; today's two incidents are its first entries |
+| 4 | **Trust ladder + revocation**: per-actor rung in the registry; `violation` → rung 0 automatically; near-miss budget (3/30d → one rung); promotion only on graded clean streaks | Earned autonomy with automatic, safe-direction demotion; re-earning by evidence, never by clock |
+| 5 | **Journal integrity**: hash chain over audit JSONL + periodic external anchor of (head hash, length) to this repo | Tamper-evidence that survives the honest limit of a bare chain |
+| 6 | **Blast-radius extras**: per-run delete caps (breaker) at the gate, two-signal rule for strict/large clears, kill-switch sentinel checked at delete time | Bounds the worst single run even if every other layer misjudges |
+
+Explicitly **not** recommended: any policy-engine or eval-framework
+dependency; any online/ML learning; any metric that rewards bytes freed;
+any promotion mechanism based on elapsed time.
+
+## Follow-ups (for the owner to approve)
+
+1. Approve the grade vocabulary (`correct` / `blocked` / `violation` /
+   `near_miss` / `error`) — everything downstream keys off it.
+2. Approve the ladder's promotion streak lengths and the near-miss budget
+   (3 / 30 days is a proposal, not a measurement — CloudDog has no
+   scorecard history to calibrate against yet; revisit after step 2 has
+   run for a month).
+3. Decide the external anchor cadence + destination for the journal head
+   (guardian-cron commit to this repo is the proposal).
+4. Confirm the no-proxy rule as law: bytes freed is telemetry, never a
+   grade, a promotion input, or a cron success condition — in CloudDog
+   and in any agent lane that reports disk work.
+
+## Sources
+
+All sources were read via live web research on 2026-10-20; no claim in
+this doc rests on training-data recollection. Key sources per angle:
+
+- **Reward hacking / Goodhart:** https://en.wikipedia.org/wiki/Reward_hacking?ref=hackernoon.com
+- **Angle A:** https://www.openpolicyagent.org/docs/v0.64.1/integration/ ·
+  https://www.cncf.io/projects/open-policy-agent-opa/ ·
+  https://www.cncf.io/projects/cedar/ ·
+  https://jun.codes/blog/authorization-with-cedar ·
+  https://pypi.org/project/pycasbin/2.3.0/ ·
+  https://pypi.org/project/durable-rules/ ·
+  https://www.permit.io/blog/policy-as-code-or-from-infrastructure-to-fine-grained-authorization
+- **Angle B:** https://interoperable-europe.ec.europa.eu/collection/open-source-observatory-osor/news/inspect-uk-government-backed-open-source-ai-testing-platform ·
+  https://inspect.aisi.org.uk/extensions-components.html ·
+  https://engineering-playbook.aisi.org.uk/evaluate.html ·
+  https://callsphere.ai/blog/vw3g-promptfoo-agent-eval-ci-gate-after-openai-acquisition ·
+  https://dev.to/pponali/scoring-ai-agents-deterministic-metrics-an-llm-judge-poj ·
+  https://contextosai.com/blog/great-ai-engineers-build-agent-harnesses ·
+  https://dev.to/devtoaaron/langfuse-vs-promptfoo-llm-testing-observability-compared-23em ·
+  https://www.harness.io/products/ai-evals
+- **Angle C:** https://clouatre.ca/posts/sre-ai-agents-production/ ·
+  https://rootly.com/ai-sre-guide/architecture ·
+  https://rootly.com/sre/2025-devops-trend-ai-incident-automation-slashes-mttr-f982d ·
+  https://devtocash.com/blog/ai-agents-sre-autonomous-incident-response-2026 ·
+  https://labs.cloudsecurityalliance.org/agentic/agentic-nist-ai-rmf-profile-v1/ ·
+  https://backendbytes.com/articles/sre-slos-slis-error-budgets/
+- **Angle D:** https://srdas.github.io/NLPBook/RLHF.html (InstructGPT,
+  arXiv 2203.02155) · reward-hacking sources above · Langfuse→regression
+  workflow (Angle B).
+- **Angle E:** https://martinfowler.com/bliki/CircuitBreaker.html ·
+  https://csrc.nist.rip/publications/nistpubs/800-12/800-12-html/chapter10.html ·
+  https://dev.to/gentlyding/how-we-built-a-tamper-evident-audit-log-for-soc-2-and-iso-27001-evidence-jl4 ·
+  https://pipelab.org/blog/what-a-hash-chain-cant-prove/ ·
+  http://cloudthinker.io/what-is-tamper-evident-audit ·
+  https://rootly.com/ai-sre-guide/frequently-asked-questions
+- **Repo grounding:** `src/clouddog/{policy,delete_gate,claims,audit,registry}.py`,
+  `docs/LAWS.md`, `docs/THRESHOLDS.md` (style + consensus format), all at
+  `3e64090`.
