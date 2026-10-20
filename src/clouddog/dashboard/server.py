@@ -416,6 +416,41 @@ def _lanes() -> list:
     return lanes
 
 
+def _registry_lane_entries(data: object) -> list:
+    """Normalize a parsed cloud_dog.py registry into a list of entry dicts.
+
+    Accepts BOTH shapes found in the wild:
+    - the documented dict contract ``{"version": N, "entries": {path: {...}}}``
+      (also ``entries`` as a list);
+    - the bare list ``[{path, size, ...}]`` written by active cleanup lanes.
+    Returning entries-as-parsed here (never fabricating them) keeps the
+    dashboard's counts honest even when the on-disk schema shifts.
+    """
+    if isinstance(data, dict):
+        entries = data.get("entries", {})
+        if isinstance(entries, dict):
+            return [e for e in entries.values() if isinstance(e, dict)]
+        if isinstance(entries, list):
+            return [e for e in entries if isinstance(e, dict)]
+        return []
+    if isinstance(data, list):
+        return [e for e in data if isinstance(e, dict)]
+    return []
+
+
+def _registry_lane_summary(items: list) -> tuple[int, dict, int]:
+    by_status: dict[str, int] = {}
+    total_bytes = 0
+    for e in items:
+        status = e.get("status") or ("cleared" if "cleared" in e else "unknown")
+        by_status[status] = by_status.get(status, 0) + 1
+        try:
+            total_bytes += int(e.get("size", 0) or 0)
+        except (ValueError, TypeError):
+            pass
+    return len(items), by_status, total_bytes
+
+
 def _cloud_dog_registry_lane() -> list:
     """Surface cloud_dog.py's registry (the single-file engine) in the lanes
     view. Read-only; never modifies the registry. Returns [] when absent."""
@@ -427,8 +462,8 @@ def _cloud_dog_registry_lane() -> list:
             data = json.load(fh)
     except (OSError, ValueError):
         return []
-    entries = data.get("entries", {}) if isinstance(data, dict) else {}
-    if not entries:
+    items = _registry_lane_entries(data)
+    if not items:
         return [{
             "lane": "cloud-dog:registry",
             "manifest_path": reg_path,
@@ -440,18 +475,12 @@ def _cloud_dog_registry_lane() -> list:
             "log_path": None,
             "note": "cloud_dog.py registry present, 0 entries",
         }]
-    by_status: dict[str, int] = {}
-    total_bytes = 0
-    for e in entries.values():
-        if not isinstance(e, dict):
-            continue
-        by_status[e.get("status", "unknown")] = by_status.get(e.get("status", "unknown"), 0) + 1
-        try:
-            total_bytes += int(e.get("size", 0) or 0)
-        except (ValueError, TypeError):
-            pass
-    verified = by_status.get("verified", 0) + by_status.get("reaped", 0)
-    total = len(entries)
+    total, by_status, total_bytes = _registry_lane_summary(items)
+    verified = (
+        by_status.get("verified", 0)
+        + by_status.get("reaped", 0)
+        + by_status.get("cleared", 0)
+    )
     return [{
         "lane": "cloud-dog:registry",
         "manifest_path": reg_path,
@@ -793,6 +822,43 @@ def _relocate_shim(tier: str, remote_ref: str, entries: list[dict]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _policy_evaluate_scan(mod: object, real: str) -> list:
+    """Fallback policy scan: ``mod.evaluate`` over top-level entries.
+
+    Kept as a helper (and covered by a regression test) so that, even when
+    the policy module lacks ``scan()``, every entry still reports a LIVE
+    byte size — never a hardcoded 0.
+    """
+    result = []
+    with os.scandir(real) as it:
+        for entry in it:
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+                if is_dir:
+                    size = _dir_size(entry.path)
+                else:
+                    size = entry.stat(follow_symlinks=False).st_size
+            except OSError:
+                size = 0
+                size_note = " (size unreadable)"
+            else:
+                size_note = ""
+            d = mod.evaluate(entry.path, scan_root=real)
+            action = d.action
+            result.append(
+                {
+                    "path": entry.path,
+                    "bytes": size,
+                    "action": action.value
+                    if hasattr(action, "value")
+                    else str(action),
+                    "tier": d.tier,
+                    "reason": d.reason + size_note,
+                }
+            )
+    return result
+
+
 # --------------------------------------------------------------------------
 # request handler
 # --------------------------------------------------------------------------
@@ -927,23 +993,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if hasattr(mod, "scan"):
                 result = mod.scan(real, max_entries=200)
             else:
-                # fallback: policy.evaluate over top-level entries
-                result = []
-                with os.scandir(real) as it:
-                    for entry in it:
-                        d = mod.evaluate(entry.path, scan_root=real)
-                        action = d.action
-                        result.append(
-                            {
-                                "path": entry.path,
-                                "bytes": 0,
-                                "action": action.value
-                                if hasattr(action, "value")
-                                else str(action),
-                                "tier": d.tier,
-                                "reason": d.reason,
-                            }
-                        )
+                result = _policy_evaluate_scan(mod, real)
         except Exception as exc:  # noqa: BLE001
             _send_error(self, f"policy scan failed: {exc}", 500)
             return

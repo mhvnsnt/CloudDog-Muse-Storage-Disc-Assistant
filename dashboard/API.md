@@ -26,7 +26,7 @@ Security rules (all enforced server-side):
 | GET | /api/backends | — | [{name, health: live\|degraded\|down, reason}] — real `health()` from each backend |
 | GET | /api/sysinfo | — | {cpu: {load_avg_1min, load_avg_5min, load_avg_15min, cpu_count}, mem:{total_bytes, used_bytes, pct}, disk:{...same as /api/disk}, gpu: null or {name, ...} if nvidia-smi exists} |
 | GET | /api/policy/scan | ?path= | [{path, bytes, action, tier, reason}] — real `policy.evaluate` over top-level entries |
-| GET | /api/lanes | — | [{lane, manifest_path, uploaded, total, pct, alive, log_tail:[last 10 lines]}] — read from real lane manifests (`blob_checkpoint.json` files under ~/workspace) + `ps` aliveness |
+| GET | /api/lanes | — | [{lane, manifest_path, uploaded, total, pct, alive, log_tail:[last 10 lines]}] — read from real lane manifests (`blob_checkpoint.json` files under ~/workspace) + `ps` aliveness. Also appends a `cloud-dog:registry` lane read live from `~/workspace/agent-ops/cloud-dog-registry.json` (accepts both the dict `{"entries": {...}}` contract and the bare-list shape active cleanup lanes write; counts/sizes come straight from the file, never a zero sentinel). |
 | POST | /api/store | {path, tier, remote_ref, dry_run} | {ok, stored:{...} or dry_run preview} |
 | POST | /api/verify | {path, stored} | {ok, match, detail} |
 | POST | /api/reap | {manifest, src_dir, dry_run=true, backend, remote_ref} | {ok, reaped, freed_bytes, mismatches, halted} — one reaper pass. Live reap requires backend+remote_ref (verified against the LIVE store); dry_run defaults true. |
