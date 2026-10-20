@@ -362,3 +362,119 @@ def test_daemon_entry_copy_failing_live_verify_survives(tmp_path):
     # daemon did not rewrite the entry to make the gate pass).
     on_disk = json.loads(registry_json.read_text())
     assert on_disk["entries"][str(target)]["locator"] == BAD_LOCATOR
+
+
+# ============================================================ reaper level
+
+from clouddog.reaper import Reaper, compute_hash  # noqa: E402
+
+
+def _reaper(tmp_path, rel="a.bin", data=b"reaper-gate-data", **kw):
+    src = tmp_path / "src"
+    src.mkdir(exist_ok=True)
+    p = src / rel
+    p.write_bytes(data)
+    manifest = {rel: compute_hash(str(p), "git-sha1")}
+    kw.setdefault("store_verify", lambda r, full: True)
+    kw.setdefault("claim_check", lambda path: (False, ""))
+    r = Reaper(
+        str(src), manifest, str(tmp_path / "reaper.log"),
+        state_path=str(tmp_path / "state.json"), **kw,
+    )
+    return r, p
+
+
+def test_reaper_policy_sacred_blocks_despite_verified_store(tmp_path):
+    # A .DO_NOT_DELETE marker over the tree makes evaluate() SACRED;
+    # manifest + live store verify must NOT be enough to delete.
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / ".DO_NOT_DELETE").write_text("lane working here")
+    r, p = _reaper(tmp_path)
+    report = r.reap_once(dry_run=False)
+    assert p.exists()
+    assert report.reaped == 0
+    with open(tmp_path / "reaper.log") as fh:
+        assert "DELETE-BLOCKED" in fh.read()
+
+
+def test_reaper_default_claims_wiring_blocks_claimed_file(tmp_path):
+    # No claim_check passed: the reaper must wire the production claims
+    # checker itself (there is no gate-less mode after the incident fix).
+    claims_db = tmp_path / "claims.db"
+    src = tmp_path / "src"
+    src.mkdir()
+    p = src / "a.bin"
+    p.write_bytes(b"claimed-data")
+    _claims_db_with_live_claim(claims_db, p)
+    manifest = {"a.bin": compute_hash(str(p), "git-sha1")}
+    r = Reaper(
+        str(src), manifest, str(tmp_path / "reaper.log"),
+        state_path=str(tmp_path / "state.json"),
+        store_verify=lambda rel, full: True,
+        claims_db=str(claims_db),
+    )
+    report = r.reap_once(dry_run=False)
+    assert p.exists()
+    assert report.reaped == 0
+
+
+def test_reaper_policy_check_injected_sacred_blocks(tmp_path):
+    r, p = _reaper(tmp_path, policy_check=lambda path: "sacred")
+    report = r.reap_once(dry_run=False)
+    assert p.exists()
+    assert report.reaped == 0
+
+
+def test_reaper_all_legs_hold_still_reaps(tmp_path):
+    r, p = _reaper(tmp_path)
+    report = r.reap_once(dry_run=False)
+    assert report.reaped == 1
+    assert not p.exists()
+
+
+# ========================================================== streamer level
+
+from clouddog.streamer import Streamer  # noqa: E402
+
+
+class _StreamBackend:
+    name = "fake"
+
+    def store(self, local_path, remote_ref, dry_run=False):
+        with open(local_path, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()
+        return StoredRef(
+            backend="fake",
+            locator=f"{remote_ref}/{os.path.basename(local_path)}",
+            size=os.path.getsize(local_path), sha256=digest, extra={},
+        )
+
+    def verify(self, local_path, stored):
+        return True
+
+
+def test_streamer_claimed_file_streams_but_never_clears(tmp_path):
+    wd = tmp_path / "watch"
+    wd.mkdir()
+    p = wd / "landed.bin"
+    p.write_bytes(b"s" * (2 * 1024 * 1024))
+    old = time.time() - 7200
+    os.utime(p, (old, old))
+    events = []
+    streamer = Streamer(
+        str(wd), _StreamBackend(), repo="o/r", tag="t1",
+        settle_secs=300, apply=True,
+        journal=lambda *a: events.append(a),
+        claim_check=lambda path: (True, "claimed by download-lane"),
+    )
+    t0 = time.time()
+    streamer.stream_once(now=t0)  # first sighting: settling
+    report = streamer.stream_once(now=t0 + 301)  # settled: streams
+    assert p.exists()  # streamed + verified, but the claim blocks the clear
+    assert report.files_cleared == 0
+    assert report.files_blocked >= 1
+    kinds = [e[0] for e in events]
+    assert "delete_blocked" in kinds
+    notes = [e[4] for e in events if e[0] == "delete_blocked"]
+    assert "claims" in notes[0]
