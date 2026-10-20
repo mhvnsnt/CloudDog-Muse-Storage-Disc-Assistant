@@ -18,7 +18,6 @@ from clouddog import scorecard, trust
 from clouddog.audit import AuditEvent, AuditJournal
 from clouddog.delete_gate import GateBlock, GateVerdict
 
-
 # ------------------------------------------------------------------ trust
 
 
@@ -143,8 +142,12 @@ def test_record_grade_journals_and_revokes_on_near_miss(tmp_path):
     assert trust.current_state(tp) == trust.APPLY
 
     rec = scorecard.record_grade(
-        journal, scorecard.NEAR_MISS, path="/w/file.bin", source="reaper",
-        note="delete gate BLOCKED: [claims] active claim", trust_path=tp,
+        journal,
+        scorecard.NEAR_MISS,
+        path="/w/file.bin",
+        source="reaper",
+        note="delete gate BLOCKED: [claims] active claim",
+        trust_path=tp,
     )
     assert rec["grade"] == scorecard.NEAR_MISS
     # revoked on the spot, persisted
@@ -163,8 +166,12 @@ def test_record_grade_correct_does_not_revoke(tmp_path):
     trust.record_clean_cycle(tp)
     assert trust.current_state(tp) == trust.APPLY
     scorecard.record_grade(
-        journal, scorecard.CORRECT, path="/w/f.bin", source="daemon",
-        note="cleared through delete gate", trust_path=tp,
+        journal,
+        scorecard.CORRECT,
+        path="/w/f.bin",
+        source="daemon",
+        note="cleared through delete gate",
+        trust_path=tp,
     )
     assert trust.current_state(tp) == trust.APPLY
 
@@ -173,13 +180,20 @@ def test_grade_gate_verdict_wires_classification_and_revoke(tmp_path):
     journal = AuditJournal(str(tmp_path / "audit.jsonl"))
     tp = _tp(tmp_path)
     grade = scorecard.grade_gate_verdict(
-        journal, _verdict("verify"), path="/w/f.bin", source="daemon", trust_path=tp,
+        journal,
+        _verdict("verify"),
+        path="/w/f.bin",
+        source="daemon",
+        trust_path=tp,
     )
     assert grade == scorecard.NEAR_MISS
     assert trust.current_state(tp) == trust.REVOKED
     grade = scorecard.grade_gate_verdict(
-        journal, _verdict("registry", "verify"), path="/w/g.bin",
-        source="daemon", trust_path=tp,
+        journal,
+        _verdict("registry", "verify"),
+        path="/w/g.bin",
+        source="daemon",
+        trust_path=tp,
     )
     assert grade == scorecard.BLOCKED
 
@@ -231,7 +245,8 @@ def test_detector_skips_fresh_claimed_stored_and_marked(tmp_path):
 def test_detector_store_lookup_also_covers(tmp_path):
     stored = _old_file(tmp_path, "intermediate/kept.bin")
     findings = scorecard.detect_unmirrored_old(
-        [str(tmp_path)], store_lookup=lambda p: object() if p == stored else None,
+        [str(tmp_path)],
+        store_lookup=lambda p: object() if p == stored else None,
     )
     assert findings == []
 
@@ -248,13 +263,30 @@ def test_detector_age_is_configurable(tmp_path):
 
 def _events():
     return [
-        {"kind": "scorecard", "grade": "CORRECT", "path": "/a", "note": "cleared through delete gate"},
+        {
+            "kind": "scorecard",
+            "grade": "CORRECT",
+            "path": "/a",
+            "note": "cleared through delete gate",
+        },
         {"kind": "scorecard", "grade": "CORRECT", "path": "/b", "note": "stored and kept local"},
         {"kind": "scorecard", "grade": "BLOCKED", "path": "/c", "note": "gate blocked"},
-        {"kind": "scorecard", "grade": "NEAR_MISS", "path": "/d", "note": "one leg",
-         "regression_test": None, "fix_ref": None},
-        {"kind": "scorecard", "grade": "VIOLATION", "path": "/e", "note": "bad delete",
-         "regression_test": "tests/v1/test_delete_gate.py::test_x", "fix_ref": "PR #45"},
+        {
+            "kind": "scorecard",
+            "grade": "NEAR_MISS",
+            "path": "/d",
+            "note": "one leg",
+            "regression_test": None,
+            "fix_ref": None,
+        },
+        {
+            "kind": "scorecard",
+            "grade": "VIOLATION",
+            "path": "/e",
+            "note": "bad delete",
+            "regression_test": "tests/v1/test_delete_gate.py::test_x",
+            "fix_ref": "PR #45",
+        },
         {"kind": "scorecard", "grade": "UNMIRRORED_OLD", "path": "/f", "note": "unmirrored"},
         {"kind": "cleared", "path": "/a", "size": 2048},
         {"kind": "reaped", "path": "/g", "size": 1024},
@@ -282,10 +314,17 @@ def test_format_scorecard_orders_correctness_before_bytes():
     lines = text.splitlines()
     # unmirrored-old is a system failure state: surfaced at the TOP
     assert "UNMIRRORED" in lines[0] and "FAILURE" in lines[0]
-    idx = {name: text.index(name) for name in (
-        "correct clears", "correct blocks", "near-misses", "violations",
-        "trust_state", "freed_bytes",
-    )}
+    idx = {
+        name: text.index(name)
+        for name in (
+            "correct clears",
+            "correct blocks",
+            "near-misses",
+            "violations",
+            "trust_state",
+            "freed_bytes",
+        )
+    }
     assert idx["correct clears"] < idx["correct blocks"] < idx["near-misses"]
     assert idx["violations"] < idx["trust_state"] < idx["freed_bytes"]
     assert text.rstrip().endswith("freed_bytes (footnote): 3072")
@@ -302,9 +341,15 @@ def test_scorecard_line_leads_with_correctness():
 def test_audit_event_scorecard_roundtrip(tmp_path):
     j = AuditJournal(str(tmp_path / "audit.jsonl"))
     ev = AuditEvent(
-        kind="scorecard", path="/x", size=5, note="n", grade="VIOLATION",
-        source="daemon", blocks=({"leg": "claims", "reason": "claimed"},),
-        regression_test=None, fix_ref="PR #45",
+        kind="scorecard",
+        path="/x",
+        size=5,
+        note="n",
+        grade="VIOLATION",
+        source="daemon",
+        blocks=({"leg": "claims", "reason": "claimed"},),
+        regression_test=None,
+        fix_ref="PR #45",
     )
     j.record(ev)
     got = j.read()[-1]
@@ -324,9 +369,14 @@ def test_audit_event_scorecard_roundtrip(tmp_path):
 def test_graded_records_carry_attribution(tmp_path):
     journal = AuditJournal(str(tmp_path / "audit.jsonl"))
     rec = scorecard.record_grade(
-        journal, scorecard.BLOCKED, path="/w/f.bin", source="daemon",
-        note="gate blocked", blocks=({"leg": "claims", "reason": "claimed"},),
-        actor="daemon", invocation_id="tick-123",
+        journal,
+        scorecard.BLOCKED,
+        path="/w/f.bin",
+        source="daemon",
+        note="gate blocked",
+        blocks=({"leg": "claims", "reason": "claimed"},),
+        actor="daemon",
+        invocation_id="tick-123",
     )
     assert rec["actor"] == "daemon"
     assert rec["invocation_id"] == "tick-123"
@@ -334,8 +384,9 @@ def test_graded_records_carry_attribution(tmp_path):
     got = journal.read()[-1]
     assert got["actor"] == "daemon" and got["invocation_id"] == "tick-123"
     # defaults: actor falls back to source; invocation id is generated
-    rec2 = scorecard.record_grade(journal, scorecard.CORRECT, path="/w/g",
-                                  source="reaper", note="cleared ok")
+    rec2 = scorecard.record_grade(
+        journal, scorecard.CORRECT, path="/w/g", source="reaper", note="cleared ok"
+    )
     assert rec2["actor"] == "reaper" and rec2["invocation_id"]
 
 
@@ -345,9 +396,15 @@ def test_error_grade_counts_and_does_not_revoke(tmp_path):
     trust.load_trust(tp, required_streak=1)
     trust.record_clean_cycle(tp)
     assert trust.current_state(tp) == trust.APPLY
-    scorecard.record_grade(journal, scorecard.ERROR, path="/w/f.bin",
-                           source="daemon", note="backend down; kept",
-                           actor="daemon", trust_path=tp)
+    scorecard.record_grade(
+        journal,
+        scorecard.ERROR,
+        path="/w/f.bin",
+        source="daemon",
+        note="backend down; kept",
+        actor="daemon",
+        trust_path=tp,
+    )
     assert trust.current_state(tp) == trust.APPLY  # ERROR is not a violation
     s = scorecard.summarize_events(journal.read(), trust_state="APPLY")
     assert s.errors == 1
@@ -364,12 +421,20 @@ def test_stale_verify_clear_grades_near_miss():
 
 def test_summary_by_actor_never_collapsed():
     events = [
-        {"kind": "scorecard", "grade": "CORRECT", "actor": "daemon",
-         "note": "cleared through gate"},
-        {"kind": "scorecard", "grade": "NEAR_MISS", "actor": "streamer",
-         "note": "stale verify", "regression_test": "t"},
-        {"kind": "scorecard", "grade": "BLOCKED", "actor": "guardian-root",
-         "note": "policy block"},
+        {
+            "kind": "scorecard",
+            "grade": "CORRECT",
+            "actor": "daemon",
+            "note": "cleared through gate",
+        },
+        {
+            "kind": "scorecard",
+            "grade": "NEAR_MISS",
+            "actor": "streamer",
+            "note": "stale verify",
+            "regression_test": "t",
+        },
+        {"kind": "scorecard", "grade": "BLOCKED", "actor": "guardian-root", "note": "policy block"},
     ]
     s = scorecard.summarize_events(events, trust_state="REVOKED")
     assert s.by_actor["daemon"]["CORRECT"] == 1
@@ -385,8 +450,15 @@ def test_freed_bytes_never_a_promotion_input(tmp_path):
     # freed nothing with clean grades is.
     from clouddog.daemon import TickReport
 
-    base = dict(started_utc="t", disk_before_pct=1.0, disk_after_pct=1.0,
-                stored=0, verified=0, cleared=0, skipped_sacred=0)
+    base = {
+        "started_utc": "t",
+        "disk_before_pct": 1.0,
+        "disk_after_pct": 1.0,
+        "stored": 0,
+        "verified": 0,
+        "cleared": 0,
+        "skipped_sacred": 0,
+    }
     dirty = TickReport(freed_bytes=10**12, near_misses=1, **base)
     assert dirty.clean_cycle is False
     clean = TickReport(freed_bytes=0, **base)
@@ -396,8 +468,14 @@ def test_freed_bytes_never_a_promotion_input(tmp_path):
 def test_summarize_journal_reads_file_and_trust(tmp_path):
     journal = AuditJournal(str(tmp_path / "audit.jsonl"))
     tp = _tp(tmp_path)
-    scorecard.record_grade(journal, scorecard.CORRECT, path="/a", source="daemon",
-                           note="cleared through delete gate", trust_path=tp)
+    scorecard.record_grade(
+        journal,
+        scorecard.CORRECT,
+        path="/a",
+        source="daemon",
+        note="cleared through delete gate",
+        trust_path=tp,
+    )
     s = scorecard.summarize_journal(str(tmp_path / "audit.jsonl"), trust_path=tp)
     assert s.correct_clears == 1
     assert s.trust_state == trust.REVOKED

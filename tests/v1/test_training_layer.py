@@ -38,8 +38,13 @@ class FakeBackend(StoreBackend):
         self.store_calls.append({"dry_run": dry_run})
         with open(local_path, "rb") as fh:
             digest = hashlib.sha256(fh.read()).hexdigest()
-        return StoredRef(backend="fake", locator=remote_ref,
-                         size=os.path.getsize(local_path), sha256=digest, extra={})
+        return StoredRef(
+            backend="fake",
+            locator=remote_ref,
+            size=os.path.getsize(local_path),
+            sha256=digest,
+            extra={},
+        )
 
     def verify(self, local_path, stored):
         return True
@@ -59,8 +64,9 @@ class FakeJournal:
         return [e.kind if hasattr(e, "kind") else e[1] for e in self.events]
 
     def grades(self):
-        return [getattr(e, "grade", "") for e in self.events
-                if getattr(e, "kind", "") == "scorecard"]
+        return [
+            getattr(e, "grade", "") for e in self.events if getattr(e, "kind", "") == "scorecard"
+        ]
 
 
 def _low_disk(monkeypatch):
@@ -76,8 +82,15 @@ def _seed_trust(tmp_path, state, required=20):
 
 
 def _entry_for(path):
-    return [{"path": path, "bytes": os.path.getsize(path),
-             "action": "store_and_clear", "tier": "github", "reason": "test"}]
+    return [
+        {
+            "path": path,
+            "bytes": os.path.getsize(path),
+            "action": "store_and_clear",
+            "tier": "github",
+            "reason": "test",
+        }
+    ]
 
 
 def _daemon(tmp_path, monkeypatch, entries, trust_path, **kw):
@@ -87,15 +100,21 @@ def _daemon(tmp_path, monkeypatch, entries, trust_path, **kw):
     from clouddog.policy import Action, Decision
 
     monkeypatch.setattr(
-        policy_mod, "evaluate",
+        policy_mod,
+        "evaluate",
         lambda p, scan_root=None: Decision(Action.STORE_AND_CLEAR, "github", "test"),
     )
     kw.setdefault("registry_path", str(tmp_path / "registry.json"))
     kw.setdefault("registry_db_path", str(tmp_path / "registry.db"))
     kw.setdefault("claims_db", str(tmp_path / "claims.db"))
-    d = Daemon(roots=[str(tmp_path)], backends={"github": FakeBackend()},
-               journal=FakeJournal(), disk_path=str(tmp_path),
-               trust_path=trust_path, **kw)
+    d = Daemon(
+        roots=[str(tmp_path)],
+        backends={"github": FakeBackend()},
+        journal=FakeJournal(),
+        disk_path=str(tmp_path),
+        trust_path=trust_path,
+        **kw,
+    )
     d.heartbeat_path = str(tmp_path / "heartbeat.json")
     return d
 
@@ -129,7 +148,7 @@ def test_daemon_promotes_through_ticks_and_then_may_apply(tmp_path, monkeypatch)
     r1 = d.tick()
     assert r1.trust_forced_dry_run is True
     assert trust.current_state(tp) == trust.PROBATION
-    r2 = d.tick()
+    d.tick()
     assert trust.current_state(tp) == trust.APPLY
     r3 = d.tick()
     assert r3.trust_forced_dry_run is False
@@ -148,10 +167,16 @@ def test_daemon_near_miss_revokes_earned_trust(tmp_path, monkeypatch):
     from clouddog import registry as reg
 
     data = target.read_bytes()
-    reg.register_entry(str(target), {
-        "store": "github", "locator": "mhvnsnt/clouddog-storage@clouddog-x/big.bin",
-        "sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
-    }, json_path=str(tmp_path / "registry.json"))
+    reg.register_entry(
+        str(target),
+        {
+            "store": "github",
+            "locator": "mhvnsnt/clouddog-storage@clouddog-x/big.bin",
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "size": len(data),
+        },
+        json_path=str(tmp_path / "registry.json"),
+    )
     import sqlite3
     from datetime import datetime, timezone
 
@@ -162,10 +187,13 @@ def test_daemon_near_miss_revokes_earned_trust(tmp_path, monkeypatch):
         " action TEXT NOT NULL, claim_id TEXT NOT NULL UNIQUE,"
         " epoch INTEGER NOT NULL, claimed_at TEXT NOT NULL,"
         " heartbeat_at TEXT NOT NULL, ttl_s INTEGER NOT NULL DEFAULT 600,"
-        " note TEXT NOT NULL DEFAULT '')")
+        " note TEXT NOT NULL DEFAULT '')"
+    )
     now = datetime.now(timezone.utc).isoformat()
-    conn.execute("INSERT INTO claims VALUES (?,?,?,?,?,?,?,?,?)",
-                 (str(target), "lane", "store", "c1", 1, now, now, 3600, ""))
+    conn.execute(
+        "INSERT INTO claims VALUES (?,?,?,?,?,?,?,?,?)",
+        (str(target), "lane", "store", "c1", 1, now, now, 3600, ""),
+    )
     conn.commit()
     conn.close()
 
@@ -208,8 +236,14 @@ def test_heartbeat_carries_correctness_fields_before_bytes(tmp_path, monkeypatch
     d = _daemon(tmp_path, monkeypatch, [], tp, dry_run=True)
     d.tick()
     payload = json.loads((tmp_path / "heartbeat.json").read_text())
-    for field in ("correct_clears", "correct_blocks", "near_misses",
-                  "violations", "unmirrored_old", "trust_state"):
+    for field in (
+        "correct_clears",
+        "correct_blocks",
+        "near_misses",
+        "violations",
+        "unmirrored_old",
+        "trust_state",
+    ):
         assert field in payload
     assert payload["trust_state"] == trust.APPLY
     keys = list(payload.keys())
@@ -222,8 +256,13 @@ def test_state_dir_isolation_default_paths(tmp_path, monkeypatch):
     # resolve inside it, never the real ~/.clouddog.
     state = os.environ["CLOUDEDOG_STATE_DIR"]
     assert trust.default_trust_path() == os.path.join(state, "trust.json")
-    d = Daemon(roots=[str(tmp_path)], backends={}, journal=FakeJournal(),
-               disk_path=str(tmp_path), dry_run=True)
+    d = Daemon(
+        roots=[str(tmp_path)],
+        backends={},
+        journal=FakeJournal(),
+        disk_path=str(tmp_path),
+        dry_run=True,
+    )
     assert d.heartbeat_path == os.path.join(state, "heartbeat.json")
     assert d.pidfile == os.path.join(state, "daemon.pid")
     assert not d.heartbeat_path.startswith(os.path.expanduser("~/.clouddog"))
@@ -239,13 +278,14 @@ def test_daemon_error_grade_for_failed_backend(tmp_path, monkeypatch):
     from clouddog.errors import StoreDegraded
 
     d.backends["github"].store = lambda *a, **k: (_ for _ in ()).throw(
-        StoreDegraded("fake", "down"))
+        StoreDegraded("fake", "down")
+    )
     report = d.tick()
     assert os.path.exists(target)
     assert report.error_actions >= 1
     assert report.violations == 0
     assert scorecard.ERROR in d.journal.grades()
-    ev = [e for e in d.journal.events if getattr(e, "grade", "") == "ERROR"][0]
+    ev = next(e for e in d.journal.events if getattr(e, "grade", "") == "ERROR")
     assert ev.actor == "daemon" and ev.invocation_id
 
 
@@ -253,8 +293,14 @@ def test_streamer_stale_verify_clear_grades_near_miss(tmp_path):
     # Grade the trace: chunk 0 was verified in a PREVIOUS run (resumed
     # checkpoint record), chunk 1 verifies fresh this run. The gate
     # passes and the file clears — but the grade is NEAR_MISS.
-    from clouddog.streamer import (ChunkRecord, FileRecord, Streamer,
-                                   load_manifest, save_manifest, sha256_file)
+    from clouddog.streamer import (
+        ChunkRecord,
+        FileRecord,
+        Streamer,
+        load_manifest,
+        save_manifest,
+        sha256_file,
+    )
 
     class Backend:
         name = "fake"
@@ -262,9 +308,13 @@ def test_streamer_stale_verify_clear_grades_near_miss(tmp_path):
         def store(self, local_path, remote_ref, dry_run=False):
             with open(local_path, "rb") as fh:
                 digest = hashlib.sha256(fh.read()).hexdigest()
-            return StoredRef(backend="fake",
-                             locator=f"{remote_ref}/{os.path.basename(local_path)}",
-                             size=os.path.getsize(local_path), sha256=digest, extra={})
+            return StoredRef(
+                backend="fake",
+                locator=f"{remote_ref}/{os.path.basename(local_path)}",
+                size=os.path.getsize(local_path),
+                sha256=digest,
+                extra={},
+            )
 
         def verify(self, local_path, stored):
             return True
@@ -280,18 +330,33 @@ def test_streamer_stale_verify_clear_grades_near_miss(tmp_path):
     manifest = load_manifest(str(wd), "o/r", "t", chunk)
     whole = sha256_file(str(p))
     rec = FileRecord(name="landed.bin", path=str(p), size=len(data), sha256=whole)
-    rec.chunks = [ChunkRecord(index=0, asset="landed.bin.chunk-0000",
-                              size=chunk, sha256="stale", locator="o/r@t/x",
-                              verified=True)]
+    rec.chunks = [
+        ChunkRecord(
+            index=0,
+            asset="landed.bin.chunk-0000",
+            size=chunk,
+            sha256="stale",
+            locator="o/r@t/x",
+            verified=True,
+        )
+    ]
     manifest.files["landed.bin"] = rec
     save_manifest(manifest)
 
     journal = AuditJournal(str(tmp_path / "audit.jsonl"))
     tp = str(tmp_path / "trust.json")
-    st = Streamer(str(wd), Backend(), repo="o/r", tag="t", chunk_bytes=chunk,
-                  settle_secs=0, apply=True,
-                  claim_check=lambda path: (False, ""),
-                  trust_path=tp, scorecard_journal=journal)
+    st = Streamer(
+        str(wd),
+        Backend(),
+        repo="o/r",
+        tag="t",
+        chunk_bytes=chunk,
+        settle_secs=0,
+        apply=True,
+        claim_check=lambda path: (False, ""),
+        trust_path=tp,
+        scorecard_journal=journal,
+    )
     t0 = time.time()
     st.stream_once(now=t0)
     report = st.stream_once(now=t0 + 1)
@@ -308,12 +373,18 @@ def test_streamer_stale_verify_clear_grades_near_miss(tmp_path):
 def test_cli_scorecard_orders_correctness_before_bytes(tmp_path, capsys):
     journal = AuditJournal(str(tmp_path / "audit.jsonl"))
     tp = str(tmp_path / "trust.json")
-    scorecard.record_grade(journal, scorecard.CORRECT, path="/a", source="daemon",
-                           note="cleared through delete gate", trust_path=tp)
-    scorecard.record_grade(journal, scorecard.BLOCKED, path="/b", source="daemon",
-                           note="gate blocked", trust_path=tp)
-    rc = cli.main(["--journal", str(tmp_path / "audit.jsonl"),
-                   "scorecard", "--trust", tp])
+    scorecard.record_grade(
+        journal,
+        scorecard.CORRECT,
+        path="/a",
+        source="daemon",
+        note="cleared through delete gate",
+        trust_path=tp,
+    )
+    scorecard.record_grade(
+        journal, scorecard.BLOCKED, path="/b", source="daemon", note="gate blocked", trust_path=tp
+    )
+    rc = cli.main(["--journal", str(tmp_path / "audit.jsonl"), "scorecard", "--trust", tp])
     assert rc == 0
     out = capsys.readouterr().out
     assert out.index("correct clears") < out.index("correct blocks")
@@ -327,25 +398,48 @@ def test_cli_scorecard_json_and_root_journal_merge(tmp_path, capsys):
     AuditJournal(str(journal_path))  # exists, empty
     root_journal = tmp_path / "root-audit.jsonl"
     root_events = [
-        {"ts": "2026-10-20T03:00:00+00:00", "action": "reap", "path": "/w/a.bin",
-         "store": "github", "size": 4096},
-        {"ts": "2026-10-20T03:01:00+00:00", "action": "reap_policy_block",
-         "path": "/w/b.bin", "store": "github", "detail": "SACRED"},
-        {"ts": "2026-10-20T03:02:00+00:00", "action": "reap_keep",
-         "path": "/w/c.bin", "store": "github", "detail": "verify failed"},
-        {"ts": "2026-10-20T03:03:00+00:00", "action": "daemon_cycle",
-         "disk_pct": 91.0},
+        {
+            "ts": "2026-10-20T03:00:00+00:00",
+            "action": "reap",
+            "path": "/w/a.bin",
+            "store": "github",
+            "size": 4096,
+        },
+        {
+            "ts": "2026-10-20T03:01:00+00:00",
+            "action": "reap_policy_block",
+            "path": "/w/b.bin",
+            "store": "github",
+            "detail": "SACRED",
+        },
+        {
+            "ts": "2026-10-20T03:02:00+00:00",
+            "action": "reap_keep",
+            "path": "/w/c.bin",
+            "store": "github",
+            "detail": "verify failed",
+        },
+        {"ts": "2026-10-20T03:03:00+00:00", "action": "daemon_cycle", "disk_pct": 91.0},
     ]
     root_journal.write_text("\n".join(json.dumps(e) for e in root_events) + "\n")
     tp = str(tmp_path / "trust.json")
-    rc = cli.main(["--journal", str(journal_path), "--json",
-                   "scorecard", "--trust", tp,
-                   "--root-journal", str(root_journal)])
+    rc = cli.main(
+        [
+            "--journal",
+            str(journal_path),
+            "--json",
+            "scorecard",
+            "--trust",
+            tp,
+            "--root-journal",
+            str(root_journal),
+        ]
+    )
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
-    assert out["correct_clears"] == 1       # the root reap, graded CORRECT
-    assert out["correct_blocks"] == 2      # policy block + verify-failed keep
-    assert out["freed_bytes"] == 4096      # footnote from the root reap
+    assert out["correct_clears"] == 1  # the root reap, graded CORRECT
+    assert out["correct_blocks"] == 2  # policy block + verify-failed keep
+    assert out["freed_bytes"] == 4096  # footnote from the root reap
     assert out["trust_state"] == trust.REVOKED
 
 
@@ -357,10 +451,10 @@ def test_root_adapter_grades_guardian_actions():
         {"action": "verify", "path": "/d", "ok": True},
         {"action": "reap_policy_unavailable"},
         {"action": "reap_summary", "count": 1, "bytes_freed": 10},  # not gradeable
-        {"action": "daemon_start", "pid": 1},                        # not gradeable
+        {"action": "daemon_start", "pid": 1},  # not gradeable
     ]
     s = scorecard.summarize_events([], trust_state="REVOKED", root_events=events)
-    assert s.correct == 3        # reap + policy-skip-kept + verify-ok
+    assert s.correct == 3  # reap + policy-skip-kept + verify-ok
     assert s.correct_clears == 1
     assert s.correct_blocks == 2  # verify-failed keep + policy-unavailable refusal
     assert s.freed_bytes == 10
@@ -385,12 +479,15 @@ def test_reaper_grades_clears_and_blocks(tmp_path):
     journal = AuditJournal(str(tmp_path / "audit.jsonl"))
     tp = str(tmp_path / "trust.json")
     r = Reaper(
-        str(src), manifest, str(tmp_path / "reaper.log"),
+        str(src),
+        manifest,
+        str(tmp_path / "reaper.log"),
         state_path=str(tmp_path / "state.json"),
         store_verify=lambda rel, full: True,
         claim_check=lambda p: (p.endswith("held.bin"), "claimed" if p.endswith("held.bin") else ""),
         policy_check=lambda p: "store_and_clear",
-        trust_path=tp, scorecard_journal=journal,
+        trust_path=tp,
+        scorecard_journal=journal,
     )
     report = r.reap_once(dry_run=False)
     assert report.reaped == 1
@@ -411,8 +508,13 @@ def test_streamer_grades_clear_and_near_miss(tmp_path):
         def store(self, local_path, remote_ref, dry_run=False):
             with open(local_path, "rb") as fh:
                 digest = hashlib.sha256(fh.read()).hexdigest()
-            return StoredRef(backend="fake", locator=f"{remote_ref}/{os.path.basename(local_path)}",
-                             size=os.path.getsize(local_path), sha256=digest, extra={})
+            return StoredRef(
+                backend="fake",
+                locator=f"{remote_ref}/{os.path.basename(local_path)}",
+                size=os.path.getsize(local_path),
+                sha256=digest,
+                extra={},
+            )
 
         def verify(self, local_path, stored):
             return True
@@ -427,9 +529,17 @@ def test_streamer_grades_clear_and_near_miss(tmp_path):
         p.write_bytes(b"s" * (1024 * 1024))
         old = time.time() - 7200
         os.utime(p, (old, old))
-        st = Streamer(str(wd), Backend(), repo="o/r", tag="t", settle_secs=0,
-                      apply=True, claim_check=lambda path: (claim, "claimed" if claim else ""),
-                      trust_path=tp, scorecard_journal=journal)
+        st = Streamer(
+            str(wd),
+            Backend(),
+            repo="o/r",
+            tag="t",
+            settle_secs=0,
+            apply=True,
+            claim_check=lambda path: (claim, "claimed" if claim else ""),
+            trust_path=tp,
+            scorecard_journal=journal,
+        )
         t0 = time.time()
         st.stream_once(now=t0)
         return st.stream_once(now=t0 + 1), p
