@@ -314,8 +314,13 @@ def test_registry_entries_list_shape():
     )
 
     data = [
-        {"path": "/a", "size": 1_469_014_801, "sha256": "git-tree",
-         "repo": "mhvnsnt/x", "cleared": "2026-10-19T20:xx:CDT"},
+        {
+            "path": "/a",
+            "size": 1_469_014_801,
+            "sha256": "git-tree",
+            "repo": "mhvnsnt/x",
+            "cleared": "2026-10-19T20:xx:CDT",
+        },
         {"path": "/b", "size": 42, "status": "reaped"},
         "not-a-dict",
     ]
