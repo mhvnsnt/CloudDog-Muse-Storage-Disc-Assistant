@@ -92,7 +92,11 @@ python3 cloud_dog.py daemon --interval 600 --apply   # real deletes
 
 ### State
 
-- Registry: `~/workspace/agent-ops/cloud-dog-registry.json`
+- Registry: `~/workspace/agent-ops/cloud-dog-registry.json` (default backend)
+  or `cloud-dog-registry.db` when sqlite is selected —
+  `--registry sqlite|json` or `$CLOUDEDOG_REGISTRY` (default: json until the
+  owner flips it). `registry-migrate` runs the one-shot JSON -> sqlite
+  import; the JSON file is kept as a backup and never deleted.
 - Action log: `~/workspace/agent-ops/disk-cleanup-log.md` (append-only)
 - Audit journal: `~/workspace/agent-ops/cloud-dog-audit.jsonl`
   (structured JSON, one event per line: register, verify, reap,

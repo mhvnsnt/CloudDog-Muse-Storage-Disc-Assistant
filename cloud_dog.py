@@ -23,6 +23,8 @@ Usage:
     cloud_dog.py reap [--apply] [--path DIR]
     cloud_dog.py enforce [--apply]        # full cycle: scan + reap verified
     cloud_dog.py registry [--json]        # show registry
+    cloud_dog.py registry-migrate         # one-shot JSON -> sqlite import
+    # Global: --registry sqlite|json (or $CLOUDEDOG_REGISTRY); default json.
     cloud_dog.py mirror --magnet URI --store github --repo O/R --release T
         [--part-mb 100]                   # torrent -> store, bounded disk
     cloud_dog.py daemon [--interval 600] [--apply]
@@ -42,6 +44,15 @@ replaces the JSON file — atomic transactions, concurrent-safe for the
 guardian cron + manual runs. Legacy cloud-dog-registry.json migrates
 once on first open; `registry_export_json()` dumps the legacy shape.
 
+v4 (2026-10-19): registry backends in cloud_dog_registry.py — columnar
+sqlite (entries keyed by absolute path, real columns for store/repo/
+release/asset/size/sha256/status/registered_at/reaped_at/verified_at +
+journal/audit table, WAL, busy timeout) or legacy JSON. Select with the
+--registry sqlite|json flag or $CLOUDEDOG_REGISTRY; default stays JSON
+until the owner flips it. `registry-migrate` runs the one-shot
+JSON -> sqlite import (JSON file kept as backup, never deleted); DBs
+from the v3 blob schema upgrade in place on open.
+
 Default mode is DRY-RUN. Nothing is deleted unless --apply is passed.
 """
 
@@ -50,7 +61,15 @@ import hashlib
 import json
 import os
 import shutil
-import sqlite3
+# Registry backends (json | sqlite): cloud_dog_registry.py, same directory.
+# Defensive sys.path fix so `import cloud_dog` from anywhere still works.
+try:
+    import cloud_dog_registry as _regmod
+except ImportError:  # pragma: no cover - belt and suspenders
+    _here = os.path.dirname(os.path.abspath(__file__))
+    if _here not in sys.path:
+        sys.path.insert(0, _here)
+    import cloud_dog_registry as _regmod
 import subprocess
 import sys
 import time
@@ -305,105 +324,51 @@ def active_transfer_pids():
 
 # ---------------------------------------------------------------- registry
 #
-# sqlite-backed registry (v3). The JSON file at REGISTRY_PATH is legacy:
-# on first DB open its entries are migrated once into sqlite, then sqlite
-# is the single source of truth. sqlite gives us atomic transactions and
-# concurrent-safe access (WAL mode) — the old load-modify-save JSON pattern
-# raced when the guardian cron and a manual run overlapped.
+# Registry backends live in cloud_dog_registry.py (v4): a columnar sqlite
+# backend (WAL, busy timeout, atomic transactions, journal/audit table)
+# and the legacy JSON backend, behind ONE dict-shaped interface so every
+# call site keeps working unchanged.
 #
-# load_registry() / save_registry() keep their exact v1/v2 API so every
-# call site works unchanged.
+# Selection (see cloud_dog_registry.select_backend):
+#   1. main()'s --registry sqlite|json flag (stored in _REGISTRY_BACKEND),
+#   2. $CLOUDEDOG_REGISTRY,
+#   3. "json" (default; the owner flips it to sqlite explicitly).
+#
+# The one-shot JSON -> sqlite importer (migrate_json_to_sqlite) preserves
+# every entry and NEVER deletes the JSON file — it stays as the backup.
+# DBs written by the v3 blob schema are upgraded in place on open, with
+# the old table kept as entries_legacy_v3.
+#
+# load_registry() / save_registry() keep their exact v1/v2/v3 API.
 
-_REGISTRY_SCHEMA = (
-    "CREATE TABLE IF NOT EXISTS entries ("
-    " local_path TEXT PRIMARY KEY,"
-    " data TEXT NOT NULL,"
-    " updated_at TEXT NOT NULL)"
-)
-_REGISTRY_META_SCHEMA = (
-    "CREATE TABLE IF NOT EXISTS meta ("
-    " k TEXT PRIMARY KEY, v TEXT NOT NULL)"
-)
+_REGISTRY_BACKEND = None  # set by main() from --registry
 
 
-def _db():
-    """Open the registry DB, creating schema and migrating legacy JSON once."""
-    os.makedirs(os.path.dirname(REGISTRY_DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(REGISTRY_DB_PATH, timeout=30)
-    try:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute(_REGISTRY_SCHEMA)
-        conn.execute(_REGISTRY_META_SCHEMA)
-        row = conn.execute(
-            "SELECT v FROM meta WHERE k='json_migrated'").fetchone()
-        if not row and os.path.exists(REGISTRY_PATH):
-            try:
-                with open(REGISTRY_PATH) as f:
-                    legacy = json.load(f)
-                entries = (legacy.get("entries", {})
-                           if isinstance(legacy, dict) else {})
-                stamp = now_stamp()
-                for p, e in entries.items():
-                    conn.execute(
-                        "INSERT OR REPLACE INTO entries"
-                        " (local_path, data, updated_at) VALUES (?, ?, ?)",
-                        (p, json.dumps(e), stamp))
-                conn.execute(
-                    "INSERT INTO meta (k, v) VALUES ('json_migrated', '1')")
-                conn.commit()
-            except (OSError, json.JSONDecodeError):
-                conn.rollback()
-        else:
-            conn.commit()
-    except Exception:
-        conn.close()
-        raise
-    return conn
+def _registry_backend():
+    return _regmod.select_backend(_REGISTRY_BACKEND)
+
+
+def set_registry_backend(backend):
+    """Override registry backend for this process (CLI --registry flag)."""
+    global _REGISTRY_BACKEND
+    _REGISTRY_BACKEND = backend
 
 
 def load_registry():
-    conn = _db()
-    try:
-        rows = conn.execute(
-            "SELECT local_path, data FROM entries").fetchall()
-        entries = {}
-        for p, d in rows:
-            try:
-                entries[p] = json.loads(d)
-            except (json.JSONDecodeError, TypeError):
-                continue
-        return {"version": 3, "entries": entries}
-    finally:
-        conn.close()
+    return _regmod.load_registry(
+        REGISTRY_PATH, REGISTRY_DB_PATH, backend=_registry_backend())
 
 
 def save_registry(reg):
-    conn = _db()
-    try:
-        stamp = now_stamp()
-        entries = reg.get("entries", {})
-        with conn:  # atomic transaction
-            conn.execute("DELETE FROM entries")
-            for p, e in entries.items():
-                conn.execute(
-                    "INSERT INTO entries (local_path, data, updated_at)"
-                    " VALUES (?, ?, ?)",
-                    (p, json.dumps(e), stamp))
-    finally:
-        conn.close()
+    return _regmod.save_registry(
+        reg, REGISTRY_PATH, REGISTRY_DB_PATH,
+        backend=_registry_backend())
 
 
 def registry_export_json(dest_path=None):
     """Dump the sqlite registry back to the legacy JSON shape (backup/audit)."""
-    reg = load_registry()
     dest = dest_path or (REGISTRY_PATH + ".export")
-    tmp = dest + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump({"version": 3, "entries": reg["entries"]},
-                  f, indent=2, sort_keys=True)
-        f.write("\n")
-    os.replace(tmp, dest)
-    return dest
+    return _regmod.export_json(REGISTRY_DB_PATH, dest)
 
 
 def log_action(text):
@@ -983,13 +948,35 @@ def cmd_enforce(args):
     return 0
 
 
+def cmd_registry_migrate(args):
+    """One-shot JSON -> sqlite import. The JSON file is kept as a backup."""
+    if _registry_backend() != "sqlite":
+        print("registry-migrate needs the sqlite backend: pass "
+              "--registry sqlite or set CLOUDEDOG_REGISTRY=sqlite",
+              file=sys.stderr)
+        return 2
+    try:
+        res = _regmod.migrate_json_to_sqlite(
+            REGISTRY_PATH, REGISTRY_DB_PATH, force=args.force)
+    except FileNotFoundError as e:
+        print(f"registry-migrate: {e}", file=sys.stderr)
+        return 1
+    print(f"Migrated {res['migrated']} entries to {res['db_path']}")
+    if res["skipped"]:
+        print(f"  skipped {len(res['skipped'])} non-absolute-path rows")
+    print(f"  JSON backup kept (never deleted): {res['json_path']}")
+    return 0
+
+
 def cmd_registry(args):
+    backend = _registry_backend()
     reg = load_registry()
     entries = reg.get("entries", {})
     if args.json:
         print(json.dumps(reg, indent=2))
         return 0
-    print(f"Registry: {len(entries)} entries ({REGISTRY_DB_PATH})")
+    where = REGISTRY_DB_PATH if backend == "sqlite" else REGISTRY_PATH
+    print(f"Registry [{backend}]: {len(entries)} entries ({where})")
     for path, e in sorted(entries.items()):
         print(f"  [{e.get('status', '?')}] {path}")
         print(f"      -> {e.get('store')}:{e.get('repo')}@{e.get('release')}"
@@ -2756,6 +2743,8 @@ def main(argv=None):
         description="Cloud Dog Storage Disc Assistant — real disk-hygiene engine.",
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
+    ap.add_argument("--registry", choices=("sqlite", "json"), default=None,
+                    help="registry backend (default: $CLOUDEDOG_REGISTRY or json)")
 
     p = sub.add_parser("scan", help="report disk usage and largest consumers")
     p.add_argument("--json", action="store_true")
@@ -2858,6 +2847,11 @@ def main(argv=None):
 
     p = sub.add_parser("registry", help="show the store registry")
     p.add_argument("--json", action="store_true")
+    p = sub.add_parser("registry-migrate",
+                       help="one-shot JSON -> sqlite registry import "
+                            "(JSON file kept as backup, never deleted)")
+    p.add_argument("--force", action="store_true",
+                   help="re-import even if a migration already ran")
 
     p = sub.add_parser("mirror",
                        help="torrent -> cloud store, bounded local footprint")
@@ -2913,6 +2907,7 @@ def main(argv=None):
                    help="pidfile path (default agent-ops/cloud-dog-daemon.pid)")
 
     args = ap.parse_args(argv)
+    set_registry_backend(args.registry)
     try:
         if args.cmd == "scan":
             cmd_scan(args.json)
@@ -2942,6 +2937,8 @@ def main(argv=None):
             return cmd_enforce(args)
         elif args.cmd == "registry":
             return cmd_registry(args)
+        elif args.cmd == "registry-migrate":
+            return cmd_registry_migrate(args)
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         return 130
