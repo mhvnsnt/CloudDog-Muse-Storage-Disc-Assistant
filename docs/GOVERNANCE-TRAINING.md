@@ -196,3 +196,230 @@ quality evals; for *safety* cases the only acceptable rate is total.
 and the `clouddog score` surface. No eval framework is pulled — Inspect
 and promptfoo are the *pattern* references (both MIT, both noted here if
 a future non-stdlib eval runner is ever wanted for offline analysis).
+
+## Angle C — Trust ladders / earned autonomy
+
+Question: how do production systems grant an autonomous actor *more*
+privilege over time, take it away automatically, and let it earn it back?
+
+The sources converge on one shape, stated most explicitly in recent SRE
+writing on AI agents:
+
+- **The ladder itself:** "a graduated set of AI guardrails where each rung
+  grants broader blast radius only after the agent demonstrates
+  reliability at the current level: Shadow mode (read-only, no writes) →
+  Supervised writes (human approval required) → Unsupervised writes
+  (scoped to low-risk paths) → Full autonomy (reserved for proven,
+  bounded tasks)" — with promotion implemented mechanically (in that
+  write-up, as Kubernetes RBAC rebinding per rung; demotion reverses it),
+  and "trust-ladder promotion should be the same typed decision, clamped
+  to the ladder, not a calendar milestone" (clouatre.ca, *SRE for AI
+  Agents: Error Budgets, Trust, and 90 Trials*).
+- **Same ladder, incident-response form:** read-only investigation →
+  recommended action → approval-gated execution → policy-bounded
+  execution, where the levels "should apply to individual actions, not
+  the product as a whole," and "low risk" is defined as "bounded,
+  reversible, pre-approved, observable, and backed by a tested rollback"
+  (Rootly, AI SRE human-in-the-loop model; Rootly architecture guide:
+  "Trust is earned in stages… reserve autonomy for narrow, reversible
+  failure modes that are well-instrumented and rollback-ready").
+- **Promotion is earned with data:** "Each promotion is earned with data,
+  not vendor confidence… the error budget becomes… an *autonomy
+  throttle*. When the budget is healthy, you can afford to let the agent
+  act inside its envelope; when it is nearly exhausted, you tighten the
+  envelope and pull humans back into the loop" (devtocash, AI Agents for
+  SRE). The Google SRE error-budget policy is the non-AI original of the
+  same mechanism: budget thresholds agreed *in advance* map to automatic
+  consequences — e.g. at 0% remaining, "freeze all feature deployments…
+  requires CTO approval to unfreeze" (sample policy reproducing the SRE
+  Workbook pattern); multi-window burn-rate alerting (14.4×/1h page,
+  6×/6h page, 1×/3d ticket) supplies the *rate* signal, not just the
+  total (Google SRE Workbook, as reproduced in backendbytes / isdown /
+  slc.alexewerlof).
+- **Governance framing:** the CSA's NIST AI RMF Agentic Profile proposes
+  exactly this as a formal extension — "formal autonomy tier
+  classification with corresponding oversight obligations (GOVERN
+  extension)… runtime behavioral metrics, autonomy calibration
+  assessment… structured incident response for agent compromise,
+  behavioral drift correction, and principled agent decommissioning
+  (MANAGE extension)" (Cloud Security Alliance, 2025) — over NIST AI RMF
+  1.0's Govern/Map/Measure/Manage functions. Framework itself: voluntary,
+  no license barrier to adapting its structure.
+
+**Adapted to CloudDog — the ladder maps onto modes that already exist:**
+
+| Rung | CloudDog mode | What it may do | Promotion requirement (proposed) |
+|---|---|---|---|
+| 0 — Shadow | `scan` / dry-run `reap` (already the default) | Observe, propose, journal intended actions; delete nothing | — (entry state; also the state every revocation lands on) |
+| 1 — Supervised | `--apply` only with a live claim/approval per batch | Store + clear, one batch at a time, owner/lane-surfaced | N consecutive shadow runs whose *proposed* clears all pass the gate when replayed (proposals graded `correct`) |
+| 2 — Scoped autonomy | Daemon `--apply` on allowlisted subtrees / size caps / non-game files only | Autonomous store+clear inside the scope envelope | A clean streak at rung 1 (zero `violation`, zero `near_miss` over the streak window) + scorecard reviewed |
+| 3 — Full autonomy | Daemon `--apply` incl. `STORE_AND_CLEAR_STRICT` game-file bar | Everything policy allows, still gate-checked per delete | Sustained rung-2 clean record; **strict-bar deletes always keep their extra legs regardless of rung** — the ladder widens *scope*, it never removes a leg |
+
+**Revocation (the half of the pattern people skip):**
+
+- Any `violation` grade → **immediate drop to rung 0** for that actor,
+  automatically, no human in the loop for the *demotion* (demotion is the
+  safe direction). This is the error-budget freeze, applied to an actor
+  instead of a release pipeline.
+- `near_miss` grades burn a **violation budget** (proposed: 3 near-misses
+  in a rolling 30-day window = demotion one rung + the near-miss class
+  becomes a regression test before re-promotion — Angle D). This mirrors
+  burn-rate thinking: single blips ticket, sustained burn pages/freezes.
+- **Re-earning is a clean streak, not a timeout.** Promotion back requires
+  the same evidence as the original promotion, counted from the demotion:
+  shadow proposals graded, then supervised batches, then scope. A clock
+  alone must never restore privilege (the clouatre.ca point: promotion is
+  a typed, evidence-gated decision, "not a calendar milestone").
+- Trust state is **per actor** (daemon / reaper / streamer / a named lane
+  invocation), stored in the registry next to the scorecard — one actor's
+  violation must not demote an unrelated actor, and one actor's clean
+  streak must not launder another's record.
+
+**Mechanism this shapes:** the trust ladder (rungs = existing CloudDog
+modes), automatic revocation on `violation`, near-miss budget, and
+clean-streak re-earning, all driven by the Angle B scorecard.
+
+## Angle D — RLHF-style feedback, adapted to a deterministic tool
+
+Question: CloudDog has no weights to update. What does "training" mean
+for it? The RLHF literature, read carefully, decomposes into four parts —
+and three of them translate directly:
+
+1. **A reward signal collected from human judgment.** In RLHF, humans
+   rank outputs; a reward model learns to predict the ranking; the policy
+   is optimized against it (InstructGPT, arXiv 2203.02155, as summarized
+   in srdas.github.io/NLPBook and the RLHF survey literature). CloudDog's
+   analogue: the **scorecard is the reward model** — except it needs no
+   learning, because its judgments are mechanical (gate legs, live verify
+   results, claim state). Human judgment enters where it should: the
+   owner/lane reviews the scorecard and adjudicates disputed grades
+   (was that block correct? was that clear actually safe?), and those
+   adjudications are data (see 3).
+2. **Reward shaping — and its known failure.** Adding intermediate
+   rewards for steps toward the goal speeds learning but risks changing
+   what is optimized. The canonical warning is the one this whole doc
+   started with: proxy ≠ objective (Goodhart / specification gaming,
+   Amodei et al. 2016). **Direct rule for CloudDog: never reward a proxy
+   again.** Bytes freed, files cleared, and GB reclaimed must be
+   *reported* (they're useful telemetry) but must never appear in any
+   grade, promotion criterion, dashboard headline, or guardian-cron
+   success condition. The only positively graded outcomes are
+   *verified-safe* ones: a clear whose pull-back was proven, a block that
+   correctly refused, a mirror that completed byte-identical. If a number
+   can go up by deleting something unstored, it is a shaping bug.
+3. **The feedback dataset = regression-test-per-incident.** In
+   deterministic-land, "training data" is a test corpus. The production
+   pattern from Angle B — extract every production failure into the eval
+   suite as a regression test (Langfuse→promptfoo workflow) — becomes a
+   standing rule: **no incident is closed until a test exists that fails
+   on the pre-fix code and passes on the fixed code**, named for the
+   incident. CloudDog already has the first two entries of this corpus by
+   history: (a) *delete with no registry entry must be blocked*
+   (tripo-wire, PR #45) and (b) *delete of a claimed / in-progress path
+   must be blocked* (claims, PR #43). The rule generalizes them from
+   fixes into a curriculum: every future `violation`/`near_miss` adds its
+   scenario (synthetic tree + registry/claims state + expected grade) to
+   the corpus, and CI runs the full corpus on every PR — the promptfoo
+   pass-rate gate, with a 100% bar for safety cases.
+4. **Punishment = privilege loss, not scolding.** RLHF's negative reward
+   becomes, deterministically, Angle C's revocation: a `violation`
+   doesn't produce a log line and a shrug, it *changes the actor's future
+   action space* (rung drop → shadow mode). That is the only "punishment"
+   a deterministic system can actually feel, and it is sufficient —
+   coupled with (3), the system both *can't* repeat the act at its old
+   privilege and *is tested* against repeating it forever.
+
+What does **not** translate, honestly: online learning, exploration,
+PPO, preference modeling. CloudDog should never learn online from its own
+deletions; its "policy updates" are code changes reviewed by humans
+through PRs, exactly as `delete_gate.py` was. Anyone proposing an ML
+layer here is solving a problem CloudDog does not have.
+
+**Mechanism this shapes:** scorecard-as-reward (with the no-proxy rule),
+the regression-test-per-incident corpus as the training set, and
+revocation (Angle C) as the negative reward.
+
+## Angle E — Guardrails / blast-radius patterns
+
+Question: what structural patterns keep one bad run from becoming a bad
+day? Six patterns, each with a production pedigree and a CloudDog form:
+
+1. **Choke-point enforcement.** All destructive paths route through one
+   gate that the actor cannot opt out of — the audit literature makes the
+   same point for logging: "a recorder inside the agent process depends
+   on the agent calling it… recording at a boundary outside the agent
+   process, one the agent cannot opt out of, is what makes an audit trail
+   hold up" (pipelab.org, *What a Hash Chain Can't Prove*). CloudDog:
+   **already landed** — `delete_gate.py` (PR #45) is exactly this, born
+   from the daemon's parallel delete authority bypassing it. Remaining
+   work: keep a CI-level invariant test that greps for unlink sites and
+   asserts each is gate-mediated (the choke point must be *defended*, not
+   just built).
+2. **Fail-closed + blast-radius caps.** Autoremediation governance in
+   SRE practice is "explicit allowlists, action tiers, preconditions,
+   success signals, stop conditions, rollback paths, and approval rules…
+   autonomy should never mean open-ended action" (Rootly AI SRE FAQ);
+   guardrail lists add "strict rate limits… circuit breakers and loop
+   detection… action tiers" and a "red-button" revocation control
+   (dev.to, SRE AI Agent Safe Failure). CloudDog forms: per-run delete
+   caps (count + bytes) as a circuit breaker in Nygard's sense — the
+   breaker "trips, and all further calls return with an error, without
+   the protected call being made at all," with a monitor alert on trip
+   (Fowler, *CircuitBreaker*, after Nygard, *Release It!*) — plus the
+   existing per-file gate. A run that hits its cap stops and journals;
+   it does not slow down and continue.
+3. **Two-key / two-person rule for the irreversible tier.** Separation of
+   duties in NIST SP 800-12: "dividing roles and responsibilities so that
+   a single individual cannot subvert a critical process" — one actor
+   initiates, another authorizes (csrc.nist.rip, SP 800-12 ch. 10);
+   two-person control generalizes it: a sensitive task "requires two
+   persons to action it" (geekmungus, summarizing the CISSP body of
+   knowledge). CloudDog already has this in law form for game files
+   (store + retrievability + **owner surfaced**, `STORE_AND_CLEAR_STRICT`).
+   Generalize the pattern one step: the *first* clear at a newly promoted
+   rung, and any clear above a size threshold, require two independent
+   signals — e.g. gate-pass **plus** a fresh claim-free re-check by a
+   second code path (reaper verifying the daemon's proposal), not the
+   same process re-reading its own cache.
+4. **Dry-run probation.** Every new actor, new scope, or re-earning actor
+   starts in shadow/dry-run (Angle C, rung 0–1). This is the SRE
+   "shadow mode catches what would have gone wrong" result: in the
+   clouatre.ca experiment, shadow comparison flagged the majority of an
+   incorrect proposed change set before it could act. CloudDog's dry-run
+   default already encodes the instinct; the ladder makes it a *stage
+   with exit criteria* instead of a flag.
+5. **Kill switch.** A single, tested, boring mechanism: a sentinel file
+   / config flag that every actor checks before any delete and that the
+   guardian cron can set; when set, all actors drop to rung 0 and journal
+   the stop. Requirements from the pattern's logic: it must be checkable
+   *at the choke point* (delete time, not startup), and setting it must
+   not require stopping a process that might be mid-delete (the
+   NEVER-KILL-IN-PROGRESS law cuts both ways — the switch stops *new*
+   deletes; an in-flight verified delete finishes).
+6. **Append-only audit journal with actor attribution + hash chain.**
+   Current `audit.py` is append-only and fsync'd — keep that — and add:
+   - **`actor` on every event** (daemon/reaper/streamer/CLI + invocation
+     id), plus `grade` and `gate legs` fields for delete-class events.
+     The agent-ops definition of a tamper-evident trail requires exactly
+     this content: "who (which agent identity), what (the action and its
+     parameters), when (a trusted timestamp), and under what authority
+     (the policy and approval that permitted it)" (cloudthinker.io).
+   - **Hash chaining**: each record stores the previous record's hash;
+     its own hash covers pointer + contents, with canonical JSON
+     serialization (`sort_keys`, fixed separators) so verification is
+     stable (dev.to, hash-chained audit log walkthrough; SOC 2 audit-log
+     write-up: `record[n].hash = H(payload[n] || record[n-1].hash)`,
+     "editing one record is… impossible to hide" *within the chain*).
+   - **Honest limit, stated in the sources and repeated here so nobody
+     over-claims it:** a bare hash chain "only proves the file agrees with
+     itself" — anyone holding the file can rewrite it and recompute the
+     tail (pipelab.org; medium, *Your audit log is a promise*). The fix
+     is an **external anchor**: periodically copy the chain head (hash +
+     length) somewhere the actor can't rewrite — for CloudDog, the
+     natural anchor is a commit to this repo / the existing agent-ops log
+     on the guardian's cadence. Chain + anchored head = tamper-*evident*;
+     chain alone = a consistency check. Build both or claim neither.
+
+**Mechanism this shapes:** journal attribution (`actor`/`grade`/legs),
+hash-chain + external head anchor, per-run circuit-breaker caps,
+two-signal rule for the irreversible tier, and a choke-point kill switch.
