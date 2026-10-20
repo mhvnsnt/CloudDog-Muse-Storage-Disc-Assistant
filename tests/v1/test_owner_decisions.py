@@ -25,9 +25,7 @@ from clouddog.stores.terabox import TeraBoxBackend
 
 MB = 1024 * 1024
 
-REPO_ROOT = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-)
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 # ------------------------------------------------------------------ #
@@ -81,7 +79,7 @@ def test_cloud_dog_part_bytes_mirrors_the_shared_constant():
                 if isinstance(t, ast.Name) and t.id == "PART_BYTES":
                     # Evaluate our own source literal (``100 * 1024 * 1024``)
                     # with no builtins available.
-                    value = eval(  # noqa: S307
+                    value = eval(
                         compile(ast.Expression(node.value), "<PART_BYTES>", "eval"),
                         {"__builtins__": {}},
                     )
