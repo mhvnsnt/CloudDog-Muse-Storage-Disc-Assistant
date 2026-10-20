@@ -1,21 +1,49 @@
 name: ci
 
+# CI minute diet (research-friction-20261019/03-ci-flakes.md, Plan B):
+# - PR-only triggers: a push to a PR branch used to run the full suite TWICE
+#   (push-to-branch + pull_request synchronize). Branch pushes no longer run
+#   CI; the PR covers them, and main-push runs once.
+# - Concurrency cancel kills superseded PR runs instead of billing them.
+# - Path filters skip the suite for docs-only changes.
+# - PRs run the main leg (3.12) only; the full matrix (3.11 + 3.12) runs on
+#   the nightly schedule.
+# - pip caching on setup-python; the lint job is merged into the test job
+#   (every job rounds up to a whole billed minute, tiny jobs included).
+
 on:
   push:
-    branches: ["**"]
+    branches: ["main"]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  schedule:
+    - cron: "0 3 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
+    name: test (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12"]
+        # Nightly runs the full matrix; PRs and main pushes run the main leg.
+        python-version: ${{ github.event_name == 'schedule' && fromJSON('["3.11", "3.12"]') || fromJSON('["3.12"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
       - name: Install
         run: |
           python -m pip install --upgrade pip
@@ -32,17 +60,12 @@ jobs:
         run: |
           pip uninstall -y clouddog
           python -m pytest tests/v1 -q
-
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: pip install ruff
       # Lint scope is the clouddog/ engine package and its tests only.
       # Root-level scripts (cloud_dog.py, spark-app helpers) belong to
       # sibling lanes and are covered by their own test files.
-      - run: ruff check clouddog tests
-      - run: ruff format --check clouddog tests
+      # Ruff is already installed via the dev extra (.[dev] above).
+      - name: Lint (ruff, main leg only)
+        if: matrix.python-version == '3.12'
+        run: |
+          python -m ruff check clouddog tests
+          python -m ruff format --check clouddog tests

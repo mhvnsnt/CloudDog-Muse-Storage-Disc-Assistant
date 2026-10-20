@@ -178,6 +178,17 @@ USAGE_CEILING = 75.0          # target: stay under this %
 HARD_CEILING = 88.0           # never reach this
 INFLIGHT_MTIME_SECS = 300     # files modified within this window = in-flight
 
+# THE single chunk-size standard for every CloudDog chunking path
+# (owner decision 2026-10-19: "100MB is THE single standard for store()
+# and mirror everywhere — keep behind config, revisit if evidence
+# changes"). 100 MiB. cloud_dog.py cannot import the src/ engine tree
+# directly (the sibling root-level `clouddog/` package shadows it), so
+# this constant MIRRORS src/clouddog/stores/base.py::CHUNK_BYTES and a
+# unit test asserts they stay equal. To change the standard, change it
+# in BOTH places (they must remain one value); the --part-mb flag below
+# defaults from this constant.
+PART_BYTES = 100 * 1024 * 1024
+
 # Directories/files that are ALWAYS sacred — never scanned for reaping,
 # never deleted, never descended into for candidate discovery.
 SACRED_PATHS = [
@@ -854,32 +865,29 @@ def cmd_register(args):
 def verify_github_asset(repo, release, asset, local_size=0, local_sha256=""):
     """Verify a local file against a GitHub release asset.
 
-    Returns (ok, detail). ok=True only if the asset exists on the release
-    AND size matches (when known) AND sha256 digest matches (when known).
+    Owner decision 2026-10-19: FULL RE-DOWNLOAD VERIFY, EVERY TIME. The
+    stored bytes are actually pulled back and sha256-checked via the
+    retrievability prover (src/clouddog/retrievability.py, PR #37). The
+    old basis — release-API name + size + server-reported digest — was
+    metadata, not proof, and is REMOVED as a verification basis.
+
+    Returns (ok, detail). ok=True only when the pull-back fetched every
+    byte and the sha256 matched. Anything else — missing checksum,
+    prover unavailable, transport failure, hash mismatch — FAILS CLOSED.
     """
-    rc, out, err = run(
-        ["gh", "api", f"repos/{repo}/releases/tags/{release}",
-         "--jq", ".assets[] | [.name, .size, .digest] | @tsv"],
-        timeout=90,
-    )
-    if rc != 0:
-        return False, f"gh api failed: {err.strip()[:200]}"
-    for line in out.splitlines():
-        parts = line.split("\t")
-        if len(parts) < 2 or parts[0] != asset:
-            continue
-        try:
-            size = int(parts[1])
-        except ValueError:
-            size = 0
-        digest = parts[2] if len(parts) > 2 else ""
-        if local_size and size != local_size:
-            return False, f"size mismatch: store={size} local={local_size}"
-        if local_sha256 and digest.startswith("sha256:"):
-            if digest.split(":", 1)[1].lower() != local_sha256.lower():
-                return False, "sha256 digest mismatch"
-        return True, f"asset {asset} verified (size={size})"
-    return False, f"asset {asset} not found on release {release}"
+    entry = {"store": "github", "repo": repo, "release": release,
+             "asset": asset, "size": local_size or 0,
+             "sha256": local_sha256 or ""}
+    result = _run_retrievability_proof(entry)
+    if result is None:
+        return False, ("retrievability prover unavailable: cannot perform "
+                       "full re-download verification; refusing to pass on "
+                       "metadata (fail closed)")
+    if result.proven:
+        return True, (f"asset {asset} verified by full re-download: "
+                      f"{result.bytes_fetched} bytes pulled back, "
+                      f"sha256 match")
+    return False, f"full re-download verification failed: {result.reason}"
 
 
 def cmd_verify(args):
@@ -898,9 +906,9 @@ def cmd_verify(args):
             entry.get("size", 0), entry.get("sha256", ""),
         )
     elif entry["store"] == "terabox":
-        # TeraBox API path is down (no creds); treat registry note as claim,
-        # NOT proof — never auto-verify TeraBox without a live check.
-        ok, detail = False, "terabox live-verify not available; manual check required"
+        # TeraBox has no byte-level re-download API wired: name+size is
+        # NOT proof (owner decision 2026-10-19). Fail closed.
+        ok, detail = verify_terabox_entry(entry, path)
     else:
         ok, detail = False, f"unknown store {entry['store']}"
     print(f"{'OK' if ok else 'FAIL'}: {path} — {detail}")
@@ -908,7 +916,20 @@ def cmd_verify(args):
 
 
 def reap_candidates(search_root=None):
-    """Yield registry entries whose local file exists and may be reaped."""
+    """Yield registry entries whose local file exists and may be reaped.
+
+    CLAIMS GATE (the Tekken 5 fix): a live work claim is a HARD BLOCK —
+    a lane that claimed the path (or any ancestor dir) owns it until the
+    lease lapses. If the claims store cannot be read at all, this yields
+    NOTHING (fail closed: if you can't read claims, you don't reap).
+    is_inflight() stays as a second net for lanes that never claimed.
+    """
+    readable, probe_reason = _regmod.claims_readable(
+        REGISTRY_DB_PATH, json_path=REGISTRY_PATH)
+    if not readable:
+        print(f"REAP DISABLED: {probe_reason}", file=sys.stderr)
+        log_action(f"cloud_dog reap blocked: {probe_reason}")
+        return
     reg = load_registry()
     for path, entry in reg["entries"].items():
         if search_root and not path.startswith(os.path.abspath(search_root)):
@@ -922,6 +943,12 @@ def reap_candidates(search_root=None):
             continue
         if has_veto_marker(path):
             continue
+        allowed, claim_reason = _regmod.claim_gate(
+            REGISTRY_DB_PATH, path, json_path=REGISTRY_PATH)
+        if not allowed:
+            print(f"CLAIM-BLOCK {path} — {claim_reason}")
+            log_action(f"cloud_dog reap claim-block: {path} — {claim_reason}")
+            continue
         inflight, reason = is_inflight(path)
         if inflight:
             continue
@@ -934,6 +961,20 @@ def cmd_reap(args):
     search_root = os.path.abspath(args.path) if getattr(args, "path", "") else None
     reaped, skipped, failed = [], [], []
     for path, entry in reap_candidates(search_root):
+        # DELETE GATE policy leg (2026-10-20 incident fix): cmd_reap
+        # historically skipped the V1 evaluate() front-decider that
+        # cmd_reap_v2 runs. A fresh verdict other than STORE_AND_CLEAR
+        # (SACRED / KEEP_LOCAL / STORE / STRICT) blocks the reap here
+        # too — registry membership + verify alone are not the whole
+        # invariant.
+        if _POLICY_AVAILABLE and _EVALUATE_AVAILABLE:
+            v1_action = _v1_evaluate(path).action.value
+            if v1_action != "store_and_clear":
+                skipped.append(path)
+                audit_log("reap_policy_skip", path=path,
+                          store=entry.get("store"),
+                          detail=f"cmd_reap: evaluate({v1_action}) blocks reap")
+                continue
         if entry["store"] == "github":
             ok, detail = verify_github_asset(
                 entry["repo"], entry["release"], entry["asset"],
@@ -1010,6 +1051,76 @@ def cmd_registry_migrate(args):
         print(f"  skipped {len(res['skipped'])} non-absolute-path rows")
     print(f"  JSON backup kept (never deleted): {res['json_path']}")
     return 0
+
+
+def _claims_db():
+    """The sqlite claims store: always REGISTRY_DB_PATH (single source of
+    truth, whatever the entries backend is)."""
+    return REGISTRY_DB_PATH, REGISTRY_PATH
+
+
+def cmd_claims(args):
+    """Work claims CLI (the Tekken 5 fix).
+
+    `check` is for non-CloudDog sweep lanes: exit 0 = do NOT delete
+    (claimed, or the claims store is unreadable and we fail closed),
+    exit 1 = free.
+    """
+    sub = getattr(args, "claims_cmd", None)
+    db_path, json_path = _claims_db()
+    if sub == "claim":
+        ok, claim = _regmod.claim_path(
+            db_path, args.path, args.owner, args.action,
+            note=args.note, ttl_s=args.ttl, json_path=json_path)
+        if ok:
+            print(f"CLAIMED {claim['path']} owner={claim['owner']}"
+                  f" action={claim['action']} epoch={claim['epoch']}"
+                  f" ttl_s={claim['ttl_s']} claim_id={claim['claim_id']}")
+            return 0
+        print(f"HELD {claim['path']} by {claim['owner']} ({claim['action']})"
+              f" since {claim['claimed_at']} heartbeat={claim['heartbeat_at']}"
+              f" ttl_s={claim['ttl_s']} — defer, do not force",
+              file=sys.stderr)
+        return 3
+    if sub == "check":
+        allowed, reason = _regmod.claim_gate(
+            db_path, args.path, json_path=json_path)
+        if allowed:
+            print(f"FREE {os.path.abspath(args.path)}")
+            return 1
+        print(f"BLOCKED {os.path.abspath(args.path)} — {reason}")
+        return 0
+    if sub == "heartbeat":
+        ok = _regmod.heartbeat_claim(
+            db_path, args.path, args.claim_id, json_path=json_path)
+        print(("HEARTBEAT-OK " if ok else "HEARTBEAT-REJECTED ")
+              + os.path.abspath(args.path))
+        return 0 if ok else 3
+    if sub == "release":
+        ok = _regmod.release_claim(
+            db_path, args.path, args.claim_id, json_path=json_path)
+        print(("RELEASED " if ok else "RELEASE-NOP ")
+              + os.path.abspath(args.path))
+        return 0 if ok else 3
+    if sub == "list":
+        for c in _regmod.list_claims(db_path, json_path=json_path):
+            state = "live" if c["live"] else "lapsed"
+            print(f"{c['path']} [{state}] owner={c['owner']}"
+                  f" action={c['action']} epoch={c['epoch']}"
+                  f" heartbeat={c['heartbeat_at']} ttl_s={c['ttl_s']}"
+                  f" claim_id={c['claim_id']} note={c['note']}")
+        return 0
+    if sub == "sweep":
+        n = _regmod.expire_claims(db_path, json_path=json_path)
+        print(f"expired {n} lapsed claim(s)")
+        return 0
+    if sub == "migrate":
+        ok, detail = _regmod.ensure_claims_schema(db_path, json_path=json_path)
+        print(f"claims schema: {detail} ({db_path})")
+        return 0 if ok else 3
+    print("usage: cloud_dog.py claims {claim|check|heartbeat|release|list|sweep|migrate}",
+          file=sys.stderr)
+    return 2
 
 
 def cmd_registry(args):
@@ -1128,27 +1239,21 @@ def terabox_list(remote_dir):
 
 
 def verify_terabox_entry(entry, local_path):
-    """Verify a registry entry against TeraBox (live ls + size match).
+    """Verify a registry entry against TeraBox — FAILS CLOSED.
 
-    Registry entry needs: remote_dir, asset (remote filename).
-    Never passes without a live listing - a registry claim alone is not proof.
+    Owner decision 2026-10-19: FULL RE-DOWNLOAD VERIFY, EVERY TIME. The
+    TeraBox API path wired here (tbupload.py) exposes name + byte size
+    only — no byte-level download to re-download and hash-check. The
+    name+size check this function used to pass on is REMOVED as a
+    verification basis: verification always fails closed with the exact
+    reason until a byte-level pull-back is wired for TeraBox.
     """
-    remote_dir = entry.get("remote_dir", "")
-    asset = entry.get("asset", "")
-    if not remote_dir or not asset:
-        return False, "terabox entry needs remote_dir + asset"
-    ok, res = terabox_list(remote_dir)
-    if not ok:
-        return False, res
-    for e in res:
-        if not e["isdir"] and e["name"] == asset:
-            want = entry.get("size", 0)
-            if want and e["size"] != want:
-                return False, (f"size mismatch: remote={e['size']} "
-                                f"local={want}")
-            return True, (f"terabox:{remote_dir}/{asset} verified "
-                          f"({e['size']} bytes)")
-    return False, f"{asset} not found in terabox:{remote_dir}"
+    return False, (
+        "terabox: no byte-level re-download API is wired (tbupload.py "
+        "exposes name+size only), so full re-download verification is "
+        "impossible; refusing to pass on name+size (fail closed, owner "
+        "decision 2026-10-19)"
+    )
 
 
 # ============================================================ restic backend
@@ -1241,39 +1346,20 @@ def b2_upload(local_path, bucket, remote_path):
 
 
 def b2_verify(entry, local_path=None):
-    """Verify a registry entry against Backblaze B2.
+    """Verify a registry entry against Backblaze B2 — FAILS CLOSED.
 
-    Entry needs: b2_bucket, b2_path. Passes only if the object exists
-    AND its size matches the registry. A registry claim alone is never proof.
+    Owner decision 2026-10-19: FULL RE-DOWNLOAD VERIFY, EVERY TIME. The
+    old basis (rclone lsjson existence + size) was metadata, not proof.
+    B2 bytes CAN be pulled back via rclone, but no byte-level re-download
+    + hash-check is wired for this backend yet, so verification fails
+    closed with the exact reason until it is.
     """
-    binary = _rclone_binary()
-    if not binary:
-        return False, "rclone binary not found (PATH or ~/workspace/tools/rclone)"
-    bucket = entry.get("b2_bucket", "")
-    remote_path = entry.get("b2_path", "")
-    if not bucket or not remote_path:
-        return False, "b2 entry needs b2_bucket + b2_path"
-    env = _b2_env()
-    if not env.get("RCLONE_CONFIG_B2_ACCOUNT"):
-        return False, "B2_ACCOUNT_ID / B2_ACCOUNT_KEY env vars not set"
-    expected_size = int(entry.get("size", 0) or 0)
-    remote = f"b2:{bucket}/{remote_path.lstrip('/')}"
-    rc, out, err = run([binary, "lsjson", remote], timeout=300, env=env)
-    if rc != 0:
-        return False, f"b2 object not found: {remote}"
-    try:
-        info = json.loads(out)
-    except ValueError:
-        return False, "rclone lsjson output was not JSON"
-    # lsjson on a single file returns a one-element list
-    objs = info if isinstance(info, list) else [info]
-    if not objs:
-        return False, f"b2 object not found: {remote}"
-    actual_size = int(objs[0].get("Size", -1))
-    if expected_size and actual_size != expected_size:
-        return False, (f"b2 size mismatch: expected {expected_size}, "
-                       f"got {actual_size}")
-    return True, f"b2:{bucket}/{remote_path} ({actual_size} bytes)"
+    return False, (
+        "b2: byte-level re-download verification is not wired for this "
+        "backend yet (lsjson name+size was metadata, not proof); "
+        "refusing to pass without a full re-download + sha256 check "
+        "(fail closed, owner decision 2026-10-19)"
+    )
 
 
 def restic_backup(local_path, repo, password=None):
@@ -1320,41 +1406,20 @@ def restic_backup(local_path, repo, password=None):
 
 
 def restic_verify(entry, local_path=None):
-    """Verify a registry entry against a restic repository.
+    """Verify a registry entry against a restic repository — FAILS CLOSED.
 
-    Registry entry needs: restic_repo, snapshot_id. Passes only if the
-    snapshot exists in the repo AND its recorded paths include the file.
-    A registry claim alone is never proof. Password via RESTIC_PASSWORD.
+    Owner decision 2026-10-19: FULL RE-DOWNLOAD VERIFY, EVERY TIME. The
+    old basis (snapshot exists + path listed) was metadata, not proof.
+    Restic bytes CAN be restored (`restic dump`), but no byte-level
+    re-download + hash-check is wired for this backend yet, so
+    verification fails closed with the exact reason until it is.
     """
-    binary = _restic_binary()
-    if not binary:
-        return False, "restic binary not found (PATH or ~/workspace/tools/restic)"
-    repo = entry.get("restic_repo", "")
-    snapshot_id = entry.get("snapshot_id", "")
-    if not repo or not snapshot_id:
-        return False, "restic entry needs restic_repo + snapshot_id"
-    path = local_path or entry.get("local_path", "")
-    env = _restic_env()
-    if not env.get("RESTIC_PASSWORD"):
-        return False, "RESTIC_PASSWORD env var not set (restic repo password)"
-    rc, out, err = run([binary, "-r", repo, "snapshots", "--json"],
-                       timeout=300, env=env)
-    if rc != 0:
-        tail = (err.strip().splitlines() or [f"exit {rc}"])[-1]
-        return False, f"restic snapshots failed: {tail[:200]}"
-    try:
-        snapshots = json.loads(out)
-    except ValueError:
-        return False, "restic snapshots output was not JSON"
-    for snap in snapshots:
-        if snap.get("id") == snapshot_id or snap.get("short_id") == snapshot_id:
-            paths = snap.get("paths") or []
-            if path and path not in paths:
-                return False, (f"snapshot {snapshot_id[:8]} exists but does "
-                               f"not contain {path}")
-            return True, (f"restic:{repo} snapshot {snapshot_id[:8]} verified "
-                          f"({len(paths)} path(s))")
-    return False, f"snapshot {snapshot_id[:8]} not found in restic:{repo}"
+    return False, (
+        "restic: byte-level re-download verification is not wired for this "
+        "backend yet (snapshot listing was metadata, not proof); "
+        "refusing to pass without a full re-download + sha256 check "
+        "(fail closed, owner decision 2026-10-19)"
+    )
 
 
 # ============================================================ v2: kaggle backend
@@ -1432,27 +1497,20 @@ def kaggle_dataset_list_files(owner_slug):
 
 
 def verify_kaggle_entry(entry, local_path):
-    """Verify a registry entry against a Kaggle dataset (live file list + size).
+    """Verify a registry entry against a Kaggle dataset — FAILS CLOSED.
 
-    Registry entry needs: dataset ("owner/slug"), asset (filename).
+    Owner decision 2026-10-19: FULL RE-DOWNLOAD VERIFY, EVERY TIME. The
+    old basis (dataset file list + size) was metadata, not proof. Kaggle
+    bytes CAN be pulled back (dataset download), but no byte-level
+    re-download + hash-check is wired for this backend yet, so
+    verification fails closed with the exact reason until it is.
     """
-    dataset = entry.get("dataset", "")
-    asset = entry.get("asset", "")
-    if not dataset or not asset:
-        return False, "kaggle entry needs dataset (owner/slug) + asset (filename)"
-    ok, payload = kaggle_dataset_list_files(dataset)
-    if not ok:
-        return False, payload
-    files = payload.get("datasetFiles", []) if isinstance(payload, dict) else []
-    for f in files:
-        name = f.get("name", "")
-        if name == asset or name.endswith("/" + asset):
-            want = entry.get("size", 0)
-            got = int(f.get("totalBytes") or 0)
-            if want and got and got != want:
-                return False, f"size mismatch: remote={got} local={want}"
-            return True, f"kaggle:{dataset} file {asset} verified ({got} bytes)"
-    return False, f"{asset} not found in kaggle dataset {dataset}"
+    return False, (
+        "kaggle: byte-level re-download verification is not wired for this "
+        "backend yet (dataset file list name+size was metadata, not "
+        "proof); refusing to pass without a full re-download + sha256 "
+        "check (fail closed, owner decision 2026-10-19)"
+    )
 
 
 def multipart_encode(fields, files):
@@ -2221,7 +2279,15 @@ def _mirror_file_parts(fi, nfiles, fname, fsize, parts_iter, store, dest,
                 {"owner": dest["owner"],
                  "slug": f"{dest['slug']}-{base}-{pidx:04d}"[:90],
                  "title": f"{dest['title']} {base} part {pidx:04d}"})
-            ok_v, detail_v = (ok, detail)
+            # Upload success is NOT verification (owner decision
+            # 2026-10-19): route through the store's verify, which for
+            # kaggle fails closed until byte-level re-download is wired.
+            ok_v, detail_v = (False, "upload failed: " + detail)
+            if ok:
+                ok_v, detail_v = verify_kaggle_entry(
+                    {"dataset": f"{dest['owner']}/"
+                                f"{dest['slug']}-{base}-{pidx:04d}"[:120],
+                     "asset": asset, "size": psize}, ppath)
             try:
                 os.unlink(zpath)
             except OSError:
@@ -2930,6 +2996,39 @@ def main(argv=None):
     p.add_argument("--force", action="store_true",
                    help="re-import even if a migration already ran")
 
+    p = sub.add_parser(
+        "claims",
+        help="work claims: lease/heartbeat ownership records that HARD-BLOCK "
+             "reaping (the Tekken 5 fix). Non-CloudDog sweep lanes: run "
+             "'claims check <path>' before deleting anything you did not create.")
+    pc = p.add_subparsers(dest="claims_cmd")
+    q = pc.add_parser("claim",
+                      help="claim a path for a lane (exit 3 if held by another owner)")
+    q.add_argument("path", help="file or directory to claim")
+    q.add_argument("--owner", required=True,
+                   help="lane/checkpoint id, e.g. t5-iso-dl")
+    q.add_argument("--action", required=True,
+                   help="download|upload|render|extract|reap|other")
+    q.add_argument("--ttl", type=int, default=600,
+                   help="lease seconds without a heartbeat (default 600)")
+    q.add_argument("--note", default="", help="human line, e.g. what is downloading")
+    q = pc.add_parser("check",
+                      help="is this path claimed? exit 0 = claimed/BLOCKED "
+                           "(or claims unreadable: fail closed), 1 = free")
+    q.add_argument("path", help="file or directory to check")
+    q = pc.add_parser("heartbeat",
+                      help="renew a claim's lease (needs the claim_id from claim)")
+    q.add_argument("path")
+    q.add_argument("--claim-id", required=True)
+    q = pc.add_parser("release",
+                      help="release a claim (needs the claim_id from claim)")
+    q.add_argument("path")
+    q.add_argument("--claim-id", required=True)
+    pc.add_parser("list", help="list claims (live and lapsed)")
+    pc.add_parser("sweep", help="expire lapsed claims (journaled)")
+    pc.add_parser("migrate", help="migration: ensure the claims table exists "
+                                  "in the registry DB (idempotent)")
+
     p = sub.add_parser("mirror",
                        help="torrent -> cloud store, bounded local footprint")
     src = p.add_mutually_exclusive_group(required=True)
@@ -2958,10 +3057,11 @@ def main(argv=None):
     p.add_argument("--title", default="", help="kaggle: dataset title")
     p.add_argument("--file", default="",
                    help="only mirror torrent files whose name contains this")
-    p.add_argument("--part-mb", type=int, default=100,
-                   help="rolling part size in MB (TorBox mode never holds "
-                        "more than one part; --direct holds the full "
-                        "download too)")
+    p.add_argument("--part-mb", type=int, default=PART_BYTES // (1024 * 1024),
+                   help="rolling part size in MB (default = the single "
+                        "100MB chunk standard, PART_BYTES; TorBox mode "
+                        "never holds more than one part; --direct holds "
+                        "the full download too)")
     p.add_argument("--poll-secs", type=int, default=60,
                    help="torbox completion poll interval")
 
@@ -3016,6 +3116,8 @@ def main(argv=None):
             return cmd_registry(args)
         elif args.cmd == "registry-migrate":
             return cmd_registry_migrate(args)
+        elif args.cmd == "claims":
+            return cmd_claims(args)
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         return 130

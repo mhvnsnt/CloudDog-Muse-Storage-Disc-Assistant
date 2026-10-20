@@ -1,9 +1,13 @@
 """GitHub Releases store backend.
 
 Uploads via the ``gh`` CLI only (no ``requests``, no API tokens in-process).
-GitHub release assets cap at 2 GB, so files larger than that are split with
-``split -b 2000000000`` into ``<base>.part-aa`` … pieces, each uploaded as its
-own asset and re-concatenated during verification.
+Files larger than the single chunk standard (``CHUNK_BYTES`` = 100 MiB,
+owner decision 2026-10-19) are split with ``split -b <CHUNK_BYTES>`` into
+``<base>.part-aa`` … pieces, each uploaded as its own asset and
+re-concatenated during verification. (GitHub's own asset ceiling is
+2 GB — see MAX_ASSET_BYTES — but chunking never goes near it: transfers
+through this fleet's proxy die well below that, which is why the
+standard is 100 MiB.)
 
 Verification is byte-exact: after upload the backend re-downloads every
 asset with ``gh release download`` and sha256-compares against the local
@@ -23,36 +27,57 @@ import re
 import subprocess
 import sys
 import tempfile
-import time
 
-from .base import Health, HealthStatus, StoreBackend, StoredRef
+from .base import CHUNK_BYTES, Health, HealthStatus, StoreBackend, StoredRef
 from ..errors import CloudDogError, StoreDegraded, VerificationFailed
+from ..net import proxy_endpoint, proxy_env
+from ..retry import TransientError, classify_error, with_backoff
 
-#: GitHub release asset size ceiling (2 GiB).
+#: GitHub release asset size ceiling (2 GB) — a platform limit, NOT a
+#: chunking choice. No single asset may exceed it; CHUNK_BYTES (100 MiB)
+#: keeps every part far below it.
 MAX_ASSET_BYTES = 2_000_000_000
-#: Size of each piece when a file must be split for the 2 GiB asset cap.
-SPLIT_BYTES = 2_000_000_000
+#: Size of each piece when a file is split for upload. THE single chunk
+#: standard (owner decision 2026-10-19) — an alias of
+#: ``clouddog.stores.base.CHUNK_BYTES``; change it there, never here.
+SPLIT_BYTES = CHUNK_BYTES
 
-_MAX_RETRIES = 3
-_RETRY_BACKOFF_S = 2.0
+# Sanity: the chunk standard must never exceed GitHub's asset ceiling.
+assert 0 < SPLIT_BYTES <= MAX_ASSET_BYTES, (
+    f"CHUNK_BYTES ({SPLIT_BYTES}) exceeds GitHub asset ceiling ({MAX_ASSET_BYTES})"
+)
+
 _MAX_ERR_LEN = 500
 
 _REF_RE = re.compile(r"^(?P<repo>[^/\s@]+/[^/\s@]+)@(?P<tag>[^/\s@]+)$")
 
 # Substrings in gh stderr that indicate a transient failure worth retrying.
+# Shared with retry.classify_error; a bare 401/404/422 is permanent
+# (fail fast) unless a transient marker rides along.
 _TRANSIENT_HINTS = (
     "rate limit",
     "secondary rate",
+    "temporarily unavailable",
     "temporarily",
     "timeout",
     "timed out",
+    "connection refused",
+    "econnrefused",
+    "connection reset",
     "connection",
     "network",
     "eof",
+    "429",
+    "500",
     "502",
     "503",
     "504",
     "socket",
+    "context deadline",
+    "stream error",
+    "cancel",
+    "empty reply",
+    "proxy",
 )
 
 
@@ -96,40 +121,51 @@ class GitHubReleaseBackend(StoreBackend):
     def _run_gh(self, args: list[str], timeout: int = 300) -> subprocess.CompletedProcess:
         """Run ``gh`` with retry on transient failures.
 
+        ``gh`` itself never retries (single-attempt client — see
+        research-friction 01), so this wrapper IS the retry layer:
+        retry.with_backoff, 8 attempts, 2s→120s exponential + jitter,
+        transient/permanent classification shared with the other
+        backends, and the sanitized proxy env (net.proxy_env — strips
+        the no_proxy IPv6 literals that break HTTP clients).
+
         Raises:
-            CloudDogError: on permanent failures (after retries) and on
-                transport problems (missing binary, timeouts).
+            CloudDogError: on permanent failures, on exhausted retries,
+                and on transport problems (missing binary, timeouts).
         """
-        last: subprocess.CompletedProcess | None = None
-        for attempt in range(_MAX_RETRIES):
+        env = proxy_env()
+        label = f"gh {' '.join(args[:2])}"
+
+        def _attempt() -> subprocess.CompletedProcess:
             try:
                 proc = subprocess.run(
                     ["gh", *args],
                     capture_output=True,
                     text=True,
                     timeout=timeout,
+                    env=env,
                 )
             except FileNotFoundError as exc:
                 raise CloudDogError("gh CLI not found on PATH") from exc
             except subprocess.TimeoutExpired as exc:
-                last = None
-                if attempt == _MAX_RETRIES - 1:
-                    raise CloudDogError(
-                        f"gh {' '.join(args[:2])} timed out after {timeout}s"
-                    ) from exc
-                time.sleep(_RETRY_BACKOFF_S * (attempt + 1))
-                continue
+                raise TransientError(f"{label} timed out after {timeout}s") from exc
             if proc.returncode == 0:
                 return proc
-            last = proc
-            err = (proc.stderr or "").lower()
-            transient = any(hint in err for hint in _TRANSIENT_HINTS)
-            if not transient or attempt == _MAX_RETRIES - 1:
-                raise CloudDogError(f"gh {' '.join(args[:2])} failed: {_truncate(proc.stderr)}")
-            time.sleep(_RETRY_BACKOFF_S * (attempt + 1))
-        # Unreachable, but keeps the type checker honest.
-        assert last is not None
-        raise CloudDogError(f"gh failed: {_truncate(last.stderr)}")
+            err = proc.stderr or ""
+            if classify_error(err, transient_hints=_TRANSIENT_HINTS):
+                raise TransientError(f"{label} failed: {_truncate(err)}")
+            raise CloudDogError(f"{label} failed: {_truncate(err)}")
+
+        def _log_retry(attempt: int, delay: float, exc: BaseException) -> None:
+            print(
+                f"[clouddog] {label}: attempt {attempt} failed transiently; "
+                f"retrying in {delay:.1f}s via proxy {proxy_endpoint(env)}: {exc}",
+                file=sys.stderr,
+            )
+
+        try:
+            return with_backoff(_attempt, before_sleep=_log_retry)
+        except TransientError as exc:
+            raise CloudDogError(str(exc)) from exc
 
     def _ensure_release(self, repo: str, tag: str) -> None:
         """Create the release if ``gh release view`` says it is missing."""
@@ -157,7 +193,7 @@ class GitHubReleaseBackend(StoreBackend):
             raise CloudDogError(f"could not ensure release {repo}@{tag}: {exc}") from exc
 
     def _split(self, local_path: str, tmpdir: str) -> list[str]:
-        """Split into <=2 GiB pieces named ``<base>.part-aa`` …. Returns paths."""
+        """Split into <=SPLIT_BYTES (100 MiB) pieces named ``<base>.part-aa`` …."""
         base = os.path.basename(local_path)
         prefix = os.path.join(tmpdir, base + ".part-")
         proc = subprocess.run(
@@ -291,6 +327,7 @@ class GitHubReleaseBackend(StoreBackend):
                 capture_output=True,
                 text=True,
                 timeout=60,
+                env=proxy_env(),
             )
         except FileNotFoundError:
             return HealthStatus(Health.DOWN, "gh CLI not found on PATH")
@@ -323,7 +360,11 @@ class GitHubReleaseBackend(StoreBackend):
 
         self._ensure_release(repo, tag)
 
-        if size > MAX_ASSET_BYTES:
+        # Owner decision 2026-10-19: 100 MiB (CHUNK_BYTES) is THE single
+        # chunk standard for store() and mirror everywhere. Anything over
+        # it splits into 100 MiB parts — also the fix for >~485 MB uploads
+        # dying on this fleet's proxy.
+        if size > CHUNK_BYTES:
             with _scratch_tmpdir("clouddog-gh-split-") as tmpdir:
                 parts = self._split(local_path, tmpdir)
                 asset_names = [os.path.basename(p) for p in parts]

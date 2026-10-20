@@ -13,6 +13,13 @@ SAFETY (non-negotiable):
   and "../" or absolute-path manifest entries).
 - Mismatches are logged, never deleted.
 - A failed spot_check HALTS the reaper (state saved first).
+- DELETE GATE (2026-10-20 tripo-wire incident fix): the unlink passes
+  clouddog.delete_gate with all four legs evaluated at delete time —
+  manifest entry binding (the reaper's registry record), the live
+  store_verify from THIS run, a fresh claims check (wired by default;
+  an unreadable claims store fails closed), and a fresh policy
+  evaluate() (SACRED always blocks; game files block — the reaper
+  cannot attest the strict bar; tooling KEEP_LOCAL blocks).
 """
 from __future__ import annotations
 
@@ -56,6 +63,35 @@ def compute_hash(path: str, algo: str = "git-sha1") -> str:
     return h.hexdigest()
 
 
+def _default_policy_action(path: str) -> str:
+    """Map a fresh policy.evaluate() verdict to the reaper's gate action.
+
+    The reaper's deletable set is {store, store_and_clear}: the lane
+    manifest + live store verify are its authorization to clear, so the
+    hot/small KEEP_LOCAL *scan heuristic* maps to "store" (superseded,
+    not a safety verdict). The safety verdicts pass through untouched
+    and therefore block at the gate: SACRED (in-flight / marked /
+    freshly modified), STORE_AND_CLEAR_STRICT (game files — the reaper
+    cannot attest retrievability + owner surfacing), and KEEP_LOCAL for
+    tooling paths (tools/ or .git/). evaluate() failing maps to ""
+    (no verdict), which the gate treats as a block — fail closed.
+    """
+    try:
+        from clouddog import policy
+
+        dec = policy.evaluate(path)
+    except Exception:  # noqa: BLE001 - no verdict = block at the gate
+        return ""
+    if dec.action == policy.Action.KEEP_LOCAL:
+        from pathlib import Path
+
+        parts = {p.lower() for p in Path(path).parts}
+        if parts & policy.TOOL_COMPONENTS:
+            return "keep_local"
+        return "store"
+    return dec.action.value
+
+
 class Reaper:
     """Verified-delete engine.
 
@@ -83,7 +119,28 @@ class Reaper:
         store_verify: Callable[[str, str], bool] | None = None,
         protected_suffixes: tuple[str, ...] = (".py", ".log", ".json", ".sha256"),
         protected_names: tuple[str, ...] | None = None,
+        claim_check: Callable[[str], tuple[bool, str]] | None = None,
+        claims_db: str | None = None,
+        policy_check: Callable[[str], str] | None = None,
     ) -> None:
+        # claim_check (the Tekken 5 fix): callable consulted before any
+        # delete; takes the guarded absolute path, returns (blocked,
+        # reason). Blocked => never deleted; a checker that raises fails
+        # closed (skip). When not supplied, the production checker is
+        # wired by default (clouddog.claims.make_claim_checker over
+        # `claims_db` or the canonical claims store) — since the
+        # 2026-10-20 incident fix there is NO gate-less mode: a reaper
+        # that cannot consult claims must not delete.
+        if claim_check is None:
+            from clouddog.claims import make_claim_checker
+
+            claim_check = make_claim_checker(claims_db)
+        self._claim_check = claim_check
+        # policy_check: callable(path) -> gate action string for a FRESH
+        # policy verdict at delete time (see _default_policy_action).
+        # None = the default mapping. A checker that raises fails closed
+        # at the gate call site.
+        self._policy_check = policy_check or _default_policy_action
         if hash_algo not in ("git-sha1", "sha256"):
             raise ValueError(f"unknown hash_algo: {hash_algo!r}")
         src_real = os.path.realpath(src_dir)
@@ -224,6 +281,20 @@ class Reaper:
             )
             return "mismatch", spot_count
         size = os.path.getsize(guarded)
+        # Claims gate (the Tekken 5 fix): a live work claim on this path
+        # (or an ancestor dir) is a HARD BLOCK. Checked before the
+        # dry-run branch so a dry run never prints WOULD-REAP for a file
+        # a live run would refuse. A checker that raises fails CLOSED,
+        # same as the store_verify contract below.
+        if self._claim_check is not None:
+            try:
+                claimed, why = self._claim_check(guarded)
+            except Exception as e:  # noqa: BLE001
+                self.log("CLAIMS-UNREADABLE %s (%s) NOT deleted" % (rel, e))
+                return "skipped", spot_count
+            if claimed:
+                self.log("CLAIMED-SKIP %s (%s) NOT deleted" % (rel, why))
+                return "skipped", spot_count
         if dry_run:
             self.log("WOULD-REAP %s %s %d" % (rel, sha, size))
             return "skipped", spot_count
@@ -248,6 +319,32 @@ class Reaper:
             return "skipped", spot_count
         if st.st_size != size:
             self.log("CHANGED-SINCE-HASH %s (size moved) NOT deleted" % rel)
+            return "skipped", spot_count
+        # DELETE GATE (2026-10-20 incident fix): final choke point at
+        # the unlink, all four legs evaluated NOW — the manifest entry
+        # (registry leg, digest-bound by the hash check above), the
+        # live store_verify from THIS run (verify leg), a FRESH claims
+        # check (claims leg), and a fresh policy verdict (policy leg).
+        from clouddog.delete_gate import check_delete_gate
+
+        try:
+            gate_policy_action = self._policy_check(guarded)
+        except Exception:  # noqa: BLE001 - no verdict = block at the gate
+            gate_policy_action = ""
+        verdict = check_delete_gate(
+            guarded,
+            registry_entry={"digest": sha, "digest_algo": self._hash_algo,
+                            "size": size, "status": "registered"},
+            local_digest=local_sha,
+            local_digest_algo=self._hash_algo,
+            local_size=size,
+            live_verify_ok=True,
+            claim_check=self._claim_check,
+            policy_action=gate_policy_action,
+            deletable_actions=frozenset({"store", "store_and_clear"}),
+        )
+        if not verdict.allowed:
+            self.log("DELETE-BLOCKED %s (%s) NOT deleted" % (rel, verdict.summary))
             return "skipped", spot_count
         os.remove(guarded)
         reaped.add(rel)

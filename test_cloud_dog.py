@@ -259,19 +259,22 @@ def test_terabox_list_parses_ls_output():
 
 
 def test_verify_terabox_entry_size_mismatch():
+    # Owner decision 2026-10-19: name+size is REMOVED as a verification
+    # basis. Even a perfectly matching live listing must NOT pass —
+    # verification fails closed because no byte-level re-download exists.
     def fake_list(remote_dir):
         return True, [{"isdir": False, "size": 100, "name": "f.bin"}]
     old = _patch(cloud_dog, "terabox_list", fake_list)
     try:
         ok, detail = cloud_dog.verify_terabox_entry(
             {"remote_dir": "/d", "asset": "f.bin", "size": 999}, "/tmp/f.bin")
-        assert ok is False and "size mismatch" in detail
+        assert ok is False and "fail closed" in detail
         ok, detail = cloud_dog.verify_terabox_entry(
             {"remote_dir": "/d", "asset": "f.bin", "size": 100}, "/tmp/f.bin")
-        assert ok is True and "verified" in detail
+        assert ok is False and "fail closed" in detail
         ok, detail = cloud_dog.verify_terabox_entry(
             {"remote_dir": "/d", "asset": "missing.bin"}, "/tmp/f.bin")
-        assert ok is False and "not found" in detail
+        assert ok is False and "fail closed" in detail
     finally:
         _patch(cloud_dog, "terabox_list", old)
 
@@ -314,6 +317,10 @@ def test_kaggle_request_sends_basic_auth():
 
 
 def test_verify_kaggle_entry_found_and_sized():
+    # Owner decision 2026-10-19: the dataset file list (name+size) is
+    # metadata, not proof. Even a perfectly matching listing must NOT
+    # pass — verification fails closed until byte-level re-download is
+    # wired for kaggle.
     def fake_list(owner_slug):
         return True, {"datasetFiles": [
             {"name": "a.bin", "totalBytes": 500},
@@ -322,27 +329,28 @@ def test_verify_kaggle_entry_found_and_sized():
     try:
         e = {"dataset": "u/ds", "asset": "a.bin", "size": 500}
         ok, detail = cloud_dog.verify_kaggle_entry(e, "/tmp/a.bin")
-        assert ok is True and "verified" in detail
+        assert ok is False and "fail closed" in detail
         e2 = {"dataset": "u/ds", "asset": "a.bin", "size": 501}
-        ok, _ = cloud_dog.verify_kaggle_entry(e2, "/tmp/a.bin")
-        assert ok is False
+        ok, detail = cloud_dog.verify_kaggle_entry(e2, "/tmp/a.bin")
+        assert ok is False and "fail closed" in detail
         e3 = {"dataset": "u/ds", "asset": "nope.bin"}
         ok, detail = cloud_dog.verify_kaggle_entry(e3, "/tmp/a.bin")
-        assert ok is False and "not found" in detail
+        assert ok is False and "fail closed" in detail
     finally:
         _patch(cloud_dog, "kaggle_dataset_list_files", old)
 
 
 def test_verify_kaggle_entry_live_readonly():
-    """Live read-only check against a real dataset (no writes)."""
+    """Live-shape check: with the decision in force, even a real dataset
+    entry cannot pass without a byte-level re-download (fail closed)."""
     e = {"dataset": "marsfmmg/cj-living-room-setup",
          "asset": "dvd_stack_ref.png", "size": 4848}
     ok, detail = cloud_dog.verify_kaggle_entry(e, "/tmp/dvd_stack_ref.png")
-    assert ok is True and "verified" in detail, detail
+    assert ok is False and "fail closed" in detail, detail
     e2 = {"dataset": "marsfmmg/cj-living-room-setup",
           "asset": "does-not-exist.bin"}
     ok, detail = cloud_dog.verify_kaggle_entry(e2, "/tmp/x.bin")
-    assert ok is False and "not found" in detail
+    assert ok is False and "fail closed" in detail
 
 
 def test_kaggle_dataset_upload_new_no_cli():
@@ -1134,8 +1142,11 @@ def test_restic_backup_and_verify_roundtrip():
         assert len(snap) == 64, f"snapshot id should be 64 hex chars: {snap}"
         entry = {"restic_repo": repo, "snapshot_id": snap,
                  "local_path": f1}
+        # Backup + snapshot are real, but verify FAILS CLOSED since the
+        # owner decision (2026-10-19): a snapshot listing is metadata,
+        # not a byte-level re-download proof.
         ok, detail = cloud_dog.restic_verify(entry, f1)
-        assert ok, f"verify failed: {detail}"
+        assert not ok and "fail closed" in detail
     finally:
         _restic_restore_env(old_pw)
         shutil.rmtree(d, ignore_errors=True)
@@ -1157,7 +1168,7 @@ def test_restic_verify_missing_snapshot_fails():
                  "local_path": f1}
         ok, detail = cloud_dog.restic_verify(entry, f1)
         assert not ok
-        assert "not found" in detail
+        assert "fail closed" in detail
     finally:
         _restic_restore_env(old_pw)
         shutil.rmtree(d, ignore_errors=True)
@@ -1178,7 +1189,7 @@ def test_restic_verify_wrong_path_fails():
                  "local_path": f1}
         ok, detail = cloud_dog.restic_verify(entry, "/nope/other.txt")
         assert not ok
-        assert "does not contain" in detail
+        assert "fail closed" in detail
     finally:
         _restic_restore_env(old_pw)
         shutil.rmtree(d, ignore_errors=True)
@@ -1202,7 +1213,7 @@ def test_restic_verify_needs_password():
         ok, detail = cloud_dog.restic_verify(
             {"restic_repo": "/tmp/r", "snapshot_id": "a" * 64}, "/tmp/x")
         assert not ok
-        assert "RESTIC_PASSWORD" in detail
+        assert "fail closed" in detail
     finally:
         _restic_restore_env(old_pw)
 
@@ -1247,9 +1258,10 @@ def test_register_restic_records_snapshot():
         assert entry["store"] == "restic"
         assert entry["restic_repo"] == repo
         assert len(entry["snapshot_id"]) == 64
-        # and the recorded snapshot verifies live
+        # and the recorded snapshot fails closed on verify (metadata,
+        # not a byte-level proof, per owner decision 2026-10-19)
         ok, detail = cloud_dog.restic_verify(entry, os.path.abspath(f1))
-        assert ok, detail
+        assert not ok and "fail closed" in detail
     finally:
         cloud_dog.AUDIT_PATH = old_audit
         _restic_restore_env(old_pw)
@@ -1794,7 +1806,7 @@ def test_b2_verify_needs_credentials():
         entry = {"store": "b2", "b2_bucket": "b", "b2_path": "p", "size": 100}
         ok, err = cloud_dog.b2_verify(entry)
         assert not ok
-        assert "B2_ACCOUNT_ID" in err
+        assert "fail closed" in err
     finally:
         if old_id:
             os.environ["B2_ACCOUNT_ID"] = old_id
@@ -1810,7 +1822,7 @@ def test_b2_verify_needs_bucket_and_path():
         entry = {"store": "b2", "size": 100}  # no bucket/path
         ok, err = cloud_dog.b2_verify(entry)
         assert not ok
-        assert "b2_bucket" in err
+        assert "fail closed" in err
     finally:
         del os.environ["B2_ACCOUNT_ID"]
         del os.environ["B2_ACCOUNT_KEY"]
@@ -1830,3 +1842,285 @@ def test_verify_entry_dispatches_b2():
             os.environ["B2_ACCOUNT_ID"] = old_id
         if old_key:
             os.environ["B2_ACCOUNT_KEY"] = old_key
+
+
+# ------------------------------------------------ owner decisions 2026-10-19
+
+def test_part_bytes_is_the_100mb_standard():
+    assert cloud_dog.PART_BYTES == 100 * 1024 * 1024
+
+
+class _FakeVerifyProof:
+    def __init__(self, proven, reason="", bytes_fetched=0):
+        self.proven = proven
+        self.reason = reason
+        self.bytes_fetched = bytes_fetched
+
+
+def test_verify_github_asset_full_redownload_proven():
+    # verify_github_asset must go through the pull-back prover and pass
+    # ONLY when the re-downloaded bytes hash-match.
+    old = _patch(cloud_dog, "_run_retrievability_proof",
+                 lambda entry: _FakeVerifyProof(True, "ok", bytes_fetched=123))
+    try:
+        ok, detail = cloud_dog.verify_github_asset(
+            "o/r", "tag", "a.bin", 123, "ab" * 32)
+        assert ok is True and "full re-download" in detail
+    finally:
+        _patch(cloud_dog, "_run_retrievability_proof", old)
+
+
+def test_verify_github_asset_hash_mismatch_fails():
+    old = _patch(cloud_dog, "_run_retrievability_proof",
+                 lambda entry: _FakeVerifyProof(
+                     False, "sha256 mismatch after pull-back"))
+    try:
+        ok, detail = cloud_dog.verify_github_asset(
+            "o/r", "tag", "a.bin", 123, "ab" * 32)
+        assert ok is False and "sha256 mismatch" in detail
+    finally:
+        _patch(cloud_dog, "_run_retrievability_proof", old)
+
+
+def test_verify_github_asset_prover_unavailable_fails_closed():
+    old = _patch(cloud_dog, "_run_retrievability_proof", lambda entry: None)
+    try:
+        ok, detail = cloud_dog.verify_github_asset(
+            "o/r", "tag", "a.bin", 123, "ab" * 32)
+        assert ok is False and "fail closed" in detail
+    finally:
+        _patch(cloud_dog, "_run_retrievability_proof", old)
+
+
+def _claims_test_env(tmp):
+    """Point cloud_dog's registry/claims/log at a tmp dir; return restore fn."""
+    olds = {
+        "REGISTRY_PATH": _patch(cloud_dog, "REGISTRY_PATH",
+                                os.path.join(tmp, "reg.json")),
+        "REGISTRY_DB_PATH": _patch(cloud_dog, "REGISTRY_DB_PATH",
+                                   os.path.join(tmp, "reg.db")),
+        "LOG_PATH": _patch(cloud_dog, "LOG_PATH",
+                           os.path.join(tmp, "cleanup.log")),
+    }
+
+    def restore():
+        for name, old in olds.items():
+            _patch(cloud_dog, name, old)
+
+    return restore
+
+
+def test_reap_candidates_claim_gate_blocks_and_release_frees(tmp_path=None):
+    # The Tekken 5 fix at the engine level: an OLD file (past the 5-min
+    # in-flight mtime heuristic) with a verified registry entry is still
+    # NOT a reap candidate while a lane's claim is live.
+    import cloud_dog_registry as regmod
+    tmp = tempfile.mkdtemp()
+    restore = _claims_test_env(tmp)
+    try:
+        target = os.path.join(tmp, "tekken5.iso")
+        with open(target, "wb") as f:
+            f.write(b"x" * 1024)
+        old = os.path.getmtime(target) - 3600  # 1h old: heuristic says free
+        os.utime(target, (old, old))
+        cloud_dog.save_registry({"version": 4, "entries": {target: {
+            "store": "github", "repo": "o/r", "release": "t", "asset": "a",
+            "size": 1024, "sha256": "s", "status": "registered"}}})
+        # unclaimed: it IS a candidate (the old world — heuristic only)
+        assert [p for p, _ in cloud_dog.reap_candidates()] == [target]
+        # claimed: hard-blocked despite age + verified entry
+        ok, claim = regmod.claim_path(cloud_dog.REGISTRY_DB_PATH, target,
+                                      "t5-iso-dl", "download",
+                                      json_path=cloud_dog.REGISTRY_PATH)
+        assert ok
+        assert list(cloud_dog.reap_candidates()) == []
+        # released: candidate again
+        assert regmod.release_claim(cloud_dog.REGISTRY_DB_PATH, target,
+                                    claim["claim_id"],
+                                    json_path=cloud_dog.REGISTRY_PATH)
+        assert [p for p, _ in cloud_dog.reap_candidates()] == [target]
+    finally:
+        restore()
+
+
+def test_reap_candidates_fail_closed_on_unreadable_claims(tmp_path=None):
+    # Corrupt claims DB => reap_candidates yields NOTHING (fail closed).
+    tmp = tempfile.mkdtemp()
+    restore = _claims_test_env(tmp)
+    try:
+        target = os.path.join(tmp, "file.bin")
+        with open(target, "wb") as f:
+            f.write(b"x" * 64)
+        old = os.path.getmtime(target) - 3600
+        os.utime(target, (old, old))
+        cloud_dog.save_registry({"version": 4, "entries": {target: {
+            "store": "github", "repo": "o/r", "release": "t", "asset": "a",
+            "size": 64, "sha256": "s", "status": "registered"}}})
+        with open(cloud_dog.REGISTRY_DB_PATH, "wb") as f:
+            f.write(b"not a sqlite db" * 128)
+        assert list(cloud_dog.reap_candidates()) == []
+        assert os.path.exists(target)  # and the file is untouched
+    finally:
+        restore()
+
+
+def test_claims_cli_check_exit_codes(tmp_path=None):
+    # `claims check` contract for non-CloudDog sweep lanes:
+    # exit 0 = claimed/BLOCKED (do not delete), exit 1 = free.
+    import cloud_dog_registry as regmod
+    tmp = tempfile.mkdtemp()
+    restore = _claims_test_env(tmp)
+    try:
+        target = os.path.join(tmp, "work.bin")
+        with open(target, "wb") as f:
+            f.write(b"x")
+        args = type("A", (), {"claims_cmd": "check", "path": target})()
+        assert cloud_dog.cmd_claims(args) == 1  # free
+        ok, claim = regmod.claim_path(cloud_dog.REGISTRY_DB_PATH, target,
+                                      "lane", "download",
+                                      json_path=cloud_dog.REGISTRY_PATH)
+        assert ok
+        assert cloud_dog.cmd_claims(args) == 0  # claimed: do not delete
+    finally:
+        restore()
+
+
+# --------------------------------------- claims schema migration (2026-10-20)
+def _write_pre_claims_db(db_path):
+    """A registry DB in the pre-#43 shape: v4 entries/journal/meta, but
+    NO claims table (the live state that made every reap fail closed
+    with 'claims unreadable (no such table: claims)')."""
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "CREATE TABLE entries (local_path TEXT PRIMARY KEY,"
+            " store TEXT NOT NULL DEFAULT '', repo TEXT NOT NULL DEFAULT '',"
+            " release TEXT NOT NULL DEFAULT '', asset TEXT NOT NULL DEFAULT '',"
+            " size INTEGER NOT NULL DEFAULT 0, sha256 TEXT NOT NULL DEFAULT '',"
+            " status TEXT NOT NULL DEFAULT 'registered',"
+            " registered_at TEXT NOT NULL DEFAULT '',"
+            " reaped_at TEXT NOT NULL DEFAULT '',"
+            " verified_at TEXT NOT NULL DEFAULT '',"
+            " updated_at TEXT NOT NULL DEFAULT '',"
+            " extra TEXT NOT NULL DEFAULT '{}')")
+        conn.execute(
+            "CREATE TABLE journal (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL, action TEXT NOT NULL,"
+            " local_path TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '')")
+        conn.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _claims_tables(db_path):
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    try:
+        return {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        conn.close()
+
+
+def test_claims_readable_migrates_pre_claims_db(tmp_path=None):
+    """A pre-claims DB gains the claims table via the probe's migration
+    path (ensure_claims_schema) instead of failing closed forever."""
+    import cloud_dog_registry as regmod
+    tmp = tempfile.mkdtemp()
+    db = os.path.join(tmp, "reg.db")
+    _write_pre_claims_db(db)
+    assert "claims" not in _claims_tables(db)
+    readable, reason = regmod.claims_readable(db, json_path=None)
+    assert readable, reason
+    assert "claims" in _claims_tables(db)
+    ok, detail = regmod.ensure_claims_schema(db, json_path=None)
+    assert ok, detail
+    # And the migrated store actually gates: unclaimed = allowed,
+    # claimed = blocked.
+    allowed, _ = regmod.claim_gate(db, os.path.join(tmp, "f.bin"), json_path=None)
+    assert allowed
+    ok, claim = regmod.claim_path(db, os.path.join(tmp, "f.bin"), "lane",
+                                  "download", json_path=None)
+    assert ok
+    allowed, reason = regmod.claim_gate(db, os.path.join(tmp, "f.bin"),
+                                        json_path=None)
+    assert not allowed and "lane" in reason
+
+
+def test_claims_readable_heals_db_swapped_under_long_lived_process(tmp_path=None):
+    """The stale-init-cache case: a process initialized the current DB,
+    then the file is replaced by a pre-claims DB (restore/swap). The
+    probe must not trust its cached init — it migrates and reads."""
+    import cloud_dog_registry as regmod
+    tmp = tempfile.mkdtemp()
+    db = os.path.join(tmp, "reg.db")
+    ok, detail = regmod.ensure_claims_schema(db, json_path=None)
+    assert ok, detail  # first open: schema init cached for this path
+    # Swap the file for a pre-claims DB underneath the process.
+    for suffix in ("-wal", "-shm"):
+        side = db + suffix
+        if os.path.exists(side):
+            os.unlink(side)
+    os.unlink(db)
+    _write_pre_claims_db(db)
+    assert "claims" not in _claims_tables(db)
+    readable, reason = regmod.claims_readable(db, json_path=None)
+    assert readable, reason
+    assert "claims" in _claims_tables(db)
+
+
+def test_claims_migrate_cli(tmp_path=None):
+    tmp = tempfile.mkdtemp()
+    restore = _claims_test_env(tmp)
+    try:
+        _write_pre_claims_db(cloud_dog.REGISTRY_DB_PATH)
+        assert "claims" not in _claims_tables(cloud_dog.REGISTRY_DB_PATH)
+        args = type("A", (), {"claims_cmd": "migrate"})()
+        assert cloud_dog.cmd_claims(args) == 0
+        assert "claims" in _claims_tables(cloud_dog.REGISTRY_DB_PATH)
+    finally:
+        restore()
+
+
+def test_cmd_reap_policy_leg_blocks_keep_local(tmp_path=None):
+    """Delete-gate policy leg for cmd_reap (2026-10-20 incident fix):
+    a registered, live-verifiable file that evaluate() calls
+    KEEP_LOCAL must survive cmd_reap --apply; a cold STORE_AND_CLEAR
+    file with the same stubbed verify is reaped (positive control)."""
+    tmp = tempfile.mkdtemp()
+    restore = _claims_test_env(tmp)
+    old_audit = _patch(cloud_dog, "AUDIT_PATH", os.path.join(tmp, "audit.jsonl"))
+    old_verify = _patch(cloud_dog, "verify_github_asset",
+                        lambda *a, **k: (True, "stubbed ok"))
+    try:
+        # KEEP_LOCAL: small file, 10 min old (past the in-flight window,
+        # still inside evaluate()'s 1h hot window).
+        keep = os.path.join(tmp, "keep.bin")
+        with open(keep, "wb") as f:
+            f.write(b"k" * 100)
+        old = os.path.getmtime(keep) - 600
+        os.utime(keep, (old, old))
+        # STORE_AND_CLEAR control: 12MB sparse, 2h old.
+        cold = os.path.join(tmp, "cold.bin")
+        with open(cold, "wb") as f:
+            f.truncate(12 * 1024 * 1024)
+        old = os.path.getmtime(cold) - 7200
+        os.utime(cold, (old, old))
+        cloud_dog.save_registry({"version": 4, "entries": {
+            keep: {"store": "github", "repo": "o/r", "release": "t",
+                   "asset": "keep.bin", "size": 100, "sha256": "s",
+                   "status": "registered"},
+            cold: {"store": "github", "repo": "o/r", "release": "t",
+                   "asset": "cold.bin", "size": 12 * 1024 * 1024,
+                   "sha256": "s", "status": "registered"},
+        }})
+        args = type("A", (), {"apply": True, "path": ""})()
+        assert cloud_dog.cmd_reap(args) == 0
+        assert os.path.exists(keep), "KEEP_LOCAL file must survive cmd_reap"
+        assert not os.path.exists(cold), "STORE_AND_CLEAR control must reap"
+    finally:
+        _patch(cloud_dog, "verify_github_asset", old_verify)
+        _patch(cloud_dog, "AUDIT_PATH", old_audit)
+        restore()
