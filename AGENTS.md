@@ -75,6 +75,17 @@ cron (every 10 min).
   API), terabox (`tbupload.py ls` + size), kaggle (`/datasets/view` + size).
 
 ## New commands (2026-10-17, this lane)
+- `stream --watch-dir DIR [--tier github|drive] [--repo o/r] [--tag T] [--chunk-bytes 100M] [--settle-secs 300] [--loop] [--retrievability-proven] [--owner-surfaced]`
+  Watch-dir streaming (2026-10-20, docs/STREAM-MODE.md): settled files in
+  the watch dir are uploaded in ~100MB chunks, each chunk byte-verified
+  against the LIVE store, then the local copy clears (DELETE-AS-YOU-GO —
+  disk falls while a download lane is still working). Checkpoint
+  manifest `.clouddog-stream-manifest.json` in the watch dir is SACRED
+  and is the sole source for the published final manifest (Scooby
+  lesson). Game files clear only at the strict bar (verified +
+  pull-back proven + owner surfaced). TeraBox refused for live streams
+  (no remote checksum, H2). The daemon runs the same passes from
+  `~/.clouddog/stream-dirs.json` (re-read every tick, no restart).
 - `hash --file PATH [--json]`
   Hash one file with the fast-hash engine (`fast_hash_file`: blake3 pip
   module -> bundled b3sum -> stdlib sha256); prints which backend ran, the
