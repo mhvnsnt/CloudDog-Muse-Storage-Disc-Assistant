@@ -71,6 +71,7 @@ class TickReport:
     near_misses: int = 0
     violations: int = 0
     unmirrored_old: int = 0
+    error_actions: int = 0
     trust_state: str = ""
     trust_forced_dry_run: bool = False
 
@@ -301,6 +302,8 @@ class Daemon:
                 self.journal, grade, path=path, source=source, size=size,
                 locator=locator, note=note, blocks=blocks,
                 trust_path=self.trust_path,
+                actor="daemon",
+                invocation_id=getattr(self, "_invocation_id", ""),
             )
         except Exception:  # noqa: BLE001 - grading is feedback, not control
             pass
@@ -317,6 +320,8 @@ class Daemon:
             report.violations += count
         elif grade == _scorecard.UNMIRRORED_OLD:
             report.unmirrored_old += count
+        elif grade == _scorecard.ERROR:
+            report.error_actions += count
 
     def _grade_verdict(self, report: TickReport, verdict, path: str,
                        size: int, locator: str, source: str = "daemon") -> str:
@@ -345,6 +350,10 @@ class Daemon:
                       msg: str, size: int = 0, backend_error: bool = False) -> None:
         report.errors.append(msg)
         self._journal("error", path, size, "", msg)
+        # ERROR grade (training layer): an action was attempted and
+        # failed without deleting — backend down, store/verify failed,
+        # file kept. Not correct, not a violation.
+        self._record_grade(report, "ERROR", path, size=size, note=msg)
         if backend_error and size > _ONE_GB:
             flags["big_backend_error"] = True
 
@@ -816,6 +825,7 @@ class Daemon:
             report.correct_kept += getattr(rep, "correct_kept", 0)
             report.near_misses += getattr(rep, "near_misses", 0)
             report.violations += getattr(rep, "violations", 0)
+            report.error_actions += getattr(rep, "error_actions", 0)
             for e in rep.errors:
                 self._record_error(report, flags, str(ent.get("watch_dir")),
                                    f"stream: {e}")
@@ -837,6 +847,12 @@ class Daemon:
             skipped_sacred=0,
         )
         flags = {"verify_failed": False, "big_backend_error": False}
+
+        # Attribution: one invocation id per tick, stamped on every
+        # graded record this tick produces.
+        import uuid
+
+        self._invocation_id = uuid.uuid4().hex[:16]
 
         # TRUST GATE (earned autonomy, 2026-10-20): checked before
         # EVERY tick. Launched with --apply while trust != APPLY ->
@@ -987,6 +1003,7 @@ class Daemon:
                 "near_misses": report.near_misses,
                 "violations": report.violations,
                 "unmirrored_old": report.unmirrored_old,
+                "error_actions": report.error_actions,
                 "trust_state": report.trust_state,
                 "trust_forced_dry_run": report.trust_forced_dry_run,
                 "stored": report.stored,

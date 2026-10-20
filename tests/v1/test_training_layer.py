@@ -229,6 +229,79 @@ def test_state_dir_isolation_default_paths(tmp_path, monkeypatch):
     assert not d.heartbeat_path.startswith(os.path.expanduser("~/.clouddog"))
 
 
+def test_daemon_error_grade_for_failed_backend(tmp_path, monkeypatch):
+    _low_disk(monkeypatch)
+    target = tmp_path / "big.bin"
+    target.write_bytes(b"data" * 64)
+    tp = _seed_trust(tmp_path, trust.APPLY)
+    d = _daemon(tmp_path, monkeypatch, _entry_for(str(target)), tp, dry_run=False)
+    # Backend down: store attempt fails, file kept -> ERROR grade.
+    from clouddog.errors import StoreDegraded
+
+    d.backends["github"].store = lambda *a, **k: (_ for _ in ()).throw(
+        StoreDegraded("fake", "down"))
+    report = d.tick()
+    assert os.path.exists(target)
+    assert report.error_actions >= 1
+    assert report.violations == 0
+    assert scorecard.ERROR in d.journal.grades()
+    ev = [e for e in d.journal.events if getattr(e, "grade", "") == "ERROR"][0]
+    assert ev.actor == "daemon" and ev.invocation_id
+
+
+def test_streamer_stale_verify_clear_grades_near_miss(tmp_path):
+    # Grade the trace: chunk 0 was verified in a PREVIOUS run (resumed
+    # checkpoint record), chunk 1 verifies fresh this run. The gate
+    # passes and the file clears — but the grade is NEAR_MISS.
+    from clouddog.streamer import (ChunkRecord, FileRecord, Streamer,
+                                   load_manifest, save_manifest, sha256_file)
+
+    class Backend:
+        name = "fake"
+
+        def store(self, local_path, remote_ref, dry_run=False):
+            with open(local_path, "rb") as fh:
+                digest = hashlib.sha256(fh.read()).hexdigest()
+            return StoredRef(backend="fake",
+                             locator=f"{remote_ref}/{os.path.basename(local_path)}",
+                             size=os.path.getsize(local_path), sha256=digest, extra={})
+
+        def verify(self, local_path, stored):
+            return True
+
+    wd = tmp_path / "watch"
+    wd.mkdir()
+    p = wd / "landed.bin"
+    data = b"s" * (1024 * 1024)
+    p.write_bytes(data)
+    old = time.time() - 7200
+    os.utime(p, (old, old))
+    chunk = 512 * 1024
+    manifest = load_manifest(str(wd), "o/r", "t", chunk)
+    whole = sha256_file(str(p))
+    rec = FileRecord(name="landed.bin", path=str(p), size=len(data), sha256=whole)
+    rec.chunks = [ChunkRecord(index=0, asset="landed.bin.chunk-0000",
+                              size=chunk, sha256="stale", locator="o/r@t/x",
+                              verified=True)]
+    manifest.files["landed.bin"] = rec
+    save_manifest(manifest)
+
+    journal = AuditJournal(str(tmp_path / "audit.jsonl"))
+    tp = str(tmp_path / "trust.json")
+    st = Streamer(str(wd), Backend(), repo="o/r", tag="t", chunk_bytes=chunk,
+                  settle_secs=0, apply=True,
+                  claim_check=lambda path: (False, ""),
+                  trust_path=tp, scorecard_journal=journal)
+    t0 = time.time()
+    st.stream_once(now=t0)
+    report = st.stream_once(now=t0 + 1)
+    assert not p.exists()  # the clear executed (gate passed)
+    assert report.files_cleared == 1
+    assert report.near_misses == 1  # ...but graded on its stale trace
+    assert report.correct_clears == 0
+    assert trust.current_state(tp) == trust.REVOKED
+
+
 # ------------------------------------------------------------- scorecard CLI
 
 

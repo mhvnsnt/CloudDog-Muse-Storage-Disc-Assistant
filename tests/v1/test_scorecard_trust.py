@@ -318,6 +318,81 @@ def test_audit_event_scorecard_roundtrip(tmp_path):
     assert "grade" not in j.read()[-1]
 
 
+# ------------------------------------------- governance refinements (PR #47)
+
+
+def test_graded_records_carry_attribution(tmp_path):
+    journal = AuditJournal(str(tmp_path / "audit.jsonl"))
+    rec = scorecard.record_grade(
+        journal, scorecard.BLOCKED, path="/w/f.bin", source="daemon",
+        note="gate blocked", blocks=({"leg": "claims", "reason": "claimed"},),
+        actor="daemon", invocation_id="tick-123",
+    )
+    assert rec["actor"] == "daemon"
+    assert rec["invocation_id"] == "tick-123"
+    assert rec["blocks"][0]["leg"] == "claims"  # gate-leg results on the record
+    got = journal.read()[-1]
+    assert got["actor"] == "daemon" and got["invocation_id"] == "tick-123"
+    # defaults: actor falls back to source; invocation id is generated
+    rec2 = scorecard.record_grade(journal, scorecard.CORRECT, path="/w/g",
+                                  source="reaper", note="cleared ok")
+    assert rec2["actor"] == "reaper" and rec2["invocation_id"]
+
+
+def test_error_grade_counts_and_does_not_revoke(tmp_path):
+    journal = AuditJournal(str(tmp_path / "audit.jsonl"))
+    tp = _tp(tmp_path)
+    trust.load_trust(tp, required_streak=1)
+    trust.record_clean_cycle(tp)
+    assert trust.current_state(tp) == trust.APPLY
+    scorecard.record_grade(journal, scorecard.ERROR, path="/w/f.bin",
+                           source="daemon", note="backend down; kept",
+                           actor="daemon", trust_path=tp)
+    assert trust.current_state(tp) == trust.APPLY  # ERROR is not a violation
+    s = scorecard.summarize_events(journal.read(), trust_state="APPLY")
+    assert s.errors == 1
+    assert s.violations == 0 and s.near_misses == 0
+    assert s.by_actor["daemon"]["ERROR"] == 1
+
+
+def test_stale_verify_clear_grades_near_miss():
+    v = _verdict()  # allowed
+    assert scorecard.classify_delete_outcome(True, v, verify_fresh=True) == scorecard.CORRECT
+    assert scorecard.classify_delete_outcome(True, v, verify_fresh=False) == scorecard.NEAR_MISS
+    assert scorecard.classify_delete_outcome(True, v) == scorecard.CORRECT
+
+
+def test_summary_by_actor_never_collapsed():
+    events = [
+        {"kind": "scorecard", "grade": "CORRECT", "actor": "daemon",
+         "note": "cleared through gate"},
+        {"kind": "scorecard", "grade": "NEAR_MISS", "actor": "streamer",
+         "note": "stale verify", "regression_test": "t"},
+        {"kind": "scorecard", "grade": "BLOCKED", "actor": "guardian-root",
+         "note": "policy block"},
+    ]
+    s = scorecard.summarize_events(events, trust_state="REVOKED")
+    assert s.by_actor["daemon"]["CORRECT"] == 1
+    assert s.by_actor["streamer"]["NEAR_MISS"] == 1
+    assert s.by_actor["guardian-root"]["BLOCKED"] == 1
+    text = scorecard.format_scorecard(s)
+    assert "by actor:" in text and "streamer" in text
+
+
+def test_freed_bytes_never_a_promotion_input(tmp_path):
+    # No-proxy rule: a cycle is clean or not on GRADES ONLY. A tick
+    # that freed gigabytes with a near-miss is not clean; a tick that
+    # freed nothing with clean grades is.
+    from clouddog.daemon import TickReport
+
+    base = dict(started_utc="t", disk_before_pct=1.0, disk_after_pct=1.0,
+                stored=0, verified=0, cleared=0, skipped_sacred=0)
+    dirty = TickReport(freed_bytes=10**12, near_misses=1, **base)
+    assert dirty.clean_cycle is False
+    clean = TickReport(freed_bytes=0, **base)
+    assert clean.clean_cycle is True
+
+
 def test_summarize_journal_reads_file_and_trust(tmp_path):
     journal = AuditJournal(str(tmp_path / "audit.jsonl"))
     tp = _tp(tmp_path)

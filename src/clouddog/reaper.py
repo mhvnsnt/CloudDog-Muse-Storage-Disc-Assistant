@@ -47,6 +47,7 @@ class ReapReport:
     correct_kept: int = 0
     near_misses: int = 0
     violations: int = 0
+    error_actions: int = 0
 
     @property
     def clean_cycle(self) -> bool:
@@ -194,6 +195,7 @@ class Reaper:
             _scorecard.BLOCKED: "correct_blocks",
             _scorecard.NEAR_MISS: "near_misses",
             _scorecard.VIOLATION: "violations",
+            _scorecard.ERROR: "error_actions",
         }.get(grade)
         if key:
             self._grades[key] = self._grades.get(key, 0) + 1
@@ -202,6 +204,8 @@ class Reaper:
                 self._scorecard_journal, grade, path=path, source="reaper",
                 size=size, note=note, blocks=blocks,
                 trust_path=self.trust_path,
+                actor="reaper",
+                invocation_id=getattr(self, "_invocation_id", ""),
             )
         except Exception:  # noqa: BLE001 - grading never breaks a reap
             pass
@@ -354,6 +358,8 @@ class Reaper:
             live_ok = self._store_verify(rel, guarded)
         except Exception as e:  # noqa: BLE001
             self.log("STORE-VERIFY-ERROR %s (%s) NOT deleted" % (rel, e))
+            self._grade("ERROR", guarded, size,
+                        note=f"live store verify errored, file kept: {e}")
             return "skipped", spot_count
         if not live_ok:
             self.log("STORE-VERIFY-FAILED %s NOT deleted" % rel)
@@ -415,6 +421,9 @@ class Reaper:
         """Single pass over manifest entries not yet reaped. Never raises on halt."""
         report = ReapReport()
         self._grades = {}
+        import uuid
+
+        self._invocation_id = uuid.uuid4().hex[:16]
         reaped, spot_count = self._load_state()
         for rel, sha in self._manifest.items():
             if rel in reaped:
@@ -443,6 +452,7 @@ class Reaper:
         report.correct_blocks = self._grades.get("correct_blocks", 0)
         report.near_misses = self._grades.get("near_misses", 0)
         report.violations = self._grades.get("violations", 0)
+        report.error_actions = self._grades.get("error_actions", 0)
         return report
 
     def run_loop(self, interval_s: int = 60, dry_run: bool = False) -> None:

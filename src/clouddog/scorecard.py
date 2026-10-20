@@ -28,6 +28,18 @@ kind ``scorecard``):
                   record. The casualty work of 2026-10-20 sat local-only
                   because continuous-mirror never covered scratch. A
                   cycle containing these findings is not clean.
+  ERROR         — action attempted, failed without deleting (backend
+                  down, store/verify crashed; file kept). Neither
+                  correct nor a violation; reported per actor.
+
+Every graded record carries attribution (``actor``, ``invocation_id``,
+gate-leg ``blocks``) — an unattributed journal is how a disappearance
+stays anonymous. Grades are reported per actor, never collapsed to a
+single number. And the trace is graded, not just the outcome: a clear
+executed on a STALE verify (proof from an earlier run) grades
+NEAR_MISS, not CORRECT. ``freed_bytes`` is telemetry only — never a
+grade, never a promotion input, never a success condition (the
+original reward-hacking flaw, named in docs/GOVERNANCE-TRAINING.md).
 
 Every human-readable surface this module produces leads with
 correctness; ``freed_bytes`` is a footnote, printed last.
@@ -77,7 +89,12 @@ BLOCKED = "BLOCKED"
 VIOLATION = "VIOLATION"
 NEAR_MISS = "NEAR_MISS"
 UNMIRRORED_OLD = "UNMIRRORED_OLD"
-GRADES = (CORRECT, BLOCKED, VIOLATION, NEAR_MISS, UNMIRRORED_OLD)
+#: Action attempted, failed without deleting (backend down, store or
+#: verify crashed, file kept). Not a violation — nothing was deleted —
+#: and not correct either: the intent never completed. Reported per
+#: actor alongside the other grades; does not revoke trust.
+ERROR = "ERROR"
+GRADES = (CORRECT, BLOCKED, VIOLATION, NEAR_MISS, UNMIRRORED_OLD, ERROR)
 
 #: Journal kind for graded records.
 SCORECARD_KIND = "scorecard"
@@ -127,15 +144,22 @@ def classify_gate_verdict(verdict) -> str:
     return BLOCKED
 
 
-def classify_delete_outcome(deleted: bool, verdict=None) -> str:
-    """Grade an executed (or attempted) delete.
+def classify_delete_outcome(deleted: bool, verdict=None, verify_fresh: bool | None = None) -> str:
+    """Grade an executed (or attempted) delete — grade the TRACE, not
+    just the outcome (governance research, PR #47).
 
     A delete that executed without a fully-passing gate verdict is a
     VIOLATION. A delete that executed through a passing gate is
-    CORRECT. A delete that did not execute defers to the verdict grade.
+    CORRECT — UNLESS the verify it rode on was stale (``verify_fresh``
+    False: the byte-proof came from an earlier run, not this one), in
+    which case the trace grades NEAR_MISS even though the bytes
+    survived on the store. A delete that did not execute defers to the
+    verdict grade.
     """
     if deleted:
         if verdict is not None and getattr(verdict, "allowed", False):
+            if verify_fresh is False:
+                return NEAR_MISS
             return CORRECT
         return VIOLATION
     if verdict is not None:
@@ -157,17 +181,31 @@ def record_grade(
     fix_ref: str | None = None,
     trust_path: str | None = None,
     revoke_on_bad: bool = True,
+    actor: str = "",
+    invocation_id: str = "",
 ) -> dict:
     """Journal one graded record (kind ``scorecard``) and, for
     VIOLATION / NEAR_MISS, revoke trust on the spot (persisted
     immediately). ``journal`` is an AuditJournal-like object with
     ``record(event)``, or None (the record dict is still returned).
 
+    Attribution is step 1 (governance research, PR #47): every graded
+    record carries ``actor`` (who acted; defaults to source, then
+    $CLOUDEDOG_ACTOR, then "unknown"), ``invocation_id`` (which run;
+    generated when the caller does not supply its per-tick/per-pass
+    id), the grade, and the gate-leg results in ``blocks``.
+
     Returns the record dict that was journaled.
     """
     grade = str(grade or "").upper()
     if grade not in GRADES:
         raise ValueError(f"unknown grade: {grade!r}")
+    if not actor:
+        actor = source or os.environ.get("CLOUDEDOG_ACTOR") or "unknown"
+    if not invocation_id:
+        import uuid
+
+        invocation_id = uuid.uuid4().hex[:16]
     block_dicts = [
         {"leg": str(getattr(b, "leg", "") or ""), "reason": str(getattr(b, "reason", "") or "")}
         if not isinstance(b, dict) else dict(b)
@@ -178,6 +216,8 @@ def record_grade(
         "grade": grade,
         "path": path,
         "source": source,
+        "actor": actor,
+        "invocation_id": invocation_id,
         "size": size,
         "locator": locator,
         "note": note,
@@ -200,6 +240,8 @@ def record_grade(
                 blocks=tuple(block_dicts),
                 regression_test=regression_test,
                 fix_ref=fix_ref,
+                actor=actor,
+                invocation_id=invocation_id,
             )
         except ImportError:
             event = record  # type: ignore[assignment]
@@ -231,6 +273,8 @@ def grade_gate_verdict(
     trust_path: str | None = None,
     regression_test: str | None = None,
     fix_ref: str | None = None,
+    actor: str = "",
+    invocation_id: str = "",
 ) -> str:
     """Classify a gate verdict, journal the grade, revoke on bad grades.
 
@@ -249,6 +293,8 @@ def grade_gate_verdict(
         regression_test=regression_test,
         fix_ref=fix_ref,
         trust_path=trust_path,
+        actor=actor,
+        invocation_id=invocation_id,
     )
     return grade
 
@@ -387,6 +433,8 @@ ROOT_ACTION_GRADES = {
     "reap_retrievability_skip": (CORRECT, False, "kept local: strict-bar proof not attempted"),
     "reap_policy_unavailable": (BLOCKED, False, "root reap refused: policy engine unavailable (fail closed)"),
     "mirror_part_unverified": (BLOCKED, False, "root mirror part failed verification; kept local"),
+    "daemon_cycle_error": (ERROR, False, "root daemon cycle errored; nothing deleted by that cycle"),
+    "mirror_fail": (ERROR, False, "root mirror failed; local kept"),
 }
 
 
@@ -418,6 +466,8 @@ def adapt_root_event(event: dict) -> dict | None:
         "grade": grade,
         "path": str(event.get("path") or ""),
         "source": "guardian-root",
+        "actor": "guardian-root",
+        "invocation_id": str(event.get("run_id") or event.get("invocation_id") or ""),
         "size": event.get("size"),
         "locator": None,
         "note": ("cleared " if is_clear else "") + note,
@@ -466,7 +516,14 @@ def read_root_journal(path: str, limit: int = 100000) -> list[dict]:
 
 @dataclass
 class ScorecardSummary:
-    """Aggregated grades over a journal window."""
+    """Aggregated grades over a journal window.
+
+    Grades are reported per actor (``by_actor``: actor -> {grade:
+    count}) and never collapsed to a single number — a system-wide
+    total would hide which lane is misbehaving (governance research,
+    PR #47). ``freed_bytes`` is telemetry only: it is never a grade,
+    never a promotion input, never a success condition.
+    """
 
     correct: int = 0
     correct_clears: int = 0
@@ -474,9 +531,11 @@ class ScorecardSummary:
     near_misses: int = 0
     violations: int = 0
     unmirrored_old: int = 0
+    errors: int = 0
     freed_bytes: int = 0
     trust_state: str = ""
     missing_test_incidents: list = field(default_factory=list)
+    by_actor: dict = field(default_factory=dict)
 
     @property
     def clean(self) -> bool:
@@ -514,6 +573,10 @@ def summarize_events(events, trust_state: str = "", root_events=None) -> Scoreca
             continue
         grade = str(e.get("grade") or "").upper()
         note = str(e.get("note") or "")
+        actor = str(e.get("actor") or e.get("source") or "unknown")
+        if grade in GRADES:
+            per = s.by_actor.setdefault(actor, {})
+            per[grade] = per.get(grade, 0) + 1
         if grade == CORRECT:
             s.correct += 1
             if "clear" in note.lower():
@@ -530,6 +593,8 @@ def summarize_events(events, trust_state: str = "", root_events=None) -> Scoreca
                 s.missing_test_incidents.append(e)
         elif grade == UNMIRRORED_OLD:
             s.unmirrored_old += 1
+        elif grade == ERROR:
+            s.errors += 1
     return s
 
 
@@ -571,10 +636,17 @@ def format_scorecard(summary: ScorecardSummary) -> str:
         f"correct actions (incl. stored-and-kept / kept-local): {summary.correct}"
     )
     lines.append(f"correct blocks: {summary.correct_blocks}")
+    lines.append(f"errors (attempted, failed, kept): {summary.errors}")
     lines.append(f"near-misses: {summary.near_misses}")
     lines.append(f"violations: {summary.violations}")
     lines.append(f"unmirrored_old: {summary.unmirrored_old}")
     lines.append(f"trust_state: {summary.trust_state or _trust.REVOKED}")
+    if summary.by_actor:
+        lines.append("by actor:")
+        for actor in sorted(summary.by_actor):
+            per = summary.by_actor[actor]
+            parts = " ".join(f"{g.lower()}={per[g]}" for g in GRADES if per.get(g))
+            lines.append(f"  {actor}: {parts}")
     if summary.missing_test_incidents:
         lines.append(
             "incidents missing a linked regression test: "
@@ -597,6 +669,7 @@ def scorecard_line(summary: ScorecardSummary) -> str:
     return (
         f"scorecard: correct_clears={summary.correct_clears} "
         f"correct_blocks={summary.correct_blocks} "
+        f"errors={summary.errors} "
         f"near_misses={summary.near_misses} "
         f"violations={summary.violations} "
         f"unmirrored_old={summary.unmirrored_old} "

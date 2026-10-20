@@ -36,6 +36,12 @@ class AuditEvent:
     blocks: tuple = ()
     regression_test: str | None = None
     fix_ref: str | None = None
+    # Attribution (governance research, PR #47): WHO acted and in WHICH
+    # invocation — the pre-training journal had no actor field, which is
+    # why a disappearance could stay anonymous. Every graded record
+    # carries actor + invocation_id + grade + gate-leg results.
+    actor: str = ""
+    invocation_id: str = ""
 
     def to_dict(self) -> dict:
         d = {
@@ -49,6 +55,8 @@ class AuditEvent:
         if self.grade:
             d["grade"] = self.grade
             d["source"] = self.source
+            d["actor"] = self.actor
+            d["invocation_id"] = self.invocation_id
             d["blocks"] = [dict(b) if isinstance(b, dict) else b for b in self.blocks]
             d["regression_test"] = self.regression_test
             d["fix_ref"] = self.fix_ref
@@ -68,6 +76,8 @@ class AuditEvent:
             blocks=tuple(d.get("blocks") or ()),
             regression_test=d.get("regression_test"),
             fix_ref=d.get("fix_ref"),
+            actor=d.get("actor", "") or "",
+            invocation_id=d.get("invocation_id", "") or "",
         )
 
 

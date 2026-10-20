@@ -401,6 +401,7 @@ class StreamReport:
     correct_kept: int = 0
     near_misses: int = 0
     violations: int = 0
+    error_actions: int = 0
 
 
 def _scratch_dir() -> str:
@@ -543,11 +544,15 @@ class Streamer:
             report.near_misses += 1
         elif grade == _scorecard.VIOLATION:
             report.violations += 1
+        elif grade == _scorecard.ERROR:
+            report.error_actions += 1
         try:
             _scorecard.record_grade(
                 self._scorecard_journal, grade, path=path, source="streamer",
                 size=size, locator=locator, note=note, blocks=blocks,
                 trust_path=self.trust_path,
+                actor="streamer",
+                invocation_id=getattr(self, "_invocation_id", ""),
             )
         except Exception:  # noqa: BLE001 - grading never breaks a stream
             pass
@@ -646,11 +651,13 @@ class Streamer:
             save_manifest(manifest)
 
         scratch = _scratch_dir() if total > 1 else None
+        resumed_chunks = 0  # verified in a PREVIOUS run (stale proof)
         try:
             for index, offset, length in plan:
                 asset = chunk_asset_name(name, index, total)
                 done = rec.chunk_by_index(index)
                 if done is not None and done.verified and done.asset == asset:
+                    resumed_chunks += 1
                     continue  # resume: already on the store, byte-verified
                 if total == 1:
                     chunk_path = path
@@ -666,6 +673,8 @@ class Streamer:
                     if self.apply:
                         save_manifest(manifest)
                     report.errors.append(f"{name}: {rec.error}")
+                    self._grade(report, "ERROR", path, length, self.remote_ref,
+                                f"stream store failed, file kept: {exc}")
                     return
                 finally:
                     if total > 1 and os.path.exists(chunk_path):
@@ -794,9 +803,23 @@ class Streamer:
         except OSError as exc:
             report.errors.append(f"{name}: delete after verified store failed: {exc}")
             return
-        self._grade(report, "CORRECT", path, rec.size, self.remote_ref,
-                    "cleared through delete gate (streamed + live-verified + gate passed)",
-                    cleared=True)
+        # Grade the TRACE, not just the outcome: a clear that rode on
+        # chunks verified in a PREVIOUS run (resumed checkpoint records)
+        # is a NEAR_MISS — the proof was stale, even though the bytes
+        # survived on the store. All-fresh clears grade CORRECT.
+        from clouddog import scorecard as _scorecard
+
+        _outcome = _scorecard.classify_delete_outcome(
+            True, verdict, verify_fresh=(resumed_chunks == 0)
+        )
+        if _outcome == _scorecard.NEAR_MISS:
+            self._grade(report, _outcome, path, rec.size, self.remote_ref,
+                        f"cleared on STALE verify: {resumed_chunks} chunk(s) "
+                        "verified in a previous run, not this one")
+        else:
+            self._grade(report, _outcome, path, rec.size, self.remote_ref,
+                        "cleared through delete gate (streamed + live-verified this run + gate passed)",
+                        cleared=True)
         rec.status = "cleared"
         save_manifest(manifest)
         manifest.seen.pop(name, None)
@@ -814,6 +837,9 @@ class Streamer:
 
     def stream_once(self, now: float | None = None) -> StreamReport:
         """One pass: settle-scan, then stream every ready file."""
+        import uuid
+
+        self._invocation_id = uuid.uuid4().hex[:16]
         report = StreamReport()
         if not os.path.isdir(self.watch_dir):
             report.errors.append(f"watch dir missing: {self.watch_dir}")

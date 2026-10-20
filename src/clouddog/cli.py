@@ -399,9 +399,11 @@ def cmd_scorecard(args: argparse.Namespace) -> int:
             "correct_clears": summary.correct_clears,
             "correct": summary.correct,
             "correct_blocks": summary.correct_blocks,
+            "errors": summary.errors,
             "near_misses": summary.near_misses,
             "violations": summary.violations,
             "unmirrored_old": summary.unmirrored_old,
+            "by_actor": summary.by_actor,
             "trust_state": summary.trust_state,
             "missing_test_incidents": [
                 {"grade": e.get("grade"), "path": e.get("path"), "ts": e.get("ts")}
@@ -571,6 +573,7 @@ def cmd_daemon(args: argparse.Namespace) -> int:
             print(f"near_misses:   {rep.get('near_misses', 0)}")
             print(f"violations:    {rep.get('violations', 0)}")
             print(f"unmirrored_old:{rep.get('unmirrored_old', 0)}")
+            print(f"error_actions: {rep.get('error_actions', 0)}")
             print(f"trust_state:   {rep.get('trust_state', '')}")
             print(f"stored:        {rep['stored']}")
             print(f"verified:      {rep['verified']}")
