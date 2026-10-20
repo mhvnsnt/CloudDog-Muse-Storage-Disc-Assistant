@@ -1890,3 +1890,96 @@ def test_verify_github_asset_prover_unavailable_fails_closed():
         assert ok is False and "fail closed" in detail
     finally:
         _patch(cloud_dog, "_run_retrievability_proof", old)
+
+
+def _claims_test_env(tmp):
+    """Point cloud_dog's registry/claims/log at a tmp dir; return restore fn."""
+    olds = {
+        "REGISTRY_PATH": _patch(cloud_dog, "REGISTRY_PATH",
+                                os.path.join(tmp, "reg.json")),
+        "REGISTRY_DB_PATH": _patch(cloud_dog, "REGISTRY_DB_PATH",
+                                   os.path.join(tmp, "reg.db")),
+        "LOG_PATH": _patch(cloud_dog, "LOG_PATH",
+                           os.path.join(tmp, "cleanup.log")),
+    }
+
+    def restore():
+        for name, old in olds.items():
+            _patch(cloud_dog, name, old)
+
+    return restore
+
+
+def test_reap_candidates_claim_gate_blocks_and_release_frees(tmp_path=None):
+    # The Tekken 5 fix at the engine level: an OLD file (past the 5-min
+    # in-flight mtime heuristic) with a verified registry entry is still
+    # NOT a reap candidate while a lane's claim is live.
+    import cloud_dog_registry as regmod
+    tmp = tempfile.mkdtemp()
+    restore = _claims_test_env(tmp)
+    try:
+        target = os.path.join(tmp, "tekken5.iso")
+        with open(target, "wb") as f:
+            f.write(b"x" * 1024)
+        old = os.path.getmtime(target) - 3600  # 1h old: heuristic says free
+        os.utime(target, (old, old))
+        cloud_dog.save_registry({"version": 4, "entries": {target: {
+            "store": "github", "repo": "o/r", "release": "t", "asset": "a",
+            "size": 1024, "sha256": "s", "status": "registered"}}})
+        # unclaimed: it IS a candidate (the old world — heuristic only)
+        assert [p for p, _ in cloud_dog.reap_candidates()] == [target]
+        # claimed: hard-blocked despite age + verified entry
+        ok, claim = regmod.claim_path(cloud_dog.REGISTRY_DB_PATH, target,
+                                      "t5-iso-dl", "download",
+                                      json_path=cloud_dog.REGISTRY_PATH)
+        assert ok
+        assert list(cloud_dog.reap_candidates()) == []
+        # released: candidate again
+        assert regmod.release_claim(cloud_dog.REGISTRY_DB_PATH, target,
+                                    claim["claim_id"],
+                                    json_path=cloud_dog.REGISTRY_PATH)
+        assert [p for p, _ in cloud_dog.reap_candidates()] == [target]
+    finally:
+        restore()
+
+
+def test_reap_candidates_fail_closed_on_unreadable_claims(tmp_path=None):
+    # Corrupt claims DB => reap_candidates yields NOTHING (fail closed).
+    tmp = tempfile.mkdtemp()
+    restore = _claims_test_env(tmp)
+    try:
+        target = os.path.join(tmp, "file.bin")
+        with open(target, "wb") as f:
+            f.write(b"x" * 64)
+        old = os.path.getmtime(target) - 3600
+        os.utime(target, (old, old))
+        cloud_dog.save_registry({"version": 4, "entries": {target: {
+            "store": "github", "repo": "o/r", "release": "t", "asset": "a",
+            "size": 64, "sha256": "s", "status": "registered"}}})
+        with open(cloud_dog.REGISTRY_DB_PATH, "wb") as f:
+            f.write(b"not a sqlite db" * 128)
+        assert list(cloud_dog.reap_candidates()) == []
+        assert os.path.exists(target)  # and the file is untouched
+    finally:
+        restore()
+
+
+def test_claims_cli_check_exit_codes(tmp_path=None):
+    # `claims check` contract for non-CloudDog sweep lanes:
+    # exit 0 = claimed/BLOCKED (do not delete), exit 1 = free.
+    import cloud_dog_registry as regmod
+    tmp = tempfile.mkdtemp()
+    restore = _claims_test_env(tmp)
+    try:
+        target = os.path.join(tmp, "work.bin")
+        with open(target, "wb") as f:
+            f.write(b"x")
+        args = type("A", (), {"claims_cmd": "check", "path": target})()
+        assert cloud_dog.cmd_claims(args) == 1  # free
+        ok, claim = regmod.claim_path(cloud_dog.REGISTRY_DB_PATH, target,
+                                      "lane", "download",
+                                      json_path=cloud_dog.REGISTRY_PATH)
+        assert ok
+        assert cloud_dog.cmd_claims(args) == 0  # claimed: do not delete
+    finally:
+        restore()

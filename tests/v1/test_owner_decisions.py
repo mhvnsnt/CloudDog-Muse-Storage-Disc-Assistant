@@ -42,6 +42,14 @@ def test_github_split_bytes_is_the_shared_constant():
     assert github_mod.SPLIT_BYTES == 100 * MB
 
 
+def test_streamer_chunk_default_is_the_shared_constant():
+    """The straight-to-store streamer landed on main via PR #42; its
+    chunk default must be the SAME single standard, not a private copy."""
+    from clouddog import streamer
+
+    assert streamer.DEFAULT_CHUNK_BYTES == CHUNK_BYTES
+
+
 def test_github_split_produces_chunk_sized_parts(tmp_path, monkeypatch):
     """_split must read the shared constant, not a hardcoded size.
 
