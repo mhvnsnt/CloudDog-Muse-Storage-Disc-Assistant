@@ -1983,3 +1983,144 @@ def test_claims_cli_check_exit_codes(tmp_path=None):
         assert cloud_dog.cmd_claims(args) == 0  # claimed: do not delete
     finally:
         restore()
+
+
+# --------------------------------------- claims schema migration (2026-10-20)
+def _write_pre_claims_db(db_path):
+    """A registry DB in the pre-#43 shape: v4 entries/journal/meta, but
+    NO claims table (the live state that made every reap fail closed
+    with 'claims unreadable (no such table: claims)')."""
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "CREATE TABLE entries (local_path TEXT PRIMARY KEY,"
+            " store TEXT NOT NULL DEFAULT '', repo TEXT NOT NULL DEFAULT '',"
+            " release TEXT NOT NULL DEFAULT '', asset TEXT NOT NULL DEFAULT '',"
+            " size INTEGER NOT NULL DEFAULT 0, sha256 TEXT NOT NULL DEFAULT '',"
+            " status TEXT NOT NULL DEFAULT 'registered',"
+            " registered_at TEXT NOT NULL DEFAULT '',"
+            " reaped_at TEXT NOT NULL DEFAULT '',"
+            " verified_at TEXT NOT NULL DEFAULT '',"
+            " updated_at TEXT NOT NULL DEFAULT '',"
+            " extra TEXT NOT NULL DEFAULT '{}')")
+        conn.execute(
+            "CREATE TABLE journal (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " ts TEXT NOT NULL, action TEXT NOT NULL,"
+            " local_path TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '')")
+        conn.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _claims_tables(db_path):
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    try:
+        return {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        conn.close()
+
+
+def test_claims_readable_migrates_pre_claims_db(tmp_path=None):
+    """A pre-claims DB gains the claims table via the probe's migration
+    path (ensure_claims_schema) instead of failing closed forever."""
+    import cloud_dog_registry as regmod
+    tmp = tempfile.mkdtemp()
+    db = os.path.join(tmp, "reg.db")
+    _write_pre_claims_db(db)
+    assert "claims" not in _claims_tables(db)
+    readable, reason = regmod.claims_readable(db, json_path=None)
+    assert readable, reason
+    assert "claims" in _claims_tables(db)
+    ok, detail = regmod.ensure_claims_schema(db, json_path=None)
+    assert ok, detail
+    # And the migrated store actually gates: unclaimed = allowed,
+    # claimed = blocked.
+    allowed, _ = regmod.claim_gate(db, os.path.join(tmp, "f.bin"), json_path=None)
+    assert allowed
+    ok, claim = regmod.claim_path(db, os.path.join(tmp, "f.bin"), "lane",
+                                  "download", json_path=None)
+    assert ok
+    allowed, reason = regmod.claim_gate(db, os.path.join(tmp, "f.bin"),
+                                        json_path=None)
+    assert not allowed and "lane" in reason
+
+
+def test_claims_readable_heals_db_swapped_under_long_lived_process(tmp_path=None):
+    """The stale-init-cache case: a process initialized the current DB,
+    then the file is replaced by a pre-claims DB (restore/swap). The
+    probe must not trust its cached init — it migrates and reads."""
+    import cloud_dog_registry as regmod
+    tmp = tempfile.mkdtemp()
+    db = os.path.join(tmp, "reg.db")
+    ok, detail = regmod.ensure_claims_schema(db, json_path=None)
+    assert ok, detail  # first open: schema init cached for this path
+    # Swap the file for a pre-claims DB underneath the process.
+    for suffix in ("-wal", "-shm"):
+        side = db + suffix
+        if os.path.exists(side):
+            os.unlink(side)
+    os.unlink(db)
+    _write_pre_claims_db(db)
+    assert "claims" not in _claims_tables(db)
+    readable, reason = regmod.claims_readable(db, json_path=None)
+    assert readable, reason
+    assert "claims" in _claims_tables(db)
+
+
+def test_claims_migrate_cli(tmp_path=None):
+    tmp = tempfile.mkdtemp()
+    restore = _claims_test_env(tmp)
+    try:
+        _write_pre_claims_db(cloud_dog.REGISTRY_DB_PATH)
+        assert "claims" not in _claims_tables(cloud_dog.REGISTRY_DB_PATH)
+        args = type("A", (), {"claims_cmd": "migrate"})()
+        assert cloud_dog.cmd_claims(args) == 0
+        assert "claims" in _claims_tables(cloud_dog.REGISTRY_DB_PATH)
+    finally:
+        restore()
+
+
+def test_cmd_reap_policy_leg_blocks_keep_local(tmp_path=None):
+    """Delete-gate policy leg for cmd_reap (2026-10-20 incident fix):
+    a registered, live-verifiable file that evaluate() calls
+    KEEP_LOCAL must survive cmd_reap --apply; a cold STORE_AND_CLEAR
+    file with the same stubbed verify is reaped (positive control)."""
+    tmp = tempfile.mkdtemp()
+    restore = _claims_test_env(tmp)
+    old_audit = _patch(cloud_dog, "AUDIT_PATH", os.path.join(tmp, "audit.jsonl"))
+    old_verify = _patch(cloud_dog, "verify_github_asset",
+                        lambda *a, **k: (True, "stubbed ok"))
+    try:
+        # KEEP_LOCAL: small file, 10 min old (past the in-flight window,
+        # still inside evaluate()'s 1h hot window).
+        keep = os.path.join(tmp, "keep.bin")
+        with open(keep, "wb") as f:
+            f.write(b"k" * 100)
+        old = os.path.getmtime(keep) - 600
+        os.utime(keep, (old, old))
+        # STORE_AND_CLEAR control: 12MB sparse, 2h old.
+        cold = os.path.join(tmp, "cold.bin")
+        with open(cold, "wb") as f:
+            f.truncate(12 * 1024 * 1024)
+        old = os.path.getmtime(cold) - 7200
+        os.utime(cold, (old, old))
+        cloud_dog.save_registry({"version": 4, "entries": {
+            keep: {"store": "github", "repo": "o/r", "release": "t",
+                   "asset": "keep.bin", "size": 100, "sha256": "s",
+                   "status": "registered"},
+            cold: {"store": "github", "repo": "o/r", "release": "t",
+                   "asset": "cold.bin", "size": 12 * 1024 * 1024,
+                   "sha256": "s", "status": "registered"},
+        }})
+        args = type("A", (), {"apply": True, "path": ""})()
+        assert cloud_dog.cmd_reap(args) == 0
+        assert os.path.exists(keep), "KEEP_LOCAL file must survive cmd_reap"
+        assert not os.path.exists(cold), "STORE_AND_CLEAR control must reap"
+    finally:
+        _patch(cloud_dog, "verify_github_asset", old_verify)
+        _patch(cloud_dog, "AUDIT_PATH", old_audit)
+        restore()

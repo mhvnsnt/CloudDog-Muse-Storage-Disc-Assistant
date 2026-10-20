@@ -123,6 +123,11 @@ def _make_daemon(tmp_path, monkeypatch, entries, backend=None, **kwargs):
     backend = backend or FakeBackend()
     journal = FakeJournal()
     monkeypatch.setattr(policy_mod, "scan", lambda root, max_entries=200: list(entries))
+    # Hermetic delete-gate state: registry + claims live under tmp_path,
+    # never the real agent-ops stores.
+    kwargs.setdefault("registry_path", str(tmp_path / "registry.json"))
+    kwargs.setdefault("registry_db_path", str(tmp_path / "registry.db"))
+    kwargs.setdefault("claims_db", str(tmp_path / "claims.db"))
     daemon = Daemon(
         roots=[str(tmp_path)],
         backends={"github": backend},
@@ -166,9 +171,27 @@ def test_tick_store_verify_clear_deletes_and_journals(tmp_path, monkeypatch):
         lambda p, scan_root=None: Decision(Action.STORE_AND_CLEAR, "github", "test"),
     )
 
+    # DELETE GATE (two-pass rule): the first tick stores + verifies, but
+    # the file has NO pre-existing registry entry, so it must survive;
+    # the daemon registers its verified store and journals the block.
     report = daemon.tick()
 
     assert isinstance(report, TickReport)
+    assert report.stored == 1
+    assert report.verified == 1
+    assert report.cleared == 0
+    assert os.path.exists(target)
+    kinds = journal.kinds()
+    assert "stored" in kinds and "verified" in kinds
+    assert "registered" in kinds and "delete_blocked" in kinds
+    assert "cleared" not in kinds
+    assert report.critical is False
+
+    # Second tick: the entry now pre-exists and binds to the bytes, the
+    # copy is live-verified again this run, claims are clear — the gate
+    # passes and the file clears.
+    report = daemon.tick()
+
     assert report.stored == 1
     assert report.verified == 1
     assert report.cleared == 1
@@ -178,7 +201,7 @@ def test_tick_store_verify_clear_deletes_and_journals(tmp_path, monkeypatch):
     assert backend.store_calls[0]["dry_run"] is False
     assert backend.store_calls[0]["remote_ref"].startswith("mhvnsnt/clouddog-storage@clouddog-")
     kinds = journal.kinds()
-    assert "stored" in kinds and "verified" in kinds and "cleared" in kinds
+    assert "cleared" in kinds
     assert report.critical is False
 
 

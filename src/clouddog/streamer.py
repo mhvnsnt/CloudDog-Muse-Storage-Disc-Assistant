@@ -475,6 +475,7 @@ class Streamer:
         retrievability_proven: bool = False,
         owner_surfaced: bool = False,
         prover=None,
+        claim_check=None,
     ) -> None:
         self.watch_dir = os.path.abspath(watch_dir)
         self.backend = backend
@@ -488,6 +489,15 @@ class Streamer:
         self.retrievability_proven = bool(retrievability_proven)
         self.owner_surfaced = bool(owner_surfaced)
         self._prover = prover  # injectable for tests; default = real prover
+        # Delete gate (2026-10-20 incident fix): the final unlink passes
+        # clouddog.delete_gate; its claims leg consults the work-claims
+        # store. Default = the production checker (fail closed when the
+        # store is unreadable); injectable for tests.
+        if claim_check is None:
+            from clouddog.claims import make_claim_checker
+
+            claim_check = make_claim_checker()
+        self._claim_check = claim_check
 
     # ------------------------------------------------------------ internals
 
@@ -686,6 +696,44 @@ class Streamer:
                 return
         except OSError as exc:
             report.errors.append(f"{name}: re-stat before delete failed: {exc}")
+            return
+        # DELETE GATE (2026-10-20 incident fix): the same hard invariant
+        # as the daemon/reaper. Registry leg = the sacred checkpoint
+        # manifest record (sha256+size of the stored file, final manifest
+        # asset published); verify leg = every chunk byte-verified
+        # against the live store during THIS run; claims leg = the work
+        # claims store (a lane may have claimed the file after it
+        # settled); policy leg = stream_gate re-run at delete time.
+        from clouddog import policy as _policy
+        from clouddog.delete_gate import check_delete_gate
+
+        try:
+            _policy_action = _policy.evaluate(path).action.value
+        except Exception:  # noqa: BLE001 - no verdict = gate blocks (fail closed)
+            _policy_action = ""
+        verdict = check_delete_gate(
+            path,
+            registry_entry={"sha256": rec.sha256, "size": rec.size,
+                            "status": "registered"},
+            local_sha256=rec.sha256,
+            local_size=rec.size,
+            live_verify_ok=(
+                len(rec.chunks) == total and all(c.verified for c in rec.chunks)
+            ),
+            claim_check=self._claim_check,
+            policy_action=_policy_action,
+            # The streamer's charter is delete-as-you-go: STORE (mirror)
+            # files clear here too once every leg holds — stream_gate
+            # already refused SACRED/KEEP_LOCAL before any upload.
+            deletable_actions=frozenset({"store", "store_and_clear", "store_and_clear_strict"}),
+        )
+        if not verdict.allowed:
+            rec.error = f"delete gate blocked: {verdict.summary}"
+            rec.status = "blocked"
+            save_manifest(manifest)
+            report.files_blocked += 1
+            self._journal("delete_blocked", path, rec.size, self.remote_ref,
+                          verdict.summary)
             return
         try:
             os.remove(path)
