@@ -318,7 +318,7 @@ def test_stream_failure_keeps_source_and_resumes(tmp_path):
     backend = FakeBackend(fail_on=lambda n: state["fail"] and n.endswith("chunk-0001"))
     wd, s = _settled_streamer(tmp_path, backend, chunk_bytes=100 * 1024)
     now = 5000.0
-    p, data = _drop(wd, "big.bin", 250 * 1024, now)
+    p, _data = _drop(wd, "big.bin", 250 * 1024, now)
     s.stream_once(now=now)
     rep = s.stream_once(now=now + 301)
     assert rep.errors and os.path.exists(p)  # failed chunk: source kept
@@ -378,7 +378,7 @@ def test_stream_game_file_blocked_without_strict_flags(tmp_path):
 
 def test_stream_game_file_clears_at_strict_bar(tmp_path):
     backend = FakeBackend()
-    prover = lambda ref: types.SimpleNamespace(proven=True, reason="ok")  # noqa: E731
+    prover = lambda ref: types.SimpleNamespace(proven=True, reason="ok")
     wd, s = _settled_streamer(
         tmp_path,
         backend,

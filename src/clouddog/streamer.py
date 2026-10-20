@@ -491,7 +491,7 @@ class Streamer:
             return
         try:
             self.journal(kind, path, size, locator, note)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass  # journaling must never break a stream
 
     def _prove_chunks(self, rec: FileRecord) -> tuple[bool, str]:
@@ -714,7 +714,7 @@ class Streamer:
         for path in ready:
             try:
                 self._stream_file(manifest, path, report)
-            except Exception as exc:  # one bad file must not stop the pass
+            except Exception as exc:  # noqa: BLE001 - one bad file must not stop the pass
                 report.errors.append(f"{os.path.basename(path)}: crashed: {exc}")
         save_manifest(manifest)
         return report
