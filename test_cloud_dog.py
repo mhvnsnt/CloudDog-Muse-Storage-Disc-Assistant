@@ -97,7 +97,11 @@ def test_registry_roundtrip(tmp_path=None):
 
 
 def test_registry_sqlite_migration():
-    # legacy JSON entries migrate into sqlite exactly once
+    # legacy JSON entries migrate into sqlite exactly once.
+    # (v4: the default backend is json; this test pins the sqlite path,
+    #  so it selects the sqlite backend explicitly and restores it.)
+    prev_backend = cloud_dog._REGISTRY_BACKEND
+    cloud_dog.set_registry_backend("sqlite")
     import json
     db_path = cloud_dog.REGISTRY_DB_PATH
     reg_path = cloud_dog.REGISTRY_PATH
@@ -127,6 +131,7 @@ def test_registry_sqlite_migration():
         conn.close()
         assert n == 2
     finally:
+        cloud_dog.set_registry_backend(prev_backend)
         for p in (reg_path, db_path, db_path + "-wal", db_path + "-shm"):
             if os.path.exists(p):
                 os.unlink(p)
@@ -136,7 +141,10 @@ def test_registry_sqlite_migration():
 
 
 def test_registry_export_json(tmp_path):
-    # export reproduces the legacy JSON shape from sqlite
+    # export reproduces the legacy JSON shape from sqlite.
+    # (v4: selects the sqlite backend explicitly; default is json.)
+    prev_backend = cloud_dog._REGISTRY_BACKEND
+    cloud_dog.set_registry_backend("sqlite")
     import json
     db_path = cloud_dog.REGISTRY_DB_PATH
     reg_path = cloud_dog.REGISTRY_PATH
@@ -156,6 +164,7 @@ def test_registry_export_json(tmp_path):
             data = json.load(f)
         assert "/tmp/x" in data["entries"]
     finally:
+        cloud_dog.set_registry_backend(prev_backend)
         for p in (reg_path, db_path, db_path + "-wal", db_path + "-shm"):
             if os.path.exists(p):
                 os.unlink(p)
