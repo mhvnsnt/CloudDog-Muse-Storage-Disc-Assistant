@@ -1,6 +1,6 @@
 """CloudDog command-line interface.
 
-Subcommands: scan, store, reap, daemon, verify, dashboard, du, dedupe.
+Subcommands: scan, store, reap, stream, daemon, verify, dashboard, du, dedupe.
 
 Global flags:
   --dry-run   no destructive action anywhere (store/reap/daemon all honor it)
@@ -27,6 +27,11 @@ from clouddog.errors import CloudDogError
 
 DEFAULT_JOURNAL = os.path.expanduser("~/.clouddog/audit.jsonl")
 TIERS = ("github", "terabox", "drive")
+
+# Every stream-mode deletion is logged here with its backup location
+# (repo AGENTS.md rule 7: disk-cleanup-log.md + the structured audit
+# journal). Tests may patch this to a tmp path.
+DISK_CLEANUP_LOG = os.path.expanduser("~/workspace/agent-ops/disk-cleanup-log.md")
 
 # CloudDog-managed open-source tool installs (pulled in 2026-10-17).
 TOOLS_DIR = os.path.expanduser("~/workspace/tools")
@@ -73,6 +78,58 @@ def _journal(journal, kind: str, path: str, size: int, locator: str, note: str =
         )
     except Exception as exc:  # journaling must not break the operation
         print(f"[clouddog] warning: journal write failed: {exc}", file=sys.stderr)
+
+
+def _parse_bytes(text) -> int:
+    """Parse a byte count: plain int or K/M/G suffix (binary, 1024-based).
+
+    Accepts '104857600', '100M', '100MB', '2G'. Raises ValueError on junk.
+    """
+    if isinstance(text, int):
+        return text
+    s = str(text).strip().upper()
+    mult = 1
+    for suffix, m in (("KB", 1024), ("MB", 1024**2), ("GB", 1024**3),
+                      ("K", 1024), ("M", 1024**2), ("G", 1024**3)):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)]
+            mult = m
+            break
+    n = int(s)  # ValueError propagates on garbage
+    if n <= 0:
+        raise ValueError(f"byte count must be positive, got {text!r}")
+    return n * mult
+
+
+def log_deletion_md(path: str, size: int, locator: str, note: str = "") -> None:
+    """Append one deletion line to the human-readable disk-cleanup log.
+
+    Repo AGENTS.md rule 7: every deletion is logged with its backup
+    location. Best-effort: a logging failure never breaks a stream.
+    """
+    try:
+        parent = os.path.dirname(os.path.abspath(DISK_CLEANUP_LOG))
+        os.makedirs(parent, exist_ok=True)
+        line = (f"{_utcnow()} [CloudDog-stream] CLEARED {path} "
+                f"({size} B) -> {locator}")
+        if note:
+            line += f" — {note}"
+        with open(DISK_CLEANUP_LOG, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass  # the audit journal is the machine record; never crash on MD log
+
+
+def stream_journal_adapter(journal):
+    """Adapt the AuditJournal to the Streamer's journal callback shape.
+
+    Also routes 'cleared' events to the disk-cleanup log (rule 7).
+    """
+    def _fn(kind: str, path: str, size: int, locator: str, note: str = "") -> None:
+        _journal(journal, kind, path, size, locator, note)
+        if kind == "cleared":
+            log_deletion_md(path, size, locator, note)
+    return _fn
 
 
 def _load_backend(tier: str):
@@ -280,6 +337,96 @@ def cmd_reap(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- stream
+
+def cmd_stream(args: argparse.Namespace) -> int:
+    """Stream settled watch-dir files to the store, delete-as-you-go.
+
+    Each settled file is uploaded in ~chunk_bytes chunks; every chunk is
+    byte-verified against the LIVE store before the local bytes clear.
+    Delete-as-you-go means disk falls WHILE a download lane is still
+    writing the next file — nothing waits for the whole job to finish.
+    """
+    from clouddog import streamer as _streamer
+    from clouddog.stores.base import Health
+
+    journal = _get_journal(args.journal)
+    try:
+        chunk_bytes = _parse_bytes(args.chunk_bytes)
+    except ValueError as exc:
+        print(f"[clouddog] bad --chunk-bytes: {exc}", file=sys.stderr)
+        return 2
+
+    tier = str(args.tier).lower()
+    if tier == "terabox" and not args.dry_run:
+        # H2: TeraBox exposes no remote checksum, so a streamed chunk
+        # cannot be byte-verified before the local bytes clear. Fail closed.
+        print("[clouddog] refusing: terabox has no remote checksum — "
+              "cannot byte-verify before delete", file=sys.stderr)
+        _journal(journal, "error", args.watch_dir, 0, "",
+                 "stream refused: terabox has no content verification")
+        return 3
+
+    try:
+        backend = _load_backend(tier)
+    except CloudDogError as exc:
+        print(f"[clouddog] {exc}", file=sys.stderr)
+        return 3
+
+    if not args.dry_run:
+        try:
+            hs = backend.health()
+        except Exception as exc:
+            print(f"[clouddog] health probe failed for backend '{tier}': {exc}",
+                  file=sys.stderr)
+            return 3
+        if hs.health is not Health.LIVE:
+            print(
+                f"[clouddog] refusing: backend '{tier}' is not LIVE "
+                f"(health={hs.health.value}: {hs.reason}). "
+                f"Re-run with --dry-run to preview, or fix the backend.",
+                file=sys.stderr,
+            )
+            _journal(journal, "error", args.watch_dir, 0, "",
+                     f"stream refused: backend '{tier}' health={hs.health.value}")
+            return 3
+
+    stream = _streamer.Streamer(
+        watch_dir=args.watch_dir,
+        backend=backend,
+        repo=args.repo,
+        tag=args.tag,
+        chunk_bytes=chunk_bytes,
+        settle_secs=args.settle_secs,
+        apply=not args.dry_run,
+        journal=stream_journal_adapter(journal),
+        retrievability_proven=args.retrievability_proven,
+        owner_surfaced=args.owner_surfaced,
+    )
+    if args.loop:
+        stream.run_forever(interval_s=args.interval)
+        return 0
+
+    report = stream.stream_once()
+    rep = dataclasses.asdict(report)
+    if args.json:
+        print(json.dumps(rep, indent=2))
+    else:
+        print(f"files_streamed: {rep['files_streamed']}")
+        print(f"files_cleared:  {rep['files_cleared']}")
+        print(f"files_blocked:  {rep['files_blocked']}")
+        print(f"chunks_uploaded:{rep['chunks_uploaded']}")
+        print(f"bytes_streamed: {rep['bytes_streamed']}")
+        print(f"freed_bytes:    {rep['freed_bytes']}")
+        print(f"skipped:        {len(rep['skipped'])}")
+        print(f"errors:         {len(rep['errors'])}")
+        for err in rep["errors"]:
+            print(f"  error: {err}")
+    if rep["errors"]:
+        return 3
+    return 0
+
+
 # ---------------------------------------------------------------- daemon
 
 def cmd_daemon(args: argparse.Namespace) -> int:
@@ -310,6 +457,9 @@ def cmd_daemon(args: argparse.Namespace) -> int:
             print(f"verified:      {rep['verified']}")
             print(f"cleared:       {rep['cleared']}")
             print(f"freed_bytes:   {rep['freed_bytes']}")
+            print(f"stream_files:  {rep.get('stream_files', 0)}")
+            print(f"stream_chunks: {rep.get('stream_chunks', 0)}")
+            print(f"stream_freed:  {rep.get('stream_freed_bytes', 0)}")
             print(f"skipped_sacred:{rep['skipped_sacred']}")
             print(f"errors:        {len(rep['errors'])}")
             print(f"critical:      {rep['critical']}")
@@ -523,6 +673,35 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--roots", default=None,
                    help="comma-separated roots to sweep (default /home/hatch)")
     d.set_defaults(func=cmd_daemon)
+
+    s = sub.add_parser("stream",
+                       help="stream settled watch-dir files to the store, "
+                            "delete-as-you-go")
+    _add_common_flags(s)
+    s.add_argument("--watch-dir", required=True,
+                   help="directory to watch for landed downloads")
+    s.add_argument("--tier", default="github", choices=list(TIERS),
+                   help="store tier (default github)")
+    s.add_argument("--repo", default=None,
+                   help="github repo (default: mhvnsnt/clouddog-storage)")
+    s.add_argument("--tag", default=None,
+                   help="release tag (default: stream-YYYYMMDD)")
+    s.add_argument("--chunk-bytes", default="100M",
+                   help="chunk size, e.g. 100M (default 100M)")
+    s.add_argument("--settle-secs", type=int, default=300,
+                   help="seconds a file must sit unchanged before it counts "
+                        "as landed (default 300)")
+    s.add_argument("--loop", action="store_true",
+                   help="keep watching instead of a single pass")
+    s.add_argument("--interval", type=int, default=60,
+                   help="seconds between passes with --loop (default 60)")
+    s.add_argument("--retrievability-proven", action="store_true",
+                   help="owner attests streamed game files had pull-back "
+                        "proof; required to clear them (strict bar)")
+    s.add_argument("--owner-surfaced", action="store_true",
+                   help="owner attests streamed game files were surfaced; "
+                        "required to clear them (strict bar)")
+    s.set_defaults(func=cmd_stream)
 
     v = sub.add_parser("verify", help="verify a local path against a stored ref")
     _add_common_flags(v)

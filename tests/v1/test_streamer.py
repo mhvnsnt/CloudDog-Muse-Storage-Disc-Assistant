@@ -392,3 +392,96 @@ def test_stream_game_file_clears_at_strict_bar(tmp_path):
     s.stream_once(now=now)
     rep = s.stream_once(now=now + 301)
     assert rep.files_cleared == 1 and not os.path.exists(p)
+
+
+# ------------------------------------------------- Patch 3: CLI + daemon hook
+
+
+def test_cli_stream_once_dry_run(tmp_path):
+    from clouddog import cli
+
+    wd = str(tmp_path / "watch")
+    os.mkdir(wd)
+    p, _ = _drop(wd, "cli.bin", 2 * MB, 5000.0)
+    argv = [
+        "stream",
+        "--watch-dir",
+        wd,
+        "--settle-secs",
+        "0",
+        "--journal",
+        str(tmp_path / "j.jsonl"),
+        "--repo",
+        "o/r",
+        "--tag",
+        "t",
+    ]
+    assert cli.main(argv) == 0  # first pass: settling
+    assert cli.main(argv) == 0  # second pass: streams (dry-run)
+    assert os.path.exists(p)  # dry-run deletes nothing
+
+
+def test_daemon_stream_dirs_hook(tmp_path):
+    from clouddog.daemon import Daemon
+
+    watch = tmp_path / "watch"
+    watch.mkdir()
+    roots = tmp_path / "roots"
+    roots.mkdir()
+    p, _ = _drop(str(watch), "landed.bin", 2 * MB, 5000.0)
+    cfg = tmp_path / "stream-dirs.json"
+    cfg.write_text(
+        json.dumps([{"watch_dir": str(watch), "repo": "o/r", "tag": "t", "settle_secs": 0}])
+    )
+
+    class J:
+        def __init__(self):
+            self.events = []
+
+        def record(self, event):
+            self.events.append(event)
+
+        def read(self, limit=100):
+            return self.events[-limit:]
+
+    backend = FakeBackend()
+    journal = J()
+    d = Daemon(
+        roots=[str(roots)],
+        backends={},
+        journal=journal,
+        disk_path=str(tmp_path),
+        dry_run=True,
+        stream_backend=backend,
+    )
+    d.stream_dirs_path = str(cfg)
+    d.tick()  # first sighting: settling
+    rep = d.tick()  # settled: dry-run stream inside the tick
+    assert rep.stored >= 1
+    assert "landed.bin" in backend.calls
+    assert os.path.exists(p)  # dry-run deletes nothing
+    kinds = {getattr(e, "kind", "") for e in journal.events}
+    assert "streamed_chunk" in kinds or "streamed" in kinds
+
+
+def test_daemon_no_config_is_noop(tmp_path):
+    from clouddog.daemon import Daemon
+
+    class J:
+        def __init__(self):
+            self.events = []
+
+        def record(self, event):
+            self.events.append(event)
+
+    d = Daemon(
+        roots=[str(tmp_path)],
+        backends={},
+        journal=J(),
+        disk_path=str(tmp_path),
+        dry_run=True,
+        stream_backend=FakeBackend(),
+    )
+    d.stream_dirs_path = str(tmp_path / "missing.json")
+    rep = d.tick()
+    assert rep.stored == 0
