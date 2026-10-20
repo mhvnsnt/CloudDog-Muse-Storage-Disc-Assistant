@@ -398,6 +398,14 @@ def _init_schema(conn, db_path, auto_migrate_json, json_path):
             if key not in _schema_init_done:
 
                 def _do_schema():
+                    # WAL is persistent in the DB header, so it is set
+                    # ONCE, here — never per-open. The delete->WAL
+                    # transition needs an exclusive lock and returns
+                    # SQLITE_BUSY *immediately* (busy_timeout does not
+                    # cover it) while another opener holds any lock;
+                    # that is why this must live inside the serialized,
+                    # retried init and not in _open_db's pragma block.
+                    conn.execute("PRAGMA journal_mode=WAL;")
                     with _write_txn(conn):
                         for stmt in _SCHEMA_STATEMENTS:
                             conn.execute(stmt)
@@ -432,7 +440,9 @@ def _open_db(db_path, auto_migrate_json=True, json_path=None):
         os.makedirs(parent, exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
     try:
-        conn.execute("PRAGMA journal_mode=WAL;")
+        # journal_mode=WAL is set inside _init_schema (serialized +
+        # retried): the mode transition needs an exclusive lock and
+        # bypasses busy_timeout, so per-open execution raced (CI flake).
         conn.execute("PRAGMA busy_timeout=30000;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("PRAGMA foreign_keys=ON;")
