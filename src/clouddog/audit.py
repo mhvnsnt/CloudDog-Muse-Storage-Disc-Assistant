@@ -21,14 +21,30 @@ def _utcnow_iso() -> str:
 @dataclass
 class AuditEvent:
     ts: str = field(default_factory=_utcnow_iso)  # UTC ISO
-    kind: str = "sweep"  # stored | verified | reaped | cleared | skipped | error | sweep
+    kind: str = "sweep"  # stored | verified | reaped | cleared | skipped | error | sweep | scorecard
     path: str = ""
     size: int | None = None
     locator: str | None = None  # where it lives now (repo@tag/asset, /terabox/path, ...)
     note: str = ""
+    # Scorecard grading fields (kind="scorecard" records; empty/absent on
+    # legacy events). See clouddog.scorecard: grade in CORRECT | BLOCKED |
+    # VIOLATION | NEAR_MISS | UNMIRRORED_OLD; blocks = per-leg gate
+    # evidence; regression_test / fix_ref link the training-loop fix for
+    # VIOLATION / NEAR_MISS incidents (docs/TRAINING-LOOP-SOP.md).
+    grade: str = ""
+    source: str = ""
+    blocks: tuple = ()
+    regression_test: str | None = None
+    fix_ref: str | None = None
+    # Attribution (governance research, PR #47): WHO acted and in WHICH
+    # invocation — the pre-training journal had no actor field, which is
+    # why a disappearance could stay anonymous. Every graded record
+    # carries actor + invocation_id + grade + gate-leg results.
+    actor: str = ""
+    invocation_id: str = ""
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "ts": self.ts,
             "kind": self.kind,
             "path": self.path,
@@ -36,6 +52,15 @@ class AuditEvent:
             "locator": self.locator,
             "note": self.note,
         }
+        if self.grade:
+            d["grade"] = self.grade
+            d["source"] = self.source
+            d["actor"] = self.actor
+            d["invocation_id"] = self.invocation_id
+            d["blocks"] = [dict(b) if isinstance(b, dict) else b for b in self.blocks]
+            d["regression_test"] = self.regression_test
+            d["fix_ref"] = self.fix_ref
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "AuditEvent":
@@ -46,6 +71,13 @@ class AuditEvent:
             size=d.get("size"),
             locator=d.get("locator"),
             note=d.get("note", ""),
+            grade=d.get("grade", "") or "",
+            source=d.get("source", "") or "",
+            blocks=tuple(d.get("blocks") or ()),
+            regression_test=d.get("regression_test"),
+            fix_ref=d.get("fix_ref"),
+            actor=d.get("actor", "") or "",
+            invocation_id=d.get("invocation_id", "") or "",
         )
 
 

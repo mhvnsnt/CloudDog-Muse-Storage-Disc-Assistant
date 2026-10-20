@@ -311,7 +311,8 @@ def cmd_reap(args: argparse.Namespace) -> int:
     try:
         reaper = Reaper(args.src_dir, manifest, log_path,
                         hash_algo=args.hash_algo, store_verify=store_verify,
-                        claim_check=make_claim_checker())
+                        claim_check=make_claim_checker(),
+                        scorecard_journal=journal)
         report = reaper.reap_once(dry_run=args.dry_run)
     except CloudDogError as exc:
         print(f"[clouddog] reap failed: {exc}", file=sys.stderr)
@@ -330,16 +331,94 @@ def cmd_reap(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(rep, indent=2))
     else:
+        # Correctness first; freed_bytes last (scorecard, 2026-10-20).
+        print(f"correct_clears:{int(rep.get('correct_clears') or 0)}")
+        print(f"correct_blocks:{int(rep.get('correct_blocks') or 0)}")
+        print(f"near_misses:  {int(rep.get('near_misses') or 0)}")
+        print(f"violations:   {int(rep.get('violations') or 0)}")
         print(f"reaped:      {reaped_n}")
         print(f"mismatches:  {int(rep.get('mismatches') or 0)}")
         print(f"skipped:     {int(rep.get('skipped') or 0)}")
-        print(f"freed_bytes: {int(rep.get('freed_bytes') or 0)}")
         print(f"halted:      {bool(rep.get('halted'))}")
         if rep.get("halted"):
             print(f"halt_reason: {rep.get('halt_reason', '')}")
+        print(f"freed_bytes: {int(rep.get('freed_bytes') or 0)}")
 
     if rep.get("halted") or rep.get("mismatches"):
         return 3
+    return 0
+
+
+# ---------------------------------------------------------------- scorecard
+
+def cmd_scorecard(args: argparse.Namespace) -> int:
+    """`clouddog scorecard` — correctness FIRST, bytes freed LAST.
+
+    Reads the v1 audit journal (scorecard records graded by the daemon /
+    reaper / streamer) and, when --root-journal is given, the guardian
+    root script's audit log (cloud_dog.py actions, graded through the
+    scorecard adapter — those actions never pass through delete_gate).
+    With --roots, the mirror-coverage detector also runs live and its
+    UNMIRRORED_OLD findings surface at the TOP as a system failure state.
+    """
+    from clouddog import scorecard as _scorecard
+    from clouddog import trust as _trust
+
+    trust_path = getattr(args, "trust", None) or _trust.default_trust_path()
+    journal_path = args.journal
+    if os.environ.get("CLOUDEDOG_STATE_DIR") and journal_path == DEFAULT_JOURNAL:
+        # The journal resolves through the one state dir, like all state.
+        journal_path = os.path.join(_trust.state_dir(), "audit.jsonl")
+    summary = _scorecard.summarize_journal(
+        journal_path,
+        trust_path=trust_path,
+        root_journal_path=getattr(args, "root_journal", None),
+    )
+
+    findings: list[dict] = []
+    roots = getattr(args, "roots", None)
+    if roots:
+        from clouddog import registry as _registry_mod
+        from clouddog.claims import check_claimed, default_claims_db
+
+        root_list = [r.strip() for r in roots.split(",") if r.strip()]
+        findings = _scorecard.detect_unmirrored_old(
+            root_list,
+            age_s=int(getattr(args, "age_hours", 6) * 3600),
+            registry_lookup=lambda p: _registry_mod.lookup_entry(p),
+            claim_check=lambda p: check_claimed(default_claims_db(), p),
+            max_depth=6,
+        )
+        # Live findings join the summary counts as UNMIRRORED_OLD
+        # (reported, not journaled — the daemon journals its own).
+        summary.unmirrored_old += len(findings)
+        summary.trust_state = summary.trust_state or _trust.REVOKED
+
+    if args.json:
+        out = {
+            "correct_clears": summary.correct_clears,
+            "correct": summary.correct,
+            "correct_blocks": summary.correct_blocks,
+            "errors": summary.errors,
+            "near_misses": summary.near_misses,
+            "violations": summary.violations,
+            "unmirrored_old": summary.unmirrored_old,
+            "by_actor": summary.by_actor,
+            "trust_state": summary.trust_state,
+            "missing_test_incidents": [
+                {"grade": e.get("grade"), "path": e.get("path"), "ts": e.get("ts")}
+                for e in summary.missing_test_incidents
+            ],
+            "unmirrored_findings": findings,
+            "freed_bytes": summary.freed_bytes,
+        }
+        print(json.dumps(out, indent=2))
+        return 0
+
+    text = _scorecard.format_scorecard(summary)
+    print(text)
+    for f in findings:
+        print(f"  UNMIRRORED_OLD {f['path']} — {f['reason']}")
     return 0
 
 
@@ -430,6 +509,7 @@ def cmd_stream(args: argparse.Namespace) -> int:
         journal=stream_journal_adapter(journal),
         retrievability_proven=args.retrievability_proven,
         owner_surfaced=args.owner_surfaced,
+        scorecard_journal=journal,
     )
     if args.loop:
         stream.run_forever(interval_s=args.interval)
@@ -440,14 +520,19 @@ def cmd_stream(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(rep, indent=2))
     else:
+        # Correctness first; freed_bytes last (scorecard, 2026-10-20).
+        print(f"correct_clears: {rep.get('correct_clears', 0)}")
+        print(f"correct_blocks: {rep.get('correct_blocks', 0)}")
+        print(f"near_misses:    {rep.get('near_misses', 0)}")
+        print(f"violations:     {rep.get('violations', 0)}")
         print(f"files_streamed: {rep['files_streamed']}")
         print(f"files_cleared:  {rep['files_cleared']}")
         print(f"files_blocked:  {rep['files_blocked']}")
         print(f"chunks_uploaded:{rep['chunks_uploaded']}")
         print(f"bytes_streamed: {rep['bytes_streamed']}")
-        print(f"freed_bytes:    {rep['freed_bytes']}")
         print(f"skipped:        {len(rep['skipped'])}")
         print(f"errors:         {len(rep['errors'])}")
+        print(f"freed_bytes:    {rep['freed_bytes']}")
         for err in rep["errors"]:
             print(f"  error: {err}")
     if rep["errors"]:
@@ -479,18 +564,27 @@ def cmd_daemon(args: argparse.Namespace) -> int:
         if args.json:
             print(json.dumps(rep, indent=2))
         else:
+            # Correctness FIRST (scorecard, 2026-10-20); bytes last.
             print(f"started_utc:   {rep['started_utc']}")
             print(f"disk:          {rep['disk_before_pct']:.1f}% -> {rep['disk_after_pct']:.1f}%")
+            print(f"correct_clears:{rep.get('correct_clears', 0)}")
+            print(f"correct_blocks:{rep.get('correct_blocks', 0)}")
+            print(f"correct_kept:  {rep.get('correct_kept', 0)}")
+            print(f"near_misses:   {rep.get('near_misses', 0)}")
+            print(f"violations:    {rep.get('violations', 0)}")
+            print(f"unmirrored_old:{rep.get('unmirrored_old', 0)}")
+            print(f"error_actions: {rep.get('error_actions', 0)}")
+            print(f"trust_state:   {rep.get('trust_state', '')}")
             print(f"stored:        {rep['stored']}")
             print(f"verified:      {rep['verified']}")
             print(f"cleared:       {rep['cleared']}")
-            print(f"freed_bytes:   {rep['freed_bytes']}")
             print(f"stream_files:  {rep.get('stream_files', 0)}")
             print(f"stream_chunks: {rep.get('stream_chunks', 0)}")
             print(f"stream_freed:  {rep.get('stream_freed_bytes', 0)}")
             print(f"skipped_sacred:{rep['skipped_sacred']}")
             print(f"errors:        {len(rep['errors'])}")
             print(f"critical:      {rep['critical']}")
+            print(f"freed_bytes:   {rep['freed_bytes']}")
             if rep["critical"]:
                 print(f"critical_msg:  {rep['critical_msg']}")
             for err in rep["errors"]:
@@ -767,6 +861,22 @@ def build_parser() -> argparse.ArgumentParser:
                     help="claim check for sweep lanes")
     cl.add_argument("path", help="file or directory to check")
     cl.set_defaults(func=cmd_claims)
+
+    sc = sub.add_parser("scorecard",
+                        help="training scorecard: correctness first, bytes last")
+    _add_common_flags(sc)
+    sc.add_argument("--root-journal", default=None,
+                    help="guardian root script audit log (cloud_dog.py) to "
+                         "grade and merge, e.g. "
+                         "~/workspace/agent-ops/cloud-dog-audit.jsonl")
+    sc.add_argument("--trust", default=None,
+                    help="trust state file (default: the state dir's trust.json)")
+    sc.add_argument("--roots", default=None,
+                    help="comma-separated roots for a live mirror-coverage "
+                         "detector run (UNMIRRORED_OLD findings)")
+    sc.add_argument("--age-hours", type=float, default=6,
+                    help="unmirrored age threshold in hours (default 6)")
+    sc.set_defaults(func=cmd_scorecard)
 
     return p
 

@@ -244,6 +244,15 @@ def _aged_file(root, name="big.bin", size=11 * 1024 * 1024):
 
 
 def _daemon(tmp_path, journal, registry_json):
+    # Seed earned APPLY trust in tmp (training layer): the incident
+    # replay is about the delete GATE, and a fresh trust file would
+    # (correctly) force dry-run before the gate is ever reached.
+    from clouddog import trust as _trust
+
+    tp = str(tmp_path / "trust.json")
+    seeded = _trust.load_trust(tp)
+    seeded["state"] = _trust.APPLY
+    _trust.save_trust(seeded, tp)
     return Daemon(
         roots=[str(tmp_path)],
         backends={"github": _Backend()},
@@ -253,6 +262,7 @@ def _daemon(tmp_path, journal, registry_json):
         registry_path=str(registry_json),
         registry_db_path=str(tmp_path / "no-registry.db"),
         claims_db=str(tmp_path / "claims.db"),
+        trust_path=tp,
     )
 
 

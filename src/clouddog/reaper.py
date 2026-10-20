@@ -41,6 +41,17 @@ class ReapReport:
     freed_bytes: int = 0
     halted: bool = False
     halt_reason: str = ""
+    # Scorecard (training layer, 2026-10-20): correctness, not bytes.
+    correct_clears: int = 0
+    correct_blocks: int = 0
+    correct_kept: int = 0
+    near_misses: int = 0
+    violations: int = 0
+    error_actions: int = 0
+
+    @property
+    def clean_cycle(self) -> bool:
+        return self.violations == 0 and self.near_misses == 0
 
 
 def compute_hash(path: str, algo: str = "git-sha1") -> str:
@@ -122,6 +133,8 @@ class Reaper:
         claim_check: Callable[[str], tuple[bool, str]] | None = None,
         claims_db: str | None = None,
         policy_check: Callable[[str], str] | None = None,
+        trust_path: str | None = None,
+        scorecard_journal=None,
     ) -> None:
         # claim_check (the Tekken 5 fix): callable consulted before any
         # delete; takes the guarded absolute path, returns (blocked,
@@ -141,6 +154,10 @@ class Reaper:
         # None = the default mapping. A checker that raises fails closed
         # at the gate call site.
         self._policy_check = policy_check or _default_policy_action
+        # Training layer: scorecard grading state (reset per reap_once).
+        self.trust_path = trust_path
+        self._scorecard_journal = scorecard_journal
+        self._grades: dict[str, int] = {}
         if hash_algo not in ("git-sha1", "sha256"):
             raise ValueError(f"unknown hash_algo: {hash_algo!r}")
         src_real = os.path.realpath(src_dir)
@@ -160,6 +177,38 @@ class Reaper:
             if p:
                 names.add(os.path.basename(p))
         self._protected_names = frozenset(names)
+
+    # -- scorecard ----------------------------------------------------------
+
+    def _grade(self, grade: str, path: str, size: int = 0, note: str = "",
+               blocks=()) -> None:
+        """Scorecard grade for one reaper action (training layer).
+
+        Counted per pass (folded into ReapReport by reap_once) and
+        journaled when a scorecard journal is wired; NEAR_MISS /
+        VIOLATION revokes trust via scorecard.record_grade.
+        """
+        from clouddog import scorecard as _scorecard
+
+        key = {
+            _scorecard.CORRECT: "correct_clears",
+            _scorecard.BLOCKED: "correct_blocks",
+            _scorecard.NEAR_MISS: "near_misses",
+            _scorecard.VIOLATION: "violations",
+            _scorecard.ERROR: "error_actions",
+        }.get(grade)
+        if key:
+            self._grades[key] = self._grades.get(key, 0) + 1
+        try:
+            _scorecard.record_grade(
+                self._scorecard_journal, grade, path=path, source="reaper",
+                size=size, note=note, blocks=blocks,
+                trust_path=self.trust_path,
+                actor="reaper",
+                invocation_id=getattr(self, "_invocation_id", ""),
+            )
+        except Exception:  # noqa: BLE001 - grading never breaks a reap
+            pass
 
     # -- logging ----------------------------------------------------------
 
@@ -294,6 +343,8 @@ class Reaper:
                 return "skipped", spot_count
             if claimed:
                 self.log("CLAIMED-SKIP %s (%s) NOT deleted" % (rel, why))
+                self._grade("BLOCKED", guarded, size,
+                            note=f"claims gate kept local: {why}")
                 return "skipped", spot_count
         if dry_run:
             self.log("WOULD-REAP %s %s %d" % (rel, sha, size))
@@ -307,6 +358,8 @@ class Reaper:
             live_ok = self._store_verify(rel, guarded)
         except Exception as e:  # noqa: BLE001
             self.log("STORE-VERIFY-ERROR %s (%s) NOT deleted" % (rel, e))
+            self._grade("ERROR", guarded, size,
+                        note=f"live store verify errored, file kept: {e}")
             return "skipped", spot_count
         if not live_ok:
             self.log("STORE-VERIFY-FAILED %s NOT deleted" % rel)
@@ -345,8 +398,14 @@ class Reaper:
         )
         if not verdict.allowed:
             self.log("DELETE-BLOCKED %s (%s) NOT deleted" % (rel, verdict.summary))
+            from clouddog import scorecard as _scorecard
+
+            self._grade(_scorecard.classify_gate_verdict(verdict), guarded, size,
+                        note=verdict.summary, blocks=tuple(verdict.blocks))
             return "skipped", spot_count
         os.remove(guarded)
+        self._grade("CORRECT", guarded, size,
+                    note="cleared through delete gate (manifest-bound + live-verified + gate passed)")
         reaped.add(rel)
         spot_count += 1
         self.log("REAPED %s %s %d" % (rel, sha, size))
@@ -361,6 +420,10 @@ class Reaper:
     def reap_once(self, dry_run: bool = False) -> ReapReport:
         """Single pass over manifest entries not yet reaped. Never raises on halt."""
         report = ReapReport()
+        self._grades = {}
+        import uuid
+
+        self._invocation_id = uuid.uuid4().hex[:16]
         reaped, spot_count = self._load_state()
         for rel, sha in self._manifest.items():
             if rel in reaped:
@@ -385,6 +448,11 @@ class Reaper:
             else:
                 report.skipped += 1
         self._save_state(reaped, spot_count)
+        report.correct_clears = self._grades.get("correct_clears", 0)
+        report.correct_blocks = self._grades.get("correct_blocks", 0)
+        report.near_misses = self._grades.get("near_misses", 0)
+        report.violations = self._grades.get("violations", 0)
+        report.error_actions = self._grades.get("error_actions", 0)
         return report
 
     def run_loop(self, interval_s: int = 60, dry_run: bool = False) -> None:
@@ -397,13 +465,19 @@ class Reaper:
             while True:
                 report = self.reap_once(dry_run=dry_run)
                 self.log(
-                    "CYCLE done: reaped=%d mismatch=%d skipped=%d freed_bytes=%d halted=%s"
+                    "CYCLE done: correct_clears=%d correct_blocks=%d "
+                    "near_misses=%d violations=%d reaped=%d mismatch=%d "
+                    "skipped=%d halted=%s freed_bytes=%d"
                     % (
+                        report.correct_clears,
+                        report.correct_blocks,
+                        report.near_misses,
+                        report.violations,
                         report.reaped,
                         report.mismatches,
                         report.skipped,
-                        report.freed_bytes,
                         report.halted,
+                        report.freed_bytes,
                     )
                 )
                 if report.halted:

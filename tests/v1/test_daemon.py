@@ -128,6 +128,18 @@ def _make_daemon(tmp_path, monkeypatch, entries, backend=None, **kwargs):
     kwargs.setdefault("registry_path", str(tmp_path / "registry.json"))
     kwargs.setdefault("registry_db_path", str(tmp_path / "registry.db"))
     kwargs.setdefault("claims_db", str(tmp_path / "claims.db"))
+    # Hermetic trust state (training layer): these tests exercise the
+    # --apply delete path, so seed earned APPLY trust in tmp — a fresh
+    # trust file initializes REVOKED and the daemon would (correctly)
+    # force dry-run. Never the real ~/.clouddog trust file.
+    if "trust_path" not in kwargs:
+        from clouddog import trust as _trust
+
+        tp = str(tmp_path / "trust.json")
+        seeded = _trust.load_trust(tp)
+        seeded["state"] = _trust.APPLY
+        _trust.save_trust(seeded, tp)
+        kwargs["trust_path"] = tp
     daemon = Daemon(
         roots=[str(tmp_path)],
         backends={"github": backend},

@@ -1014,7 +1014,212 @@ def cmd_reap(args):
     return 0
 
 
+# ============================================================ training layer
+# Scorecard adapter (owner law 2026-10-20 + deleter audit): the guardian
+# runs THIS script's enforce --apply, whose actions never pass through
+# the v1 delete_gate — they are gated by evaluate() + laws
+# decide_delete + live verify and journaled via audit_log above. This
+# adapter grades those root audit events into scorecard-compatible
+# records (the same mapping as src/clouddog/scorecard.py's
+# ROOT_ACTION_GRADES — keep the two in sync) and merges the v1 journal's
+# graded records, so `cloud_dog.py scorecard` shows ONE card for the
+# whole system: correctness first, freed bytes last. Trust state lives
+# in the one state dir ($CLOUDEDOG_STATE_DIR or ~/.clouddog) — never in
+# a repo checkout.
+
+def _scorecard_state_dir():
+    return os.environ.get("CLOUDEDOG_STATE_DIR") or os.path.join(HOME, ".clouddog")
+
+
+def _scorecard_trust_path():
+    if os.environ.get("CLOUDEDOG_STATE_DIR"):
+        return os.path.join(os.environ["CLOUDEDOG_STATE_DIR"], "trust.json")
+    return (os.environ.get("CLOUDEDOG_TRUST_PATH")
+            or os.path.join(HOME, ".clouddog", "trust.json"))
+
+
+_ROOT_ACTION_GRADES = {
+    # action: (grade, is_clear)
+    "reap": ("CORRECT", True),
+    "reap_policy_block": ("BLOCKED", False),
+    "reap_keep": ("BLOCKED", False),
+    "reap_policy_skip": ("CORRECT", False),
+    "reap_retrievability_skip": ("CORRECT", False),
+    "reap_policy_unavailable": ("BLOCKED", False),
+    "mirror_part_unverified": ("BLOCKED", False),
+    "daemon_cycle_error": ("ERROR", False),
+    "mirror_fail": ("ERROR", False),
+}
+
+
+def scorecard_record_from_audit(event):
+    """Adapter: one root audit_log event -> scorecard record or None.
+
+    Attribution (governance research step 1): every record carries
+    actor + invocation_id + grade. Root audit events predate the
+    attribution fields, so the adapter stamps actor="guardian-root"
+    and takes invocation_id from the event's run_id when present.
+    """
+    if not isinstance(event, dict):
+        return None
+    action = str(event.get("action") or "")
+    if action == "verify":
+        grade, is_clear = ("CORRECT", False) if event.get("ok") else ("BLOCKED", False)
+    elif action == "reap_retrievability_proof":
+        grade, is_clear = ("CORRECT", False) if event.get("proven") else ("BLOCKED", False)
+    elif action in _ROOT_ACTION_GRADES:
+        grade, is_clear = _ROOT_ACTION_GRADES[action]
+    else:
+        return None
+    rec = {"kind": "scorecard", "grade": grade, "source": "guardian-root",
+           "actor": "guardian-root",
+           "invocation_id": str(event.get("run_id") or event.get("invocation_id") or ""),
+           "path": str(event.get("path") or ""), "ts": event.get("ts", ""),
+           "note": ("cleared " if is_clear else "") + f"root {action}",
+           "blocks": [],
+           "regression_test": None, "fix_ref": None}
+    if is_clear and isinstance(event.get("size"), int):
+        rec["freed"] = int(event["size"])
+    return rec
+
+
+def _read_jsonl(path, limit=100000):
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines[-limit:]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
+def scorecard_counts(root_journal=None, v1_journal=None):
+    """Aggregate BOTH journals into one correctness-first summary dict."""
+    counts = {"correct": 0, "correct_clears": 0, "correct_blocks": 0,
+              "near_misses": 0, "violations": 0, "unmirrored_old": 0,
+              "errors": 0, "by_actor": {},
+              "freed_bytes": 0, "missing_test_incidents": []}
+    # Root (guardian) events, graded through the adapter.
+    for ev in _read_jsonl(root_journal or AUDIT_PATH):
+        rec = scorecard_record_from_audit(ev)
+        if rec is None:
+            continue
+        _fold_scorecard_record(counts, rec)
+    # V1 journal: graded scorecard records + legacy freed footnote.
+    v1_path = v1_journal or os.path.join(_scorecard_state_dir(), "audit.jsonl")
+    for ev in _read_jsonl(v1_path):
+        if ev.get("kind") == "scorecard":
+            _fold_scorecard_record(counts, ev)
+        elif ev.get("kind") in ("cleared", "reaped"):
+            size = ev.get("size")
+            if isinstance(size, int) and size > 0:
+                counts["freed_bytes"] += size
+    # Trust state (read-only here; the v1 trust module owns the file).
+    try:
+        with open(_scorecard_trust_path()) as f:
+            counts["trust_state"] = json.load(f).get("state", "REVOKED")
+    except (OSError, ValueError):
+        counts["trust_state"] = "REVOKED"
+    return counts
+
+
+def _fold_scorecard_record(counts, rec):
+    grade = str(rec.get("grade") or "").upper()
+    actor = str(rec.get("actor") or rec.get("source") or "unknown")
+    if grade in ("CORRECT", "BLOCKED", "NEAR_MISS", "VIOLATION",
+                 "UNMIRRORED_OLD", "ERROR"):
+        per = counts.setdefault("by_actor", {}).setdefault(actor, {})
+        per[grade] = per.get(grade, 0) + 1
+    if grade == "CORRECT":
+        counts["correct"] += 1
+        if "clear" in str(rec.get("note") or "").lower():
+            counts["correct_clears"] += 1
+    elif grade == "BLOCKED":
+        counts["correct_blocks"] += 1
+    elif grade == "NEAR_MISS":
+        counts["near_misses"] += 1
+        if not rec.get("regression_test"):
+            counts["missing_test_incidents"].append(rec)
+    elif grade == "VIOLATION":
+        counts["violations"] += 1
+        if not rec.get("regression_test"):
+            counts["missing_test_incidents"].append(rec)
+    elif grade == "UNMIRRORED_OLD":
+        counts["unmirrored_old"] += 1
+    elif grade == "ERROR":
+        counts["errors"] += 1
+    freed = rec.get("freed")
+    if isinstance(freed, int):
+        counts["freed_bytes"] += freed
+
+
+def scorecard_line(counts=None):
+    """One correctness-first line for enforce/heartbeat surfaces."""
+    c = counts if counts is not None else scorecard_counts()
+    return (f"scorecard: correct_clears={c['correct_clears']} "
+            f"correct_blocks={c['correct_blocks']} "
+            f"errors={c.get('errors', 0)} "
+            f"near_misses={c['near_misses']} violations={c['violations']} "
+            f"unmirrored_old={c['unmirrored_old']} "
+            f"trust_state={c.get('trust_state', 'REVOKED')} "
+            f"freed_bytes={c['freed_bytes']}")
+
+
+def cmd_scorecard(args):
+    """`cloud_dog.py scorecard` — the whole system's card: guardian
+    (root) actions graded via the adapter + v1 graded records, trust
+    state, correctness first and freed_bytes last."""
+    counts = scorecard_counts(root_journal=getattr(args, "root_journal", "") or None,
+                              v1_journal=getattr(args, "journal", "") or None)
+    if getattr(args, "json", False):
+        out = dict(counts)
+        out["missing_test_incidents"] = [
+            {"grade": r.get("grade"), "path": r.get("path"), "ts": r.get("ts")}
+            for r in counts["missing_test_incidents"]]
+        print(json.dumps(out, indent=2))
+        return 0
+    if counts["unmirrored_old"]:
+        print(f"SYSTEM FAILURE — UNMIRRORED OLD WORK: {counts['unmirrored_old']} "
+              "file(s) local-only past the mirror age with no store record")
+    print(f"correct clears: {counts['correct_clears']}")
+    print(f"correct actions (incl. stored-and-kept / kept-local): {counts['correct']}")
+    print(f"correct blocks: {counts['correct_blocks']}")
+    print(f"errors (attempted, failed, kept): {counts.get('errors', 0)}")
+    print(f"near-misses: {counts['near_misses']}")
+    print(f"violations: {counts['violations']}")
+    print(f"unmirrored_old: {counts['unmirrored_old']}")
+    print(f"trust_state: {counts.get('trust_state', 'REVOKED')}")
+    for actor in sorted(counts.get("by_actor", {})):
+        per = counts["by_actor"][actor]
+        parts = " ".join(f"{g.lower()}={per[g]}" for g in
+                         ("CORRECT", "BLOCKED", "ERROR", "NEAR_MISS",
+                          "VIOLATION", "UNMIRRORED_OLD") if per.get(g))
+        print(f"  {actor}: {parts}")
+    print(f"incidents missing a linked regression test: "
+          f"{len(counts['missing_test_incidents'])}")
+    for rec in counts["missing_test_incidents"]:
+        print(f"  MISSING-TEST {rec.get('grade', '')} {rec.get('path', '')} "
+              f"({rec.get('ts', '')}) — link a regression test per "
+              "docs/TRAINING-LOOP-SOP.md")
+    print(f"freed_bytes (footnote): {counts['freed_bytes']}")
+    return 0
+
+
 def cmd_enforce(args):
+    # Correctness leads every enforce run (scorecard, 2026-10-20);
+    # freed bytes are the footnote, never the headline.
+    try:
+        print(scorecard_line())
+    except Exception:
+        pass  # the scorecard must never break an enforce cycle
     report = cmd_scan()
     freed = 0
     if report["over_ceiling"] or args.apply:
@@ -2988,6 +3193,15 @@ def main(argv=None):
     p = sub.add_parser("enforce", help="full cycle: scan + reap")
     p.add_argument("--apply", action="store_true")
 
+    p = sub.add_parser("scorecard",
+                       help="training scorecard: guardian + v1 grades, "
+                            "correctness first, freed bytes last")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--root-journal", default="",
+                   help="root audit journal (default: agent-ops/cloud-dog-audit.jsonl)")
+    p.add_argument("--journal", default="",
+                   help="v1 audit journal (default: <state dir>/audit.jsonl)")
+
     p = sub.add_parser("registry", help="show the store registry")
     p.add_argument("--json", action="store_true")
     p = sub.add_parser("registry-migrate",
@@ -3112,6 +3326,8 @@ def main(argv=None):
             return cmd_daemon(args)
         elif args.cmd == "enforce":
             return cmd_enforce(args)
+        elif args.cmd == "scorecard":
+            return cmd_scorecard(args)
         elif args.cmd == "registry":
             return cmd_registry(args)
         elif args.cmd == "registry-migrate":

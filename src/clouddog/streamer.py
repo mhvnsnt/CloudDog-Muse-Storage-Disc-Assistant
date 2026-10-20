@@ -395,13 +395,22 @@ class StreamReport:
     freed_bytes: int = 0
     skipped: list = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Scorecard (training layer, 2026-10-20): correctness, not bytes.
+    correct_clears: int = 0
+    correct_blocks: int = 0
+    correct_kept: int = 0
+    near_misses: int = 0
+    violations: int = 0
+    error_actions: int = 0
 
 
 def _scratch_dir() -> str:
     """Scratch space for chunk extraction. NEVER /tmp (512MB tmpfs)."""
     import tempfile
 
-    base = os.path.join(os.path.expanduser("~/.clouddog"), "tmp")
+    from clouddog import trust as _trust
+
+    base = os.path.join(_trust.state_dir(), "tmp")
     os.makedirs(base, exist_ok=True)
     return tempfile.mkdtemp(prefix="clouddog-stream-", dir=base)
 
@@ -476,6 +485,8 @@ class Streamer:
         owner_surfaced: bool = False,
         prover=None,
         claim_check=None,
+        trust_path: str | None = None,
+        scorecard_journal=None,
     ) -> None:
         self.watch_dir = os.path.abspath(watch_dir)
         self.backend = backend
@@ -498,6 +509,10 @@ class Streamer:
 
             claim_check = make_claim_checker()
         self._claim_check = claim_check
+        # Training layer: scorecard journal (AuditJournal-like or None)
+        # + the trust file a NEAR_MISS / VIOLATION grade revokes.
+        self.trust_path = trust_path
+        self._scorecard_journal = scorecard_journal
 
     # ------------------------------------------------------------ internals
 
@@ -508,6 +523,39 @@ class Streamer:
             self.journal(kind, path, size, locator, note)
         except Exception:  # noqa: BLE001, S110
             pass  # journaling must never break a stream
+
+    def _grade(self, report: StreamReport, grade: str, path: str, size: int,
+               locator: str, note: str, blocks=(), cleared: bool = False) -> None:
+        """Scorecard grade for one streamer action (training layer).
+
+        Counted on the report and journaled when a scorecard journal is
+        wired; NEAR_MISS / VIOLATION revokes trust via record_grade.
+        """
+        from clouddog import scorecard as _scorecard
+
+        if grade == _scorecard.CORRECT:
+            if cleared:
+                report.correct_clears += 1
+            else:
+                report.correct_kept += 1
+        elif grade == _scorecard.BLOCKED:
+            report.correct_blocks += 1
+        elif grade == _scorecard.NEAR_MISS:
+            report.near_misses += 1
+        elif grade == _scorecard.VIOLATION:
+            report.violations += 1
+        elif grade == _scorecard.ERROR:
+            report.error_actions += 1
+        try:
+            _scorecard.record_grade(
+                self._scorecard_journal, grade, path=path, source="streamer",
+                size=size, locator=locator, note=note, blocks=blocks,
+                trust_path=self.trust_path,
+                actor="streamer",
+                invocation_id=getattr(self, "_invocation_id", ""),
+            )
+        except Exception:  # noqa: BLE001 - grading never breaks a stream
+            pass
 
     def _prove_chunks(self, rec: FileRecord) -> tuple[bool, str]:
         """Pull-back proof per chunk: each chunk's StoredRef is fetched
@@ -603,11 +651,13 @@ class Streamer:
             save_manifest(manifest)
 
         scratch = _scratch_dir() if total > 1 else None
+        resumed_chunks = 0  # verified in a PREVIOUS run (stale proof)
         try:
             for index, offset, length in plan:
                 asset = chunk_asset_name(name, index, total)
                 done = rec.chunk_by_index(index)
                 if done is not None and done.verified and done.asset == asset:
+                    resumed_chunks += 1
                     continue  # resume: already on the store, byte-verified
                 if total == 1:
                     chunk_path = path
@@ -623,6 +673,8 @@ class Streamer:
                     if self.apply:
                         save_manifest(manifest)
                     report.errors.append(f"{name}: {rec.error}")
+                    self._grade(report, "ERROR", path, length, self.remote_ref,
+                                f"stream store failed, file kept: {exc}")
                     return
                 finally:
                     if total > 1 and os.path.exists(chunk_path):
@@ -677,6 +729,8 @@ class Streamer:
         )
 
         if not self.apply:
+            self._grade(report, "CORRECT", path, rec.size, self.remote_ref,
+                        "stored and kept local (dry-run stream; nothing deleted)")
             return  # dry-run: uploaded nothing, deleted nothing
 
         if rec.strict and not self._strict_bar_ok(rec, report):
@@ -684,6 +738,8 @@ class Streamer:
             save_manifest(manifest)
             report.files_blocked += 1
             self._journal("skipped", path, rec.size, self.remote_ref, rec.error)
+            self._grade(report, "BLOCKED", path, rec.size, self.remote_ref,
+                        f"strict bar kept local: {rec.error}")
             return
 
         # TOCTOU re-check: the source must be exactly what we hashed.
@@ -693,6 +749,8 @@ class Streamer:
                 rec.status = "blocked"
                 save_manifest(manifest)
                 report.files_blocked += 1
+                self._grade(report, "BLOCKED", path, rec.size, self.remote_ref,
+                            "kept local: source changed since hashing (TOCTOU check)")
                 return
         except OSError as exc:
             report.errors.append(f"{name}: re-stat before delete failed: {exc}")
@@ -734,12 +792,34 @@ class Streamer:
             report.files_blocked += 1
             self._journal("delete_blocked", path, rec.size, self.remote_ref,
                           verdict.summary)
+            from clouddog import scorecard as _scorecard
+
+            self._grade(report, _scorecard.classify_gate_verdict(verdict),
+                        path, rec.size, self.remote_ref, verdict.summary,
+                        blocks=tuple(verdict.blocks))
             return
         try:
             os.remove(path)
         except OSError as exc:
             report.errors.append(f"{name}: delete after verified store failed: {exc}")
             return
+        # Grade the TRACE, not just the outcome: a clear that rode on
+        # chunks verified in a PREVIOUS run (resumed checkpoint records)
+        # is a NEAR_MISS — the proof was stale, even though the bytes
+        # survived on the store. All-fresh clears grade CORRECT.
+        from clouddog import scorecard as _scorecard
+
+        _outcome = _scorecard.classify_delete_outcome(
+            True, verdict, verify_fresh=(resumed_chunks == 0)
+        )
+        if _outcome == _scorecard.NEAR_MISS:
+            self._grade(report, _outcome, path, rec.size, self.remote_ref,
+                        f"cleared on STALE verify: {resumed_chunks} chunk(s) "
+                        "verified in a previous run, not this one")
+        else:
+            self._grade(report, _outcome, path, rec.size, self.remote_ref,
+                        "cleared through delete gate (streamed + live-verified this run + gate passed)",
+                        cleared=True)
         rec.status = "cleared"
         save_manifest(manifest)
         manifest.seen.pop(name, None)
@@ -757,6 +837,9 @@ class Streamer:
 
     def stream_once(self, now: float | None = None) -> StreamReport:
         """One pass: settle-scan, then stream every ready file."""
+        import uuid
+
+        self._invocation_id = uuid.uuid4().hex[:16]
         report = StreamReport()
         if not os.path.isdir(self.watch_dir):
             report.errors.append(f"watch dir missing: {self.watch_dir}")

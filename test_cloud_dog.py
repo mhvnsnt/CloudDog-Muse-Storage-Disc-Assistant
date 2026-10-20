@@ -2124,3 +2124,60 @@ def test_cmd_reap_policy_leg_blocks_keep_local(tmp_path=None):
         _patch(cloud_dog, "verify_github_asset", old_verify)
         _patch(cloud_dog, "AUDIT_PATH", old_audit)
         restore()
+
+
+# ======================================================= training layer
+# Scorecard adapter (2026-10-20): guardian/root audit actions are graded
+# as a first-class source; correctness first, freed bytes last. State
+# (trust) resolves through the state dir, never a repo checkout, and
+# these tests only ever point it at tmp dirs.
+
+def test_scorecard_adapter_grades_root_actions():
+    rec = cloud_dog.scorecard_record_from_audit(
+        {"action": "reap", "path": "/w/a.bin", "size": 2048})
+    assert rec["grade"] == "CORRECT" and rec["freed"] == 2048
+    assert "clear" in rec["note"]
+    assert cloud_dog.scorecard_record_from_audit(
+        {"action": "reap_policy_block", "path": "/w/b.bin"})["grade"] == "BLOCKED"
+    assert cloud_dog.scorecard_record_from_audit(
+        {"action": "reap_keep", "path": "/w/c.bin"})["grade"] == "BLOCKED"
+    assert cloud_dog.scorecard_record_from_audit(
+        {"action": "verify", "ok": True})["grade"] == "CORRECT"
+    assert cloud_dog.scorecard_record_from_audit(
+        {"action": "verify", "ok": False})["grade"] == "BLOCKED"
+    assert cloud_dog.scorecard_record_from_audit(
+        {"action": "daemon_cycle", "disk_pct": 90.0}) is None
+    assert cloud_dog.scorecard_record_from_audit(
+        {"action": "reap_summary", "count": 3}) is None
+
+
+def test_scorecard_counts_merge_root_and_v1(tmp_path=None):
+    import json as _json
+    tmp = str(tmp_path) if tmp_path else tempfile.mkdtemp()
+    root_j = os.path.join(tmp, "root.jsonl")
+    with open(root_j, "w") as f:
+        f.write(_json.dumps({"action": "reap", "path": "/a", "size": 100}) + "\n")
+        f.write(_json.dumps({"action": "reap_policy_block", "path": "/b"}) + "\n")
+    v1_j = os.path.join(tmp, "v1.jsonl")
+    with open(v1_j, "w") as f:
+        f.write(_json.dumps({"kind": "scorecard", "grade": "NEAR_MISS",
+                             "path": "/c", "note": "one leg",
+                             "regression_test": None}) + "\n")
+        f.write(_json.dumps({"kind": "cleared", "path": "/d", "size": 50}) + "\n")
+    old_env = os.environ.get("CLOUDEDOG_STATE_DIR")
+    os.environ["CLOUDEDOG_STATE_DIR"] = tmp  # no trust.json in tmp -> REVOKED
+    try:
+        counts = cloud_dog.scorecard_counts(root_journal=root_j, v1_journal=v1_j)
+    finally:
+        if old_env is None:
+            os.environ.pop("CLOUDEDOG_STATE_DIR", None)
+        else:
+            os.environ["CLOUDEDOG_STATE_DIR"] = old_env
+    assert counts["correct_clears"] == 1
+    assert counts["correct_blocks"] == 1
+    assert counts["near_misses"] == 1
+    assert counts["freed_bytes"] == 150  # root reap 100 + v1 cleared 50
+    assert counts["trust_state"] == "REVOKED"
+    assert len(counts["missing_test_incidents"]) == 1
+    line = cloud_dog.scorecard_line(counts)
+    assert line.index("correct_clears") < line.index("freed_bytes")
