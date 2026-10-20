@@ -122,6 +122,50 @@ except Exception:  # pragma: no cover - defensive; module ships in-repo
     _V1_ACTION_STORE_AND_CLEAR_STRICT = _V1_ACTION_KEEP_LOCAL = None
     _EVALUATE_AVAILABLE = False
 
+
+# Pull-back retrievability prover (src/clouddog/retrievability.py). Loaded
+# by file path for the same shadowing reason as the v1 policy above. When
+# a reap run passes --retrievability-proven, the flag no longer merely
+# ASSERTS that a pull-back happened: cmd_reap_v2 RUNS the prover for each
+# strict-bar (game-file) candidate and records the proof in the audit
+# journal. If the prover cannot load or a proof fails/infeasible, the
+# strict bar stays unsatisfied — fail closed.
+def _load_retrievability():
+    import importlib.util
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    prover_path = os.path.join(here, "src", "clouddog", "retrievability.py")
+    spec = importlib.util.spec_from_file_location("_clouddog_retrievability", prover_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load retrievability prover from {prover_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+try:
+    _RETRIEVABILITY = _load_retrievability()
+    _RETRIEVABILITY_AVAILABLE = True
+except Exception:  # pragma: no cover - defensive; module ships in-repo
+    _RETRIEVABILITY = None
+    _RETRIEVABILITY_AVAILABLE = False
+
+
+def _run_retrievability_proof(entry):
+    """Run the pull-back prover for one registry entry.
+
+    Returns the ProofResult, or None when the prover is unavailable or
+    raised unexpectedly: the caller treats None as "not proven" (fail
+    closed). prove_registry_entry itself never raises on proof failure.
+    """
+    if not _RETRIEVABILITY_AVAILABLE:
+        return None
+    try:
+        return _RETRIEVABILITY.prove_registry_entry(entry)
+    except Exception:  # noqa: BLE001 - prover must never crash reap
+        return None
+
 # ---------------------------------------------------------------- locations
 HOME = os.path.expanduser("~")
 WORKSPACE = os.path.join(HOME, "workspace")
@@ -2667,13 +2711,37 @@ def cmd_reap_v2(args):
             continue
         claimed = [entry["store"]] if entry.get("store") else []
         strict_kwargs = {}
+        proof_info = None
         if v1_action == _V1_ACTION_STORE_AND_CLEAR_STRICT:
             # Game-file strict bar: 100% byte-verified store +
             # retrievability proven (pull-back actually tested) + owner
             # surfaced. decide_delete names exactly which condition is
-            # missing when it blocks.
+            # missing when it blocks. --retrievability-proven does NOT
+            # merely assert the flag: it RUNS the pull-back prover right
+            # now for this entry and records the proof (bytes fetched,
+            # hash match, timestamp) in the audit journal. A failed or
+            # infeasible proof leaves the strict bar unsatisfied (fail
+            # closed); a listing is never proof.
+            proven_now = False
+            if retrievability_proven:
+                proof = _run_retrievability_proof(entry)
+                if proof is not None:
+                    proof_info = proof.to_dict()
+                    proven_now = bool(proof_info.get("proven"))
+                audit_log("reap_retrievability_proof", path=path,
+                          store=entry.get("store"),
+                          proven=proven_now,
+                          bytes_fetched=(proof_info or {}).get("bytes_fetched", 0),
+                          hash_matched=(proof_info or {}).get("hash_matched", False),
+                          proof_ts=(proof_info or {}).get("ts", ""),
+                          detail=((proof_info or {}).get("reason")
+                                  or "prover unavailable; refusing (fail closed)")[:300])
+            else:
+                audit_log("reap_retrievability_skip", path=path,
+                          store=entry.get("store"),
+                          detail="--retrievability-proven not given")
             strict_kwargs = dict(
-                retrievability_proven=retrievability_proven,
+                retrievability_proven=proven_now,
                 owner_surfaced=owner_surfaced,
             )
         decision = decide_delete(path, verified_stores=claimed,
@@ -2686,6 +2754,12 @@ def cmd_reap_v2(args):
         if not decision.allowed or (decision.requires_owner
                                     and not owner_approved):
             reason = "; ".join(decision.reasons)
+            if proof_info is not None and not proof_info.get("proven"):
+                # Prefix (not append): the summary print truncates reasons
+                # at 160 chars; the proof failure is the actionable part.
+                reason = ("pull-back proof FAILED: "
+                          + str(proof_info.get("reason", ""))[:160]
+                          + " | " + reason)
             blocked.append((path, reason))
             audit_log("reap_policy_block", path=path, store=entry.get("store"),
                       evaluate_tier=v1.tier, detail=reason[:200])
@@ -2808,9 +2882,12 @@ def main(argv=None):
                    help="owner approval for protected game files "
                         "(NEVER-DELETE-GAME-FILES: unattended runs must omit)")
     p.add_argument("--retrievability-proven", action="store_true",
-                   help="game-file strict bar: pull-back was actually tested "
-                        "(asset downloadable / manifest fetched — a listing is "
-                        "NOT proof). Required to reap protected game files.")
+                   help="game-file strict bar: RUN the pull-back prover now "
+                        "for each strict candidate (fetch the stored bytes "
+                        "and hash-verify them; proof recorded in the audit "
+                        "journal). A failed or infeasible proof blocks the "
+                        "reap — a listing is NOT proof. Required to reap "
+                        "protected game files.")
     p.add_argument("--owner-surfaced", action="store_true",
                    help="game-file strict bar: the store event was surfaced "
                         "to the owner (never silent). --owner-approved "

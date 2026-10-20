@@ -618,11 +618,36 @@ def test_policy_gate_passes_ordinary_file_to_verify():
         cleanup()
 
 
+class _FakeProof:
+    """Stub stand-in for retrievability.ProofResult in reap wiring tests."""
+
+    def __init__(self, proven, reason=""):
+        self._d = {"proven": proven, "bytes_fetched": 123,
+                   "hash_matched": proven, "size_matched": proven,
+                   "expected_sha256": "e" * 64, "actual_sha256": "e" * 64,
+                   "expected_size": 123, "locator": "o/r@tag/a",
+                   "ts": "2026-10-20T00:00:00+00:00", "attempts": 1,
+                   "reason": reason}
+
+    def to_dict(self):
+        return dict(self._d)
+
+
+def _audit_events():
+    import json
+    with open(cloud_dog.AUDIT_PATH) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
 def test_policy_gate_owner_approved_allows_game_file_past_gate():
-    """With --owner-approved AND --retrievability-proven, a protected game
-    file passes the POLICY gate (strict bar satisfied) and proceeds to
-    live verification."""
+    """With --owner-approved AND --retrievability-proven (which now RUNS
+    the pull-back prover instead of merely asserting the flag), a
+    protected game file passes the POLICY gate (strict bar satisfied)
+    and proceeds to live verification. The prover's verdict — not the
+    flag — decides, and the proof is recorded in the audit journal."""
     d, cleanup = _policy_test_setup()
+    old = _patch(cloud_dog, "_run_retrievability_proof",
+                 lambda entry: _FakeProof(True, "pull-back fetched and hash-verified"))
     try:
         iso = _old_file(d, "game2.iso")
         assert _register(iso) == 0
@@ -631,8 +656,68 @@ def test_policy_gate_owner_approved_allows_game_file_past_gate():
             "retrievability_proven": True})())
         assert rc == 0
         assert "blocked-policy=0" in out, out
+        proofs = [e for e in _audit_events()
+                  if e.get("action") == "reap_retrievability_proof"]
+        assert len(proofs) == 1, [e.get("action") for e in _audit_events()]
+        assert proofs[0]["proven"] is True
+        assert proofs[0]["bytes_fetched"] == 123
+        assert proofs[0]["hash_matched"] is True
+        assert proofs[0]["proof_ts"] == "2026-10-20T00:00:00+00:00"
         assert os.path.exists(iso)
     finally:
+        _patch(cloud_dog, "_run_retrievability_proof", old)
+        cleanup()
+
+
+def test_policy_gate_game_file_blocked_when_pullback_proof_fails():
+    """The flag no longer asserts proof: when the prover runs and FAILS,
+    the game-file strict bar is unsatisfied (fail closed), the reap is
+    blocked, the block names the proof failure, and the file survives."""
+    d, cleanup = _policy_test_setup()
+    old = _patch(cloud_dog, "_run_retrievability_proof",
+                 lambda entry: _FakeProof(False, "sha256 mismatch after pull-back"))
+    try:
+        iso = _old_file(d, "game4.iso")
+        assert _register(iso) == 0
+        rc, out = _reap_dry(type("A", (), {
+            "apply": False, "path": "", "owner_approved": True,
+            "retrievability_proven": True})())
+        assert rc == 0
+        assert "blocked-policy=1" in out, out
+        assert "pull-back proof FAILED" in out, out
+        assert "sha256 mismatch" in out, out
+        proofs = [e for e in _audit_events()
+                  if e.get("action") == "reap_retrievability_proof"]
+        assert len(proofs) == 1
+        assert proofs[0]["proven"] is False
+        assert os.path.exists(iso), "proof-failed file must never be deleted"
+    finally:
+        _patch(cloud_dog, "_run_retrievability_proof", old)
+        cleanup()
+
+
+def test_policy_gate_game_file_prover_unavailable_fails_closed():
+    """When the prover module cannot run (returns None), a
+    --retrievability-proven strict run still blocks (fail closed),
+    naming the gap in the audit journal."""
+    d, cleanup = _policy_test_setup()
+    old = _patch(cloud_dog, "_run_retrievability_proof", lambda entry: None)
+    try:
+        iso = _old_file(d, "game5.iso")
+        assert _register(iso) == 0
+        rc, out = _reap_dry(type("A", (), {
+            "apply": False, "path": "", "owner_approved": True,
+            "retrievability_proven": True})())
+        assert rc == 0
+        assert "blocked-policy=1" in out, out
+        proofs = [e for e in _audit_events()
+                  if e.get("action") == "reap_retrievability_proof"]
+        assert len(proofs) == 1
+        assert proofs[0]["proven"] is False
+        assert "unavailable" in proofs[0]["detail"]
+        assert os.path.exists(iso), "fail-closed file must never be deleted"
+    finally:
+        _patch(cloud_dog, "_run_retrievability_proof", old)
         cleanup()
 
 
