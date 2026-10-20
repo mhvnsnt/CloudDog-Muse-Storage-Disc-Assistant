@@ -373,3 +373,370 @@ def scan_watch(
             continue
         ready.append(full)
     return ready, skipped
+
+
+# ------------------------------------------------------------------ streaming
+
+
+@dataclass
+class StreamReport:
+    """Outcome of one stream pass."""
+
+    files_streamed: int = 0
+    files_cleared: int = 0
+    files_blocked: int = 0
+    chunks_uploaded: int = 0
+    bytes_streamed: int = 0
+    freed_bytes: int = 0
+    skipped: list = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+
+def _scratch_dir() -> str:
+    """Scratch space for chunk extraction. NEVER /tmp (512MB tmpfs)."""
+    import tempfile
+
+    base = os.path.join(os.path.expanduser("~/.clouddog"), "tmp")
+    os.makedirs(base, exist_ok=True)
+    return tempfile.mkdtemp(prefix="clouddog-stream-", dir=base)
+
+
+def _extract_chunk(src: str, offset: int, length: int, dest: str) -> str:
+    """Copy src[offset:offset+length] to dest (streaming). Returns sha256
+    of the extracted bytes."""
+    digest = hashlib.sha256()
+    remaining = length
+    with open(src, "rb") as fin, open(dest, "wb") as fout:
+        fin.seek(offset)
+        while remaining > 0:
+            data = fin.read(min(8 * 1024 * 1024, remaining))
+            if not data:
+                raise CloudDogError(f"short read extracting chunk at offset {offset} from {src}")
+            fout.write(data)
+            digest.update(data)
+            remaining -= len(data)
+    return digest.hexdigest()
+
+
+def build_final_manifest(rec: FileRecord, repo: str, tag: str) -> dict:
+    """The published manifest payload for one streamed file.
+
+    SCOOBY LESSON: built FROM THE CHECKPOINT RECORD — never by re-walking
+    the watch dir (the streamer prunes local bytes as it goes; a re-walk
+    would see an empty dir and lose the file's accounting at the last
+    step). The chunks listed here are already byte-verified on the store.
+    """
+    chunks = [c.to_dict() for c in sorted(rec.chunks, key=lambda c: c.index)]
+    assets = [c["asset"] for c in chunks]
+    return {
+        "name": rec.name,
+        "size": rec.size,
+        "sha256": rec.sha256,
+        "repo": repo,
+        "tag": tag,
+        "chunks": chunks,
+        "created_utc": _utcnow(),
+        "tool": "clouddog-stream/1",
+        "reassemble": (
+            f"gh release download {tag} -R {repo} "
+            f"-p '{rec.name}.chunk-*' -p '{rec.name}' ; "
+            f"cat {' '.join(assets)} > {rec.name} ; "
+            f"sha256sum {rec.name}  # expect {rec.sha256}"
+        ),
+    }
+
+
+class Streamer:
+    """Stream settled watch-dir files to a GitHub release, delete-as-you-go.
+
+    Per file: hash -> split into chunks (scratch) -> for each chunk,
+    backend.store() (which uploads AND byte-verifies against the live
+    store by re-downloading) -> checkpoint the manifest -> delete the
+    scratch chunk -> publish the final manifest asset FROM the checkpoint
+    -> delete the local source (only after every chunk verified; game
+    files additionally need the strict bar). Peak extra disk: one chunk.
+    """
+
+    def __init__(
+        self,
+        watch_dir: str,
+        backend,
+        repo: str = DEFAULT_REPO,
+        tag: str | None = None,
+        chunk_bytes: int = DEFAULT_CHUNK_BYTES,
+        settle_secs: int = DEFAULT_SETTLE_SECS,
+        apply: bool = False,
+        journal=None,
+        retrievability_proven: bool = False,
+        owner_surfaced: bool = False,
+        prover=None,
+    ) -> None:
+        self.watch_dir = os.path.abspath(watch_dir)
+        self.backend = backend
+        self.repo = repo
+        self.tag = tag or f"stream-{datetime.now(timezone.utc):%Y%m%d}"
+        self.remote_ref = f"{repo}@{self.tag}"
+        self.chunk_bytes = int(chunk_bytes)
+        self.settle_secs = int(settle_secs)
+        self.apply = bool(apply)
+        self.journal = journal  # callable(kind, path, size, locator, note)
+        self.retrievability_proven = bool(retrievability_proven)
+        self.owner_surfaced = bool(owner_surfaced)
+        self._prover = prover  # injectable for tests; default = real prover
+
+    # ------------------------------------------------------------ internals
+
+    def _journal(self, kind: str, path: str, size: int, locator: str, note: str = "") -> None:
+        if self.journal is None:
+            return
+        try:
+            self.journal(kind, path, size, locator, note)
+        except Exception:
+            pass  # journaling must never break a stream
+
+    def _prove_chunks(self, rec: FileRecord) -> tuple[bool, str]:
+        """Pull-back proof per chunk: each chunk's StoredRef is fetched
+        from the live store and hash-checked (PR #37 prover). Chunks are
+        contiguous ranges of the original, so per-chunk byte-identity +
+        the recorded whole-file sha256 proves reassembly."""
+        from clouddog.stores.base import StoredRef
+
+        prover = self._prover
+        if prover is None:
+            from clouddog.retrievability import prove_retrievable
+
+            prover = prove_retrievable
+        total = 0
+        for c in sorted(rec.chunks, key=lambda c: c.index):
+            ref = StoredRef(backend="github", locator=c.locator, size=c.size, sha256=c.sha256)
+            result = prover(ref)
+            if not getattr(result, "proven", False):
+                return False, f"chunk {c.index} pull-back failed: {getattr(result, 'reason', '?')}"
+            total += c.size
+        if total != rec.size:
+            return False, f"chunk sizes sum to {total}, file is {rec.size}"
+        return True, "all chunks pull-back proven"
+
+    def _strict_bar_ok(self, rec: FileRecord, report: StreamReport) -> bool:
+        """Game-file 100% rule (owner 2026-10-17): 100% byte-verified
+        store + retrievability PROVEN + owner surfaced. All three or the
+        local copy stays."""
+        if not self.retrievability_proven:
+            rec.error = "strict bar: --retrievability-proven not set; kept local"
+            return False
+        if not self.owner_surfaced:
+            rec.error = "strict bar: --owner-surfaced not set; kept local"
+            return False
+        ok, why = self._prove_chunks(rec)
+        self._journal(
+            "stream_retrievability_proof",
+            rec.path,
+            rec.size,
+            self.remote_ref,
+            f"proven={ok} {why}",
+        )
+        if not ok:
+            rec.error = f"strict bar: retrievability not proven ({why}); kept local"
+            return False
+        return True
+
+    def _publish_manifest(self, manifest: StreamManifest, rec: FileRecord) -> None:
+        """Upload the final manifest asset, built from the checkpoint
+        record (never a re-walk of the watch dir)."""
+        payload = build_final_manifest(rec, self.repo, self.tag)
+        scratch = _scratch_dir()
+        try:
+            tmp = os.path.join(scratch, manifest_asset_name(rec.name))
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+            stored = self.backend.store(tmp, self.remote_ref, dry_run=not self.apply)
+            rec.manifest_asset = stored.locator
+        finally:
+            import shutil
+
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    def _stream_file(self, manifest: StreamManifest, path: str, report: StreamReport) -> None:
+        name = os.path.basename(path)
+        allowed, strict, _reason = stream_gate(path, self.watch_dir)
+        if not allowed:
+            report.skipped.append((name, "gate closed after scan"))
+            return
+        try:
+            size = os.path.getsize(path)
+            whole_sha = sha256_file(path)
+        except OSError as exc:
+            report.errors.append(f"{name}: cannot stat/hash: {exc}")
+            return
+
+        rec = manifest.files.get(name)
+        if rec is not None and (rec.size, rec.sha256) != (size, whole_sha):
+            rec = None  # new content under a known name: fresh record
+        if rec is None:
+            rec = FileRecord(name=name, path=path, strict=strict)
+            if self.apply:
+                manifest.files[name] = rec
+        rec.size, rec.sha256, rec.strict = size, whole_sha, strict
+
+        plan = chunk_plan(size, self.chunk_bytes)
+        if not plan:
+            report.skipped.append((name, "empty file"))
+            return
+        total = len(plan)
+        rec.status = "streaming"
+        if self.apply:
+            save_manifest(manifest)
+
+        scratch = _scratch_dir() if total > 1 else None
+        try:
+            for index, offset, length in plan:
+                asset = chunk_asset_name(name, index, total)
+                done = rec.chunk_by_index(index)
+                if done is not None and done.verified and done.asset == asset:
+                    continue  # resume: already on the store, byte-verified
+                if total == 1:
+                    chunk_path = path
+                else:
+                    assert scratch is not None
+                    chunk_path = os.path.join(scratch, asset)
+                    _extract_chunk(path, offset, length, chunk_path)
+                try:
+                    stored = self.backend.store(chunk_path, self.remote_ref, dry_run=not self.apply)
+                except CloudDogError as exc:
+                    rec.status = "failed"
+                    rec.error = f"chunk {index} store failed: {exc}"
+                    if self.apply:
+                        save_manifest(manifest)
+                    report.errors.append(f"{name}: {rec.error}")
+                    return
+                finally:
+                    if total > 1 and os.path.exists(chunk_path):
+                        os.remove(chunk_path)  # scratch chunk: store has it now
+                crec = ChunkRecord(
+                    index=index,
+                    asset=asset,
+                    size=length,
+                    sha256=stored.sha256,
+                    locator=stored.locator,
+                    verified=True,
+                )
+                rec.chunks = [c for c in rec.chunks if c.index != index] + [crec]
+                rec.chunks.sort(key=lambda c: c.index)
+                report.chunks_uploaded += 1
+                report.bytes_streamed += length
+                if self.apply:
+                    save_manifest(manifest)  # checkpoint after EVERY chunk
+                self._journal(
+                    "streamed_chunk",
+                    path,
+                    length,
+                    stored.locator,
+                    f"chunk {index + 1}/{total} of {name} verified on store",
+                )
+        finally:
+            if scratch is not None:
+                import shutil
+
+                shutil.rmtree(scratch, ignore_errors=True)
+
+        if not rec.manifest_asset:
+            try:
+                self._publish_manifest(manifest, rec)
+            except CloudDogError as exc:
+                rec.status = "failed"
+                rec.error = f"final manifest publish failed: {exc}"
+                if self.apply:
+                    save_manifest(manifest)
+                report.errors.append(f"{name}: {rec.error}")
+                return
+            if self.apply:
+                save_manifest(manifest)
+        rec.status = "stored"
+        report.files_streamed += 1
+        self._journal(
+            "streamed",
+            path,
+            rec.size,
+            self.remote_ref,
+            f"{name}: {total} chunk(s) verified; manifest {rec.manifest_asset}",
+        )
+
+        if not self.apply:
+            return  # dry-run: uploaded nothing, deleted nothing
+
+        if rec.strict and not self._strict_bar_ok(rec, report):
+            rec.status = "blocked"
+            save_manifest(manifest)
+            report.files_blocked += 1
+            self._journal("skipped", path, rec.size, self.remote_ref, rec.error)
+            return
+
+        # TOCTOU re-check: the source must be exactly what we hashed.
+        try:
+            if os.path.getsize(path) != rec.size or sha256_file(path) != rec.sha256:
+                rec.error = "source changed since hashing; kept local"
+                rec.status = "blocked"
+                save_manifest(manifest)
+                report.files_blocked += 1
+                return
+        except OSError as exc:
+            report.errors.append(f"{name}: re-stat before delete failed: {exc}")
+            return
+        try:
+            os.remove(path)
+        except OSError as exc:
+            report.errors.append(f"{name}: delete after verified store failed: {exc}")
+            return
+        rec.status = "cleared"
+        save_manifest(manifest)
+        manifest.seen.pop(name, None)
+        report.files_cleared += 1
+        report.freed_bytes += rec.size
+        self._journal(
+            "cleared",
+            path,
+            rec.size,
+            self.remote_ref,
+            f"{name}: local copy cleared after verified stream (delete-as-you-go)",
+        )
+
+    # ------------------------------------------------------------------ API
+
+    def stream_once(self, now: float | None = None) -> StreamReport:
+        """One pass: settle-scan, then stream every ready file."""
+        report = StreamReport()
+        if not os.path.isdir(self.watch_dir):
+            report.errors.append(f"watch dir missing: {self.watch_dir}")
+            return report
+        manifest = load_manifest(self.watch_dir, self.repo, self.tag, self.chunk_bytes)
+        ready, skipped = scan_watch(self.watch_dir, manifest, self.settle_secs, now=now)
+        report.skipped = skipped
+        for path in ready:
+            try:
+                self._stream_file(manifest, path, report)
+            except Exception as exc:  # one bad file must not stop the pass
+                report.errors.append(f"{os.path.basename(path)}: crashed: {exc}")
+        save_manifest(manifest)
+        return report
+
+    def run_forever(self, interval_s: int = 60) -> None:
+        """Watch loop: stream_once every interval_s. Ctrl-C exits cleanly."""
+        print(
+            f"[clouddog] stream watch: dir={self.watch_dir} "
+            f"store={self.remote_ref} chunk={self.chunk_bytes}B "
+            f"settle={self.settle_secs}s apply={self.apply}",
+            flush=True,
+        )
+        try:
+            while True:
+                report = self.stream_once()
+                if report.files_streamed or report.errors:
+                    print(
+                        f"[clouddog] stream pass: streamed={report.files_streamed} "
+                        f"cleared={report.files_cleared} "
+                        f"freed={report.freed_bytes}B errors={len(report.errors)}",
+                        flush=True,
+                    )
+                time.sleep(interval_s)
+        except KeyboardInterrupt:
+            print("[clouddog] stream watch stopping (keyboard interrupt)")

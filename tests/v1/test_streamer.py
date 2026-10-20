@@ -200,3 +200,195 @@ def test_stream_gate_flags_game_files(tmp_path):
     os.utime(fresh, (_t.time(), _t.time()))
     allowed, _, _ = streamer.stream_gate(fresh, wd)
     assert not allowed
+
+
+# ------------------------------------------------- Patch 2: streaming engine
+
+import hashlib
+import json
+import types
+
+from clouddog.stores.base import Health, HealthStatus, StoreBackend, StoredRef
+
+
+class FakeBackend(StoreBackend):
+    """In-memory v1 backend: store() reads bytes, keeps them by asset name."""
+
+    name = "fake"
+
+    def __init__(self, fail_on=None):
+        self.blobs: dict[str, bytes] = {}
+        self.calls: list[str] = []
+        self.fail_on = fail_on
+
+    def health(self):
+        return HealthStatus(Health.LIVE)
+
+    def store(self, local_path, remote_ref, dry_run=False):
+        with open(local_path, "rb") as fh:
+            data = fh.read()
+        name = os.path.basename(local_path)
+        self.calls.append(name)
+        if self.fail_on is not None and self.fail_on(name):
+            raise CloudDogError(f"injected failure on {name}")
+        digest = hashlib.sha256(data).hexdigest()
+        if dry_run:
+            return StoredRef(
+                backend="fake",
+                locator=f"dry-run:{remote_ref}/{name}",
+                size=len(data),
+                sha256=digest,
+            )
+        self.blobs[name] = data
+        return StoredRef(
+            backend="fake",
+            locator=f"{remote_ref}/{name}",
+            size=len(data),
+            sha256=digest,
+        )
+
+    def verify(self, local_path, stored):
+        with open(local_path, "rb") as fh:
+            data = fh.read()
+        return hashlib.sha256(data).hexdigest() == stored.sha256
+
+
+def _settled_streamer(tmp_path, backend, apply=True, **kw):
+    wd = str(tmp_path / "watch")
+    os.mkdir(wd)
+    return wd, streamer.Streamer(wd, backend, repo="o/r", tag="tag", apply=apply, **kw)
+
+
+def _drop(wd, name, size, now, payload=None):
+    p = os.path.join(wd, name)
+    data = payload if payload is not None else os.urandom(size)
+    with open(p, "wb") as fh:
+        fh.write(data)
+    os.utime(p, (now - 1000, now - 1000))
+    return p, data
+
+
+def test_stream_single_chunk_apply(tmp_path):
+    backend = FakeBackend()
+    wd, s = _settled_streamer(tmp_path, backend, chunk_bytes=10 * MB)
+    now = 5000.0
+    p, data = _drop(wd, "one.bin", 2 * MB, now)
+    s.stream_once(now=now)  # first sighting: settling only
+    rep = s.stream_once(now=now + 301)  # settle window elapsed: streams
+    assert rep.files_cleared == 1 and rep.freed_bytes == 2 * MB
+    assert not os.path.exists(p)
+    assert backend.blobs["one.bin"] == data
+    m = streamer.load_manifest(wd, "o/r", "tag", chunk_bytes=10 * MB)
+    assert m.files["one.bin"].status == "cleared"
+    # Final manifest asset was published from the checkpoint record.
+    payload = json.loads(backend.blobs["one.bin.stream-manifest.json"])
+    assert payload["sha256"] == hashlib.sha256(data).hexdigest()
+    assert payload["chunks"][0]["asset"] == "one.bin"
+
+
+def test_stream_multi_chunk(tmp_path):
+    backend = FakeBackend()
+    wd, s = _settled_streamer(tmp_path, backend, chunk_bytes=100 * 1024)
+    now = 5000.0
+    p, data = _drop(wd, "big.bin", 250 * 1024, now)
+    s.stream_once(now=now)
+    rep = s.stream_once(now=now + 301)
+    assert rep.chunks_uploaded == 3
+    assert not os.path.exists(p)
+    joined = b"".join(backend.blobs[f"big.bin.chunk-{i:04d}"] for i in range(3))
+    assert joined == data  # reassembly from stored chunks is byte-identical
+
+
+def test_stream_dry_run_deletes_nothing(tmp_path):
+    backend = FakeBackend()
+    wd, s = _settled_streamer(tmp_path, backend, apply=False, chunk_bytes=10 * MB)
+    now = 5000.0
+    p, _ = _drop(wd, "dry.bin", 2 * MB, now)
+    s.stream_once(now=now)
+    rep = s.stream_once(now=now + 301)
+    assert rep.files_streamed == 1 and rep.files_cleared == 0
+    assert os.path.exists(p)
+    assert backend.blobs == {}  # dry-run uploaded nothing real
+    m = streamer.load_manifest(wd, "o/r", "tag", chunk_bytes=10 * MB)
+    assert "dry.bin" not in m.files  # dry-run never persists file records
+
+
+def test_stream_failure_keeps_source_and_resumes(tmp_path):
+    state = {"fail": True}
+    backend = FakeBackend(fail_on=lambda n: state["fail"] and n.endswith("chunk-0001"))
+    wd, s = _settled_streamer(tmp_path, backend, chunk_bytes=100 * 1024)
+    now = 5000.0
+    p, data = _drop(wd, "big.bin", 250 * 1024, now)
+    s.stream_once(now=now)
+    rep = s.stream_once(now=now + 301)
+    assert rep.errors and os.path.exists(p)  # failed chunk: source kept
+    m = streamer.load_manifest(wd, "o/r", "tag", chunk_bytes=100 * 1024)
+    assert m.files["big.bin"].chunks[0].verified  # chunk 0 checkpointed
+
+    state["fail"] = False
+    backend.calls.clear()
+    rep = s.stream_once(now=now + 301)
+    assert rep.files_cleared == 1 and not os.path.exists(p)
+    assert "big.bin.chunk-0000" not in backend.calls  # resumed, not redone
+
+
+def test_build_final_manifest_from_checkpoint_only(tmp_path):
+    # SCOOBY regression: the watch dir is already pruned; the published
+    # manifest must come from the checkpoint record alone.
+    rec = streamer.FileRecord(
+        name="gone.bin",
+        path="/nowhere/gone.bin",
+        size=10,
+        sha256="deadbeef",
+        chunks=[
+            streamer.ChunkRecord(
+                index=1,
+                asset="gone.bin.chunk-0001",
+                size=4,
+                sha256="b",
+                locator="o/r@tag/gone.bin.chunk-0001",
+                verified=True,
+            ),
+            streamer.ChunkRecord(
+                index=0,
+                asset="gone.bin.chunk-0000",
+                size=6,
+                sha256="a",
+                locator="o/r@tag/gone.bin.chunk-0000",
+                verified=True,
+            ),
+        ],
+    )
+    payload = streamer.build_final_manifest(rec, "o/r", "tag")
+    assert [c["index"] for c in payload["chunks"]] == [0, 1]  # sorted
+    assert payload["sha256"] == "deadbeef"
+
+
+def test_stream_game_file_blocked_without_strict_flags(tmp_path):
+    backend = FakeBackend()
+    wd, s = _settled_streamer(tmp_path, backend, chunk_bytes=10 * MB)
+    now = 5000.0
+    p, data = _drop(wd, "game.iso", 2 * MB, now)
+    s.stream_once(now=now)
+    rep = s.stream_once(now=now + 301)
+    # Streamed + verified on the store, but the local copy STAYS.
+    assert backend.blobs["game.iso"] == data
+    assert rep.files_blocked == 1 and os.path.exists(p)
+
+
+def test_stream_game_file_clears_at_strict_bar(tmp_path):
+    backend = FakeBackend()
+    prover = lambda ref: types.SimpleNamespace(proven=True, reason="ok")  # noqa: E731
+    wd, s = _settled_streamer(
+        tmp_path,
+        backend,
+        chunk_bytes=10 * MB,
+        retrievability_proven=True,
+        owner_surfaced=True,
+        prover=prover,
+    )
+    now = 5000.0
+    p, _ = _drop(wd, "game.iso", 2 * MB, now)
+    s.stream_once(now=now)
+    rep = s.stream_once(now=now + 301)
+    assert rep.files_cleared == 1 and not os.path.exists(p)
