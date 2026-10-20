@@ -178,6 +178,17 @@ USAGE_CEILING = 75.0          # target: stay under this %
 HARD_CEILING = 88.0           # never reach this
 INFLIGHT_MTIME_SECS = 300     # files modified within this window = in-flight
 
+# THE single chunk-size standard for every CloudDog chunking path
+# (owner decision 2026-10-19: "100MB is THE single standard for store()
+# and mirror everywhere — keep behind config, revisit if evidence
+# changes"). 100 MiB. cloud_dog.py cannot import the src/ engine tree
+# directly (the sibling root-level `clouddog/` package shadows it), so
+# this constant MIRRORS src/clouddog/stores/base.py::CHUNK_BYTES and a
+# unit test asserts they stay equal. To change the standard, change it
+# in BOTH places (they must remain one value); the --part-mb flag below
+# defaults from this constant.
+PART_BYTES = 100 * 1024 * 1024
+
 # Directories/files that are ALWAYS sacred — never scanned for reaping,
 # never deleted, never descended into for candidate discovery.
 SACRED_PATHS = [
@@ -2958,10 +2969,11 @@ def main(argv=None):
     p.add_argument("--title", default="", help="kaggle: dataset title")
     p.add_argument("--file", default="",
                    help="only mirror torrent files whose name contains this")
-    p.add_argument("--part-mb", type=int, default=100,
-                   help="rolling part size in MB (TorBox mode never holds "
-                        "more than one part; --direct holds the full "
-                        "download too)")
+    p.add_argument("--part-mb", type=int, default=PART_BYTES // (1024 * 1024),
+                   help="rolling part size in MB (default = the single "
+                        "100MB chunk standard, PART_BYTES; TorBox mode "
+                        "never holds more than one part; --direct holds "
+                        "the full download too)")
     p.add_argument("--poll-secs", type=int, default=60,
                    help="torbox completion poll interval")
 
