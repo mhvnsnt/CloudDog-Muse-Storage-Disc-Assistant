@@ -61,7 +61,7 @@ def make_gh_fake(
     preserves the old collision-path tests; set False for fresh-upload tests).
     """
     calls = []
-    state = {"api_calls": 0}
+    state = {"api_calls": 0, "uploaded": []}
 
     def fake(args, **kwargs):
         calls.append(list(args))
@@ -80,6 +80,13 @@ def make_gh_fake(
             if sub == "create":
                 return subprocess.CompletedProcess(args, 0, "{}", "")
             if sub == "upload":
+                # Model the real API: a successful upload makes the asset
+                # visible in subsequent `gh api releases` listings.
+                argv = list(args)
+                parts = argv[6:-1] if argv[-1] == "--clobber" else argv[6:]
+                for p in parts:
+                    if not p.startswith("-"):
+                        state["uploaded"].append(os.path.basename(p))
                 return subprocess.CompletedProcess(args, 0, "", "")
             if sub == "download":
                 argv = list(args)
@@ -95,6 +102,7 @@ def make_gh_fake(
                 return subprocess.CompletedProcess(args, 1, "", "HTTP 503: Service Unavailable")
             size = len(FILE_BYTES) if asset_size is None else asset_size
             assets = [{"name": FILE_NAME, "size": size}] if asset_exists else []
+            assets += [{"name": n, "size": size} for n in state["uploaded"]]
             releases = [
                 {
                     "tag_name": TAG,
@@ -512,3 +520,78 @@ def test_storedref_round_trip():
         extra={"parts": 2, "asset_names": ["a.part-aa", "a.part-ab"]},
     )
     assert StoredRef.from_dict(ref.to_dict()) == ref
+
+
+def test_github_store_resolves_dotfile_rename(monkeypatch, tmp_path):
+    """gh renames dotfile uploads (``default.<name>``); store() must
+    resolve the real asset name and verify under it, not the pre-upload
+    name. Regression: verify() used to fail with 'no assets match'."""
+    name = ".dot-probe.txt"
+    path = tmp_path / name
+    path.write_bytes(FILE_BYTES)
+    renamed = f"default.{name}"
+
+    def fake(args, **kwargs):
+        cmd = args[1]
+        if cmd == "auth":
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if cmd == "release":
+            sub = args[2]
+            if sub == "view":
+                return subprocess.CompletedProcess(args, 1, "", "release not found")
+            if sub == "create":
+                return subprocess.CompletedProcess(args, 0, "{}", "")
+            if sub == "upload":
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if sub == "download":
+                argv = list(args)
+                aname = argv[argv.index("-p") + 1]
+                dest = argv[argv.index("-D") + 1]
+                assert aname == renamed, (
+                    f"verify must download the resolved name, got {aname!r}"
+                )
+                with open(os.path.join(dest, aname), "wb") as fh:
+                    fh.write(FILE_BYTES)
+                return subprocess.CompletedProcess(args, 0, "", "")
+        if cmd == "api":
+            releases = [
+                {"tag_name": TAG, "assets": [{"name": renamed, "size": len(FILE_BYTES)}]}
+            ]
+            return subprocess.CompletedProcess(args, 0, json.dumps(releases), "")
+        return subprocess.CompletedProcess(args, 1, "", f"unexpected: {args}")
+
+    monkeypatch.setattr(subprocess, "run", fake)
+    backend = GitHubReleaseBackend()
+    ref = backend.store(str(path), f"{REPO}@{TAG}", dry_run=False)
+    assert ref.extra["asset_names"] == [renamed]
+    assert backend.verify(str(path), ref) is True
+
+
+def test_github_resolve_asset_name_exact_and_ambiguous(monkeypatch):
+    """_resolve_asset_name prefers exact, then default.-prefixed, then a
+    unique suffix; raises when the name cannot be pinned down."""
+    backend = GitHubReleaseBackend()
+
+    def fake_api(names):
+        def fake(args, **kwargs):
+            releases = [
+                {
+                    "tag_name": TAG,
+                    "assets": [{"name": n, "size": 1} for n in names],
+                }
+            ]
+            return subprocess.CompletedProcess(args, 0, json.dumps(releases), "")
+
+        return fake
+
+    monkeypatch.setattr(subprocess, "run", fake_api(["a.bin", "default.b.bin"]))
+    assert backend._resolve_asset_name(REPO, TAG, "a.bin") == "a.bin"
+    assert backend._resolve_asset_name(REPO, TAG, "b.bin") == "default.b.bin"
+
+    monkeypatch.setattr(subprocess, "run", fake_api(["x-a.bin", "y-a.bin"]))
+    with pytest.raises(CloudDogError):
+        backend._resolve_asset_name(REPO, TAG, "a.bin")
+
+    monkeypatch.setattr(subprocess, "run", fake_api([]))
+    with pytest.raises(CloudDogError):
+        backend._resolve_asset_name(REPO, TAG, "missing.bin")

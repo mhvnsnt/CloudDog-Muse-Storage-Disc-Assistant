@@ -175,6 +175,13 @@ class GitHubReleaseBackend(StoreBackend):
 
     def _asset_size(self, repo: str, tag: str, asset_name: str) -> int | None:
         """Return the size recorded by the release API for an asset, or None."""
+        for asset in self._list_assets(repo, tag):
+            if asset.get("name") == asset_name:
+                return int(asset.get("size", -1))
+        return None
+
+    def _list_assets(self, repo: str, tag: str) -> list[dict]:
+        """Raw asset dicts the release API reports for ``repo@tag``."""
         proc = self._run_gh(["api", f"repos/{repo}/releases"], timeout=120)
         try:
             releases = json.loads(proc.stdout or "[]")
@@ -183,12 +190,32 @@ class GitHubReleaseBackend(StoreBackend):
                 f"could not parse gh api releases output: {_truncate(str(exc))}"
             ) from exc
         for release in releases:
-            if release.get("tag_name") != tag:
-                continue
-            for asset in release.get("assets", []):
-                if asset.get("name") == asset_name:
-                    return int(asset.get("size", -1))
-        return None
+            if release.get("tag_name") == tag:
+                return list(release.get("assets", []))
+        return []
+
+    def _resolve_asset_name(self, repo: str, tag: str, base: str) -> str:
+        """The asset's ACTUAL name on the release after an upload.
+
+        ``gh release upload`` renames some files (dotfiles gain a
+        ``default.`` prefix). Verifying under the pre-upload name would
+        look for an asset that does not exist, so resolve the real name:
+        exact match first, then the known ``default.`` form, then a
+        unique suffix match. Raises when it cannot be pinned down.
+        """
+        names = [str(a.get("name", "")) for a in self._list_assets(repo, tag)]
+        if base in names:
+            return base
+        prefixed = f"default.{base}"
+        if prefixed in names:
+            return prefixed
+        suffix = [n for n in names if n.endswith(base)]
+        if len(suffix) == 1:
+            return suffix[0]
+        raise CloudDogError(
+            f"could not resolve uploaded asset {base!r} on {repo}@{tag}: "
+            f"release assets are {names}"
+        )
 
     def _download_asset(self, repo: str, tag: str, asset_name: str, destdir: str) -> str:
         """Download one asset into destdir. Returns the local path."""
@@ -309,6 +336,10 @@ class GitHubReleaseBackend(StoreBackend):
                     ["release", "upload", "--repo", repo, tag, *parts, "--clobber"],
                     timeout=7200,
                 )
+                # gh may rename uploads (dotfiles); resolve actual names.
+                asset_names = [
+                    self._resolve_asset_name(repo, tag, n) for n in asset_names
+                ]
                 # Verify while the temp parts still exist.
                 self._verify_assets(repo, tag, asset_names, sha256)
             locator = f"{repo}@{tag}/{base}"
@@ -317,16 +348,21 @@ class GitHubReleaseBackend(StoreBackend):
             asset_names = [base]
             # L5: never silently clobber a same-named asset from another
             # lane/file. If it exists and is byte-identical, reuse it;
-            # if it differs, refuse.
+            # if it differs, refuse. (Check the gh-renamed form too.)
             existing = self._asset_size(repo, tag, base)
+            existing_name = base
+            if existing is None:
+                existing = self._asset_size(repo, tag, f"default.{base}")
+                if existing is not None:
+                    existing_name = f"default.{base}"
             if existing is not None:
                 if existing == size and self._remote_sha_matches(
-                        repo, tag, base, sha256):
+                        repo, tag, existing_name, sha256):
                     locator = f"{repo}@{tag}/{base}"
                     return StoredRef(
                         backend=self.name, locator=locator, size=size,
                         sha256=sha256,
-                        extra={"parts": 1, "asset_names": asset_names,
+                        extra={"parts": 1, "asset_names": [existing_name],
                                "reused": True},
                     )
                 raise CloudDogError(
@@ -336,6 +372,9 @@ class GitHubReleaseBackend(StoreBackend):
                 ["release", "upload", "--repo", repo, tag, local_path, "--clobber"],
                 timeout=7200,
             )
+            # gh may rename the upload (dotfiles gain a 'default.' prefix);
+            # verify under the actual asset name, not the pre-upload name.
+            asset_names = [self._resolve_asset_name(repo, tag, base)]
             self._verify_assets(repo, tag, asset_names, sha256)
             locator = f"{repo}@{tag}/{base}"
             extra = {"parts": 1, "asset_names": asset_names}
