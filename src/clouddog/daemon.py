@@ -14,6 +14,7 @@ Iron rules enforced here, defense in depth:
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import time
@@ -138,6 +139,7 @@ class Daemon:
         self.disk_path = disk_path
         self.dry_run = dry_run
         self.pidfile = pidfile or os.path.expanduser("~/.clouddog/daemon.pid")
+        self.heartbeat_path = os.path.expanduser("~/.clouddog/heartbeat.json")
 
     # ------------------------------------------------------------ internals
 
@@ -428,7 +430,38 @@ class Daemon:
             causes.append("backend error on a >1GB file")
         report.critical = bool(causes)
         report.critical_msg = "; ".join(causes)
+        self._write_heartbeat(report)
         return report
+
+    def _write_heartbeat(self, report: TickReport) -> None:
+        """Best-effort liveness record after every tick (supervisor reads
+        this; a stale heartbeat means the daemon is wedged or dead).
+        Heartbeat failures must never break a tick."""
+        try:
+            os.makedirs(os.path.dirname(self.heartbeat_path), exist_ok=True)
+            payload = {
+                "ts_utc": self._utcnow(),
+                "pid": os.getpid(),
+                "roots": list(self.roots),
+                "interval_s": self.interval_s,
+                "dry_run": self.dry_run,
+                "disk_before_pct": report.disk_before_pct,
+                "disk_after_pct": report.disk_after_pct,
+                "stored": report.stored,
+                "verified": report.verified,
+                "cleared": report.cleared,
+                "freed_bytes": report.freed_bytes,
+                "skipped_sacred": report.skipped_sacred,
+                "errors": len(report.errors),
+                "critical": report.critical,
+                "critical_msg": report.critical_msg,
+            }
+            tmp = self.heartbeat_path + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(payload, fh, indent=2)
+            os.replace(tmp, self.heartbeat_path)
+        except OSError:
+            pass
 
     def run_forever(self) -> None:
         """Loop tick() every interval_s. Prints only when critical or on error."""

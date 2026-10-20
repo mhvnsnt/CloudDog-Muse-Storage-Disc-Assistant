@@ -378,3 +378,35 @@ def test_tick_report_field_order_and_defaults():
     )
     assert r.critical_msg == ""
     assert r.errors == []
+
+
+def test_tick_writes_heartbeat_json(tmp_path, monkeypatch):
+    import json
+
+    _low_disk(monkeypatch)
+    daemon, _backend, _journal = _make_daemon(tmp_path, monkeypatch, [])
+    hb = tmp_path / "heartbeat.json"
+    daemon.heartbeat_path = str(hb)
+
+    report = daemon.tick()
+
+    assert hb.exists(), "tick() must write a heartbeat file"
+    payload = json.loads(hb.read_text())
+    assert payload["pid"] == os.getpid()
+    assert payload["roots"] == [str(tmp_path)]
+    assert payload["disk_before_pct"] == pytest.approx(report.disk_before_pct)
+    assert payload["disk_after_pct"] == pytest.approx(report.disk_after_pct)
+    assert payload["stored"] == 0
+    assert payload["cleared"] == 0
+    assert payload["critical"] is False
+    assert "ts_utc" in payload
+
+
+def test_heartbeat_failure_never_breaks_tick(tmp_path, monkeypatch):
+    _low_disk(monkeypatch)
+    daemon, _backend, _journal = _make_daemon(tmp_path, monkeypatch, [])
+    daemon.heartbeat_path = "/proc/definitely-not-here/heartbeat.json"
+
+    report = daemon.tick()  # must not raise
+
+    assert isinstance(report, TickReport)
