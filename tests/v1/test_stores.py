@@ -591,3 +591,17 @@ def test_github_resolve_asset_name_exact_and_ambiguous(monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake_api([]))
     with pytest.raises(CloudDogError):
         backend._resolve_asset_name(REPO, TAG, "missing.bin")
+
+
+def test_github_scratch_tmpdir_avoids_tmpfs(monkeypatch, tmp_path):
+    """Release download/verify scratch must NOT live on /tmp (a 512MB
+    tmpfs): a full /tmp made verify fail with 'no space left on device'
+    while the disk itself had gigabytes free."""
+    from clouddog.stores import github as gh_mod
+
+    fake_home = tmp_path / "home"
+    monkeypatch.setattr(os.path, "expanduser", lambda p: str(fake_home) + p[1:])
+    with gh_mod._scratch_tmpdir("probe-") as d:
+        real = os.path.realpath(d)
+        assert real.startswith(os.path.realpath(str(fake_home)) + os.sep), real
+        assert not real.startswith("/tmp" + os.sep), real

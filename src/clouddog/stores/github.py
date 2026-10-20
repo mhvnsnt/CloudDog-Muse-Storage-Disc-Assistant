@@ -13,6 +13,7 @@ and nothing is deleted (this backend never deletes local files anyway).
 
 remote_ref format: ``owner/repo@tag`` (asset name defaults to basename).
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -68,6 +69,15 @@ def _sha256_of(path: str) -> str:
     return digest.hexdigest()
 
 
+def _scratch_tmpdir(prefix: str) -> tempfile.TemporaryDirectory:
+    """Scratch space for release downloads/verify. NEVER /tmp: it is a
+    512MB tmpfs that fills independently of the disk, which made verify
+    downloads fail with 'no space left on device' mid-tick."""
+    base = os.path.join(os.path.expanduser("~/.clouddog"), "tmp")
+    os.makedirs(base, exist_ok=True)
+    return tempfile.TemporaryDirectory(prefix=prefix, dir=base)
+
+
 class GitHubReleaseBackend(StoreBackend):
     """Store backend backed by GitHub release assets via the ``gh`` CLI."""
 
@@ -80,9 +90,7 @@ class GitHubReleaseBackend(StoreBackend):
         """Split ``owner/repo@tag``. Raises CloudDogError on bad format."""
         m = _REF_RE.match((remote_ref or "").strip())
         if not m:
-            raise CloudDogError(
-                f"github remote_ref must be 'owner/repo@tag', got {remote_ref!r}"
-            )
+            raise CloudDogError(f"github remote_ref must be 'owner/repo@tag', got {remote_ref!r}")
         return m.group("repo"), m.group("tag")
 
     def _run_gh(self, args: list[str], timeout: int = 300) -> subprocess.CompletedProcess:
@@ -117,9 +125,7 @@ class GitHubReleaseBackend(StoreBackend):
             err = (proc.stderr or "").lower()
             transient = any(hint in err for hint in _TRANSIENT_HINTS)
             if not transient or attempt == _MAX_RETRIES - 1:
-                raise CloudDogError(
-                    f"gh {' '.join(args[:2])} failed: {_truncate(proc.stderr)}"
-                )
+                raise CloudDogError(f"gh {' '.join(args[:2])} failed: {_truncate(proc.stderr)}")
             time.sleep(_RETRY_BACKOFF_S * (attempt + 1))
         # Unreachable, but keeps the type checker honest.
         assert last is not None
@@ -148,9 +154,7 @@ class GitHubReleaseBackend(StoreBackend):
                 ]
             )
         except CloudDogError as exc:
-            raise CloudDogError(
-                f"could not ensure release {repo}@{tag}: {exc}"
-            ) from exc
+            raise CloudDogError(f"could not ensure release {repo}@{tag}: {exc}") from exc
 
     def _split(self, local_path: str, tmpdir: str) -> list[str]:
         """Split into <=2 GiB pieces named ``<base>.part-aa`` …. Returns paths."""
@@ -165,9 +169,7 @@ class GitHubReleaseBackend(StoreBackend):
         if proc.returncode != 0:
             raise CloudDogError(f"split failed: {_truncate(proc.stderr)}")
         parts = sorted(
-            os.path.join(tmpdir, p)
-            for p in os.listdir(tmpdir)
-            if p.startswith(base + ".part-")
+            os.path.join(tmpdir, p) for p in os.listdir(tmpdir) if p.startswith(base + ".part-")
         )
         if not parts:
             raise CloudDogError("split produced no parts")
@@ -213,8 +215,7 @@ class GitHubReleaseBackend(StoreBackend):
         if len(suffix) == 1:
             return suffix[0]
         raise CloudDogError(
-            f"could not resolve uploaded asset {base!r} on {repo}@{tag}: "
-            f"release assets are {names}"
+            f"could not resolve uploaded asset {base!r} on {repo}@{tag}: release assets are {names}"
         )
 
     def _download_asset(self, repo: str, tag: str, asset_name: str, destdir: str) -> str:
@@ -235,16 +236,14 @@ class GitHubReleaseBackend(StoreBackend):
         )
         path = os.path.join(destdir, asset_name)
         if not os.path.isfile(path):
-            raise CloudDogError(
-                f"gh downloaded asset {asset_name} but it is missing on disk"
-            )
+            raise CloudDogError(f"gh downloaded asset {asset_name} but it is missing on disk")
         return path
 
     def _remote_sha_matches(
         self, repo: str, tag: str, asset_name: str, expected_sha256: str
     ) -> bool:
         """True iff the existing remote asset downloads sha256-identical."""
-        with tempfile.TemporaryDirectory(prefix="clouddog-gh-reuse-") as tmpdir:
+        with _scratch_tmpdir("clouddog-gh-reuse-") as tmpdir:
             path = self._download_asset(repo, tag, asset_name, tmpdir)
             digest = hashlib.sha256()
             with open(path, "rb") as fh:
@@ -260,7 +259,7 @@ class GitHubReleaseBackend(StoreBackend):
         For multi-asset (split) uploads the parts are concatenated in sorted
         order before hashing.
         """
-        with tempfile.TemporaryDirectory(prefix="clouddog-gh-verify-") as tmpdir:
+        with _scratch_tmpdir("clouddog-gh-verify-") as tmpdir:
             downloaded: list[str] = []
             for asset_name in asset_names:
                 recorded = self._asset_size(repo, tag, asset_name)
@@ -299,13 +298,9 @@ class GitHubReleaseBackend(StoreBackend):
             return HealthStatus(Health.DOWN, "gh auth status timed out")
         if proc.returncode == 0:
             return HealthStatus(Health.LIVE)
-        return HealthStatus(
-            Health.DOWN, f"gh not authenticated: {_truncate(proc.stderr)}"
-        )
+        return HealthStatus(Health.DOWN, f"gh not authenticated: {_truncate(proc.stderr)}")
 
-    def store(
-        self, local_path: str, remote_ref: str, dry_run: bool = False
-    ) -> StoredRef:
+    def store(self, local_path: str, remote_ref: str, dry_run: bool = False) -> StoredRef:
         repo, tag = self._parse_ref(remote_ref)
         if not os.path.isfile(local_path):
             raise CloudDogError(f"local file not found: {local_path}")
@@ -329,7 +324,7 @@ class GitHubReleaseBackend(StoreBackend):
         self._ensure_release(repo, tag)
 
         if size > MAX_ASSET_BYTES:
-            with tempfile.TemporaryDirectory(prefix="clouddog-gh-split-") as tmpdir:
+            with _scratch_tmpdir("clouddog-gh-split-") as tmpdir:
                 parts = self._split(local_path, tmpdir)
                 asset_names = [os.path.basename(p) for p in parts]
                 self._run_gh(
@@ -337,9 +332,7 @@ class GitHubReleaseBackend(StoreBackend):
                     timeout=7200,
                 )
                 # gh may rename uploads (dotfiles); resolve actual names.
-                asset_names = [
-                    self._resolve_asset_name(repo, tag, n) for n in asset_names
-                ]
+                asset_names = [self._resolve_asset_name(repo, tag, n) for n in asset_names]
                 # Verify while the temp parts still exist.
                 self._verify_assets(repo, tag, asset_names, sha256)
             locator = f"{repo}@{tag}/{base}"
@@ -356,18 +349,19 @@ class GitHubReleaseBackend(StoreBackend):
                 if existing is not None:
                     existing_name = f"default.{base}"
             if existing is not None:
-                if existing == size and self._remote_sha_matches(
-                        repo, tag, existing_name, sha256):
+                if existing == size and self._remote_sha_matches(repo, tag, existing_name, sha256):
                     locator = f"{repo}@{tag}/{base}"
                     return StoredRef(
-                        backend=self.name, locator=locator, size=size,
+                        backend=self.name,
+                        locator=locator,
+                        size=size,
                         sha256=sha256,
-                        extra={"parts": 1, "asset_names": [existing_name],
-                               "reused": True},
+                        extra={"parts": 1, "asset_names": [existing_name], "reused": True},
                     )
                 raise CloudDogError(
                     f"asset {base!r} already exists on {repo}@{tag} with "
-                    f"different content; refusing to clobber")
+                    f"different content; refusing to clobber"
+                )
             self._run_gh(
                 ["release", "upload", "--repo", repo, tag, local_path, "--clobber"],
                 timeout=7200,
@@ -399,9 +393,7 @@ class GitHubReleaseBackend(StoreBackend):
             repo, tag = self._parse_ref(head)
         except CloudDogError as exc:
             raise CloudDogError(f"cannot parse stored locator {stored.locator!r}: {exc}") from exc
-        asset_names = stored.extra.get("asset_names") or [
-            stored.locator.rpartition("/")[2]
-        ]
+        asset_names = stored.extra.get("asset_names") or [stored.locator.rpartition("/")[2]]
         try:
             self._verify_assets(repo, tag, asset_names, _sha256_of(local_path))
         except VerificationFailed:
