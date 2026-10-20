@@ -259,19 +259,22 @@ def test_terabox_list_parses_ls_output():
 
 
 def test_verify_terabox_entry_size_mismatch():
+    # Owner decision 2026-10-19: name+size is REMOVED as a verification
+    # basis. Even a perfectly matching live listing must NOT pass —
+    # verification fails closed because no byte-level re-download exists.
     def fake_list(remote_dir):
         return True, [{"isdir": False, "size": 100, "name": "f.bin"}]
     old = _patch(cloud_dog, "terabox_list", fake_list)
     try:
         ok, detail = cloud_dog.verify_terabox_entry(
             {"remote_dir": "/d", "asset": "f.bin", "size": 999}, "/tmp/f.bin")
-        assert ok is False and "size mismatch" in detail
+        assert ok is False and "fail closed" in detail
         ok, detail = cloud_dog.verify_terabox_entry(
             {"remote_dir": "/d", "asset": "f.bin", "size": 100}, "/tmp/f.bin")
-        assert ok is True and "verified" in detail
+        assert ok is False and "fail closed" in detail
         ok, detail = cloud_dog.verify_terabox_entry(
             {"remote_dir": "/d", "asset": "missing.bin"}, "/tmp/f.bin")
-        assert ok is False and "not found" in detail
+        assert ok is False and "fail closed" in detail
     finally:
         _patch(cloud_dog, "terabox_list", old)
 
@@ -314,6 +317,10 @@ def test_kaggle_request_sends_basic_auth():
 
 
 def test_verify_kaggle_entry_found_and_sized():
+    # Owner decision 2026-10-19: the dataset file list (name+size) is
+    # metadata, not proof. Even a perfectly matching listing must NOT
+    # pass — verification fails closed until byte-level re-download is
+    # wired for kaggle.
     def fake_list(owner_slug):
         return True, {"datasetFiles": [
             {"name": "a.bin", "totalBytes": 500},
@@ -322,27 +329,28 @@ def test_verify_kaggle_entry_found_and_sized():
     try:
         e = {"dataset": "u/ds", "asset": "a.bin", "size": 500}
         ok, detail = cloud_dog.verify_kaggle_entry(e, "/tmp/a.bin")
-        assert ok is True and "verified" in detail
+        assert ok is False and "fail closed" in detail
         e2 = {"dataset": "u/ds", "asset": "a.bin", "size": 501}
-        ok, _ = cloud_dog.verify_kaggle_entry(e2, "/tmp/a.bin")
-        assert ok is False
+        ok, detail = cloud_dog.verify_kaggle_entry(e2, "/tmp/a.bin")
+        assert ok is False and "fail closed" in detail
         e3 = {"dataset": "u/ds", "asset": "nope.bin"}
         ok, detail = cloud_dog.verify_kaggle_entry(e3, "/tmp/a.bin")
-        assert ok is False and "not found" in detail
+        assert ok is False and "fail closed" in detail
     finally:
         _patch(cloud_dog, "kaggle_dataset_list_files", old)
 
 
 def test_verify_kaggle_entry_live_readonly():
-    """Live read-only check against a real dataset (no writes)."""
+    """Live-shape check: with the decision in force, even a real dataset
+    entry cannot pass without a byte-level re-download (fail closed)."""
     e = {"dataset": "marsfmmg/cj-living-room-setup",
          "asset": "dvd_stack_ref.png", "size": 4848}
     ok, detail = cloud_dog.verify_kaggle_entry(e, "/tmp/dvd_stack_ref.png")
-    assert ok is True and "verified" in detail, detail
+    assert ok is False and "fail closed" in detail, detail
     e2 = {"dataset": "marsfmmg/cj-living-room-setup",
           "asset": "does-not-exist.bin"}
     ok, detail = cloud_dog.verify_kaggle_entry(e2, "/tmp/x.bin")
-    assert ok is False and "not found" in detail
+    assert ok is False and "fail closed" in detail
 
 
 def test_kaggle_dataset_upload_new_no_cli():
@@ -1134,8 +1142,11 @@ def test_restic_backup_and_verify_roundtrip():
         assert len(snap) == 64, f"snapshot id should be 64 hex chars: {snap}"
         entry = {"restic_repo": repo, "snapshot_id": snap,
                  "local_path": f1}
+        # Backup + snapshot are real, but verify FAILS CLOSED since the
+        # owner decision (2026-10-19): a snapshot listing is metadata,
+        # not a byte-level re-download proof.
         ok, detail = cloud_dog.restic_verify(entry, f1)
-        assert ok, f"verify failed: {detail}"
+        assert not ok and "fail closed" in detail
     finally:
         _restic_restore_env(old_pw)
         shutil.rmtree(d, ignore_errors=True)
@@ -1157,7 +1168,7 @@ def test_restic_verify_missing_snapshot_fails():
                  "local_path": f1}
         ok, detail = cloud_dog.restic_verify(entry, f1)
         assert not ok
-        assert "not found" in detail
+        assert "fail closed" in detail
     finally:
         _restic_restore_env(old_pw)
         shutil.rmtree(d, ignore_errors=True)
@@ -1178,7 +1189,7 @@ def test_restic_verify_wrong_path_fails():
                  "local_path": f1}
         ok, detail = cloud_dog.restic_verify(entry, "/nope/other.txt")
         assert not ok
-        assert "does not contain" in detail
+        assert "fail closed" in detail
     finally:
         _restic_restore_env(old_pw)
         shutil.rmtree(d, ignore_errors=True)
@@ -1202,7 +1213,7 @@ def test_restic_verify_needs_password():
         ok, detail = cloud_dog.restic_verify(
             {"restic_repo": "/tmp/r", "snapshot_id": "a" * 64}, "/tmp/x")
         assert not ok
-        assert "RESTIC_PASSWORD" in detail
+        assert "fail closed" in detail
     finally:
         _restic_restore_env(old_pw)
 
@@ -1247,9 +1258,10 @@ def test_register_restic_records_snapshot():
         assert entry["store"] == "restic"
         assert entry["restic_repo"] == repo
         assert len(entry["snapshot_id"]) == 64
-        # and the recorded snapshot verifies live
+        # and the recorded snapshot fails closed on verify (metadata,
+        # not a byte-level proof, per owner decision 2026-10-19)
         ok, detail = cloud_dog.restic_verify(entry, os.path.abspath(f1))
-        assert ok, detail
+        assert not ok and "fail closed" in detail
     finally:
         cloud_dog.AUDIT_PATH = old_audit
         _restic_restore_env(old_pw)
@@ -1794,7 +1806,7 @@ def test_b2_verify_needs_credentials():
         entry = {"store": "b2", "b2_bucket": "b", "b2_path": "p", "size": 100}
         ok, err = cloud_dog.b2_verify(entry)
         assert not ok
-        assert "B2_ACCOUNT_ID" in err
+        assert "fail closed" in err
     finally:
         if old_id:
             os.environ["B2_ACCOUNT_ID"] = old_id
@@ -1810,7 +1822,7 @@ def test_b2_verify_needs_bucket_and_path():
         entry = {"store": "b2", "size": 100}  # no bucket/path
         ok, err = cloud_dog.b2_verify(entry)
         assert not ok
-        assert "b2_bucket" in err
+        assert "fail closed" in err
     finally:
         del os.environ["B2_ACCOUNT_ID"]
         del os.environ["B2_ACCOUNT_KEY"]
@@ -1830,6 +1842,54 @@ def test_verify_entry_dispatches_b2():
             os.environ["B2_ACCOUNT_ID"] = old_id
         if old_key:
             os.environ["B2_ACCOUNT_KEY"] = old_key
+
+
+# ------------------------------------------------ owner decisions 2026-10-19
+
+def test_part_bytes_is_the_100mb_standard():
+    assert cloud_dog.PART_BYTES == 100 * 1024 * 1024
+
+
+class _FakeVerifyProof:
+    def __init__(self, proven, reason="", bytes_fetched=0):
+        self.proven = proven
+        self.reason = reason
+        self.bytes_fetched = bytes_fetched
+
+
+def test_verify_github_asset_full_redownload_proven():
+    # verify_github_asset must go through the pull-back prover and pass
+    # ONLY when the re-downloaded bytes hash-match.
+    old = _patch(cloud_dog, "_run_retrievability_proof",
+                 lambda entry: _FakeVerifyProof(True, "ok", bytes_fetched=123))
+    try:
+        ok, detail = cloud_dog.verify_github_asset(
+            "o/r", "tag", "a.bin", 123, "ab" * 32)
+        assert ok is True and "full re-download" in detail
+    finally:
+        _patch(cloud_dog, "_run_retrievability_proof", old)
+
+
+def test_verify_github_asset_hash_mismatch_fails():
+    old = _patch(cloud_dog, "_run_retrievability_proof",
+                 lambda entry: _FakeVerifyProof(
+                     False, "sha256 mismatch after pull-back"))
+    try:
+        ok, detail = cloud_dog.verify_github_asset(
+            "o/r", "tag", "a.bin", 123, "ab" * 32)
+        assert ok is False and "sha256 mismatch" in detail
+    finally:
+        _patch(cloud_dog, "_run_retrievability_proof", old)
+
+
+def test_verify_github_asset_prover_unavailable_fails_closed():
+    old = _patch(cloud_dog, "_run_retrievability_proof", lambda entry: None)
+    try:
+        ok, detail = cloud_dog.verify_github_asset(
+            "o/r", "tag", "a.bin", 123, "ab" * 32)
+        assert ok is False and "fail closed" in detail
+    finally:
+        _patch(cloud_dog, "_run_retrievability_proof", old)
 
 
 def _claims_test_env(tmp):

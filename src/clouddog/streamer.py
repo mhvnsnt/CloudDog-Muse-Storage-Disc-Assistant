@@ -45,14 +45,19 @@ from datetime import datetime, timezone
 
 from clouddog import policy
 from clouddog.errors import CloudDogError
+from clouddog.stores.base import CHUNK_BYTES
 
 #: Local checkpoint manifest (inside the watch dir). SACRED: the resume
 #: record and the only source for the final published manifest asset.
 #: Never deleted by the streamer or the reaper.
 MANIFEST_NAME = ".clouddog-stream-manifest.json"
 
-#: 100 MB — proxy-survivable chunk size (threshold research, 2026-10-17).
-DEFAULT_CHUNK_BYTES = 100 * 1024 * 1024
+#: THE single chunk standard (owner decision 2026-10-19: 100MB for
+#: store() and mirror everywhere) — an alias of
+#: ``clouddog.stores.base.CHUNK_BYTES``. The value matches the size the
+#: threshold research found survives the egress proxy (485 MB+ parts
+#: fail; 100 MB works). Change it in stores/base.py, never here.
+DEFAULT_CHUNK_BYTES = CHUNK_BYTES
 
 #: Settle window before a landed file counts as complete (seconds).
 #: Matches the policy engine's five-minute sacred window by default.

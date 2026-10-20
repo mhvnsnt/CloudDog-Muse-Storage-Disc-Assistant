@@ -15,6 +15,19 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 
+#: THE single chunk-size standard for every CloudDog chunking path
+#: (owner decision 2026-10-19: "100MB is THE single standard for store()
+#: and mirror everywhere — keep behind config, revisit if evidence
+#: changes"). 100 MiB. Every backend split, the mirror part stream, and
+#: the straight-to-store streamer MUST read this constant — never a
+#: hardcoded local size. To change the standard, change it HERE only.
+#:
+#: NOTE for the straight-to-store streamer lane: when streamer.py lands
+#: on main, its part size must be ``CHUNK_BYTES`` from this module (the
+#: v1 mirror in cloud_dog.py already derives its --part-mb default from
+#: the mirrored PART_BYTES constant there).
+CHUNK_BYTES = 100 * 1024 * 1024
+
 
 class Health(Enum):
     LIVE = "live"

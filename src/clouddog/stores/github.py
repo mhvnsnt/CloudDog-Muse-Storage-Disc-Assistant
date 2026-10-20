@@ -1,9 +1,13 @@
 """GitHub Releases store backend.
 
 Uploads via the ``gh`` CLI only (no ``requests``, no API tokens in-process).
-GitHub release assets cap at 2 GB, so files larger than that are split with
-``split -b 2000000000`` into ``<base>.part-aa`` … pieces, each uploaded as its
-own asset and re-concatenated during verification.
+Files larger than the single chunk standard (``CHUNK_BYTES`` = 100 MiB,
+owner decision 2026-10-19) are split with ``split -b <CHUNK_BYTES>`` into
+``<base>.part-aa`` … pieces, each uploaded as its own asset and
+re-concatenated during verification. (GitHub's own asset ceiling is
+2 GB — see MAX_ASSET_BYTES — but chunking never goes near it: transfers
+through this fleet's proxy die well below that, which is why the
+standard is 100 MiB.)
 
 Verification is byte-exact: after upload the backend re-downloads every
 asset with ``gh release download`` and sha256-compares against the local
@@ -24,15 +28,24 @@ import subprocess
 import sys
 import tempfile
 
-from .base import Health, HealthStatus, StoreBackend, StoredRef
+from .base import CHUNK_BYTES, Health, HealthStatus, StoreBackend, StoredRef
 from ..errors import CloudDogError, StoreDegraded, VerificationFailed
 from ..net import proxy_endpoint, proxy_env
 from ..retry import TransientError, classify_error, with_backoff
 
-#: GitHub release asset size ceiling (2 GiB).
+#: GitHub release asset size ceiling (2 GB) — a platform limit, NOT a
+#: chunking choice. No single asset may exceed it; CHUNK_BYTES (100 MiB)
+#: keeps every part far below it.
 MAX_ASSET_BYTES = 2_000_000_000
-#: Size of each piece when a file must be split for the 2 GiB asset cap.
-SPLIT_BYTES = 2_000_000_000
+#: Size of each piece when a file is split for upload. THE single chunk
+#: standard (owner decision 2026-10-19) — an alias of
+#: ``clouddog.stores.base.CHUNK_BYTES``; change it there, never here.
+SPLIT_BYTES = CHUNK_BYTES
+
+# Sanity: the chunk standard must never exceed GitHub's asset ceiling.
+assert 0 < SPLIT_BYTES <= MAX_ASSET_BYTES, (
+    f"CHUNK_BYTES ({SPLIT_BYTES}) exceeds GitHub asset ceiling ({MAX_ASSET_BYTES})"
+)
 
 _MAX_ERR_LEN = 500
 
@@ -180,7 +193,7 @@ class GitHubReleaseBackend(StoreBackend):
             raise CloudDogError(f"could not ensure release {repo}@{tag}: {exc}") from exc
 
     def _split(self, local_path: str, tmpdir: str) -> list[str]:
-        """Split into <=2 GiB pieces named ``<base>.part-aa`` …. Returns paths."""
+        """Split into <=SPLIT_BYTES (100 MiB) pieces named ``<base>.part-aa`` …."""
         base = os.path.basename(local_path)
         prefix = os.path.join(tmpdir, base + ".part-")
         proc = subprocess.run(
@@ -347,7 +360,11 @@ class GitHubReleaseBackend(StoreBackend):
 
         self._ensure_release(repo, tag)
 
-        if size > MAX_ASSET_BYTES:
+        # Owner decision 2026-10-19: 100 MiB (CHUNK_BYTES) is THE single
+        # chunk standard for store() and mirror everywhere. Anything over
+        # it splits into 100 MiB parts — also the fix for >~485 MB uploads
+        # dying on this fleet's proxy.
+        if size > CHUNK_BYTES:
             with _scratch_tmpdir("clouddog-gh-split-") as tmpdir:
                 parts = self._split(local_path, tmpdir)
                 asset_names = [os.path.basename(p) for p in parts]

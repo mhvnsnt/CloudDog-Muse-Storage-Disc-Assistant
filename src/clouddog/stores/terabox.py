@@ -11,11 +11,14 @@ auth. Credential values are never printed, logged, or returned.
 Verification honesty note: ``tbupload.py`` itself verifies each upload
 with TeraBox's ``/api/list`` (name + byte size) after the create step.
 Its ``ls`` output likewise carries name and size only — the TeraBox web
-API path used here does not expose a remote sha256. This backend therefore
-verifies by remote name + byte size, and computes sha256 of the LOCAL file
-for the :class:`StoredRef` record (used for bookkeeping and for
-name+size-based re-verification). The ``extra`` field documents this
-explicitly so callers never mistake it for a remote-hash check.
+API path used here does not expose a remote sha256, and no byte-level
+download is wired. Owner decision 2026-10-19 (FULL RE-DOWNLOAD VERIFY,
+EVERY TIME): name+size is therefore REMOVED as a verification basis —
+:meth:`TeraBoxBackend.verify` fails closed with the exact reason. This
+backend still computes sha256 of the LOCAL file for the
+:class:`StoredRef` record (bookkeeping only), and ``store()`` keeps its
+post-upload name+size confirmation as an *upload* integrity check —
+never as proof of byte-identity.
 
 remote_ref format: ``/remote/dir`` (remote directory; asset name defaults
 to basename).
@@ -28,7 +31,7 @@ import subprocess
 import sys
 
 from .base import Health, HealthStatus, StoreBackend, StoredRef
-from ..errors import CloudDogError, StoreDegraded
+from ..errors import CloudDogError, StoreDegraded, VerificationFailed
 
 TB_UPLOADER = os.path.expanduser(
     "~/workspace/tools/terabox-uploader/tbupload.py"
@@ -184,22 +187,18 @@ class TeraBoxBackend(StoreBackend):
         )
 
     def verify(self, local_path: str, stored: StoredRef) -> bool:
-        """Re-verify name+size against the remote dir listing.
+        """FAIL CLOSED: TeraBox cannot byte-verify (owner decision 2026-10-19).
 
-        Returns False on mismatch; raises only on transport errors.
+        Verification must re-download the stored bytes and hash-check
+        them. No byte-level download is wired for TeraBox (tbupload.py
+        exposes name+size only), so this raises VerificationFailed with
+        the exact reason instead of ever passing on name+size. Callers
+        (daemon, reaper) treat a raise as verification failure and keep
+        the local file — never delete on this tier.
         """
-        if not os.path.isfile(local_path):
-            raise CloudDogError(f"local file not found: {local_path}")
-        locator = stored.locator
-        if locator.startswith("dry-run:"):
-            locator = locator[len("dry-run:") :]
-        remotedir, _, base = locator.rpartition("/")
-        if not remotedir.startswith("/") or not base:
-            raise CloudDogError(
-                f"cannot parse terabox stored locator {stored.locator!r}"
-            )
-        try:
-            entries = self._ls(remotedir)
-        except CloudDogError:
-            raise
-        return entries.get(base) == os.path.getsize(local_path)
+        raise VerificationFailed(
+            "terabox: no byte-level re-download API is wired (tbupload.py "
+            "exposes name+size only), so full re-download verification is "
+            "impossible; refusing to pass on name+size (fail closed, "
+            "owner decision 2026-10-19)"
+        )
