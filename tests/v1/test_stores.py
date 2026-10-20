@@ -547,16 +547,12 @@ def test_github_store_resolves_dotfile_rename(monkeypatch, tmp_path):
                 argv = list(args)
                 aname = argv[argv.index("-p") + 1]
                 dest = argv[argv.index("-D") + 1]
-                assert aname == renamed, (
-                    f"verify must download the resolved name, got {aname!r}"
-                )
+                assert aname == renamed, f"verify must download the resolved name, got {aname!r}"
                 with open(os.path.join(dest, aname), "wb") as fh:
                     fh.write(FILE_BYTES)
                 return subprocess.CompletedProcess(args, 0, "", "")
         if cmd == "api":
-            releases = [
-                {"tag_name": TAG, "assets": [{"name": renamed, "size": len(FILE_BYTES)}]}
-            ]
+            releases = [{"tag_name": TAG, "assets": [{"name": renamed, "size": len(FILE_BYTES)}]}]
             return subprocess.CompletedProcess(args, 0, json.dumps(releases), "")
         return subprocess.CompletedProcess(args, 1, "", f"unexpected: {args}")
 
