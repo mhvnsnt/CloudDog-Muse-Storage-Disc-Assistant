@@ -266,3 +266,122 @@ def test_sweep_returns_job_immediately(base_url):
 
     status, _ = get(base_url, "/api/sweep/status?job=nope")
     assert status == 404
+
+
+# ---------------------------------------------------------------------------
+# Live-data audit regression tests: no endpoint may return a hardcoded
+# sentinel. Every number asserted here is recomputed from the live source at
+# test time — a constant pretending to be data fails these tests.
+# ---------------------------------------------------------------------------
+
+import os
+
+
+def _registry_live_file():
+    p = os.path.expanduser("~/workspace/agent-ops/cloud-dog-registry.json")
+    if not os.path.isfile(p):
+        return None, None
+    with open(p, "r", encoding="utf-8") as fh:
+        return p, json.load(fh)
+
+
+def test_registry_entries_dict_contract():
+    from clouddog.dashboard.server import (
+        _registry_lane_entries,
+        _registry_lane_summary,
+    )
+
+    data = {
+        "version": 3,
+        "entries": {
+            "/a": {"size": 100, "status": "verified"},
+            "/b": {"size": 200, "status": "registered"},
+        },
+    }
+    items = _registry_lane_entries(data)
+    total, by_status, total_bytes = _registry_lane_summary(items)
+    assert total == 2
+    assert total_bytes == 300
+    assert by_status == {"verified": 1, "registered": 1}
+
+
+def test_registry_entries_list_shape():
+    """The on-disk registry can be a bare list (what active cleanup lanes
+    write). The parser must surface those entries, not report 0."""
+    from clouddog.dashboard.server import (
+        _registry_lane_entries,
+        _registry_lane_summary,
+    )
+
+    data = [
+        {
+            "path": "/a",
+            "size": 1_469_014_801,
+            "sha256": "git-tree",
+            "repo": "mhvnsnt/x",
+            "cleared": "2026-10-19T20:xx:CDT",
+        },
+        {"path": "/b", "size": 42, "status": "reaped"},
+        "not-a-dict",
+    ]
+    items = _registry_lane_entries(data)
+    total, by_status, total_bytes = _registry_lane_summary(items)
+    assert total == 2
+    assert total_bytes == 1_469_014_843
+    assert by_status["cleared"] == 1
+    assert by_status["reaped"] == 1
+
+
+def test_registry_lane_reflects_live_registry(base_url):
+    """End-to-end: /api/lanes' cloud-dog:registry lane reports the live
+    registry's real entry count and bytes — never a stale or zero sentinel.
+    """
+    _, data = _registry_live_file()
+    if data is None:
+        pytest.skip("no live registry on this host (CI)")
+    from clouddog.dashboard.server import (
+        _registry_lane_entries,
+        _registry_lane_summary,
+    )
+
+    items = _registry_lane_entries(data)
+    live_total, _, live_bytes = _registry_lane_summary(items)
+    status, body = get(base_url, "/api/lanes")
+    assert status == 200
+    lanes = {l["lane"]: l for l in body}
+    assert "cloud-dog:registry" in lanes, "registry lane missing"
+    reg = lanes["cloud-dog:registry"]
+    assert reg["total"] == live_total
+    assert str(live_bytes) in reg["note"]
+    assert reg["uploaded"] <= reg["total"]
+
+
+def test_policy_fallback_scan_reports_live_bytes(tmp_path):
+    """The policy/scan evaluate() fallback must report real sizes from a
+    live stat, not a hardcoded 0."""
+    from clouddog import policy
+    from clouddog.dashboard.server import _policy_evaluate_scan
+
+    blob = tmp_path / "blob.bin"
+    blob.write_bytes(b"x" * 2048)
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "n.txt").write_text("y" * 100)
+    res = _policy_evaluate_scan(policy, str(tmp_path))
+    got = {r["path"]: r["bytes"] for r in res}
+    assert got[str(blob)] == 2048
+    assert got[str(sub)] == 100
+    assert all(r["bytes"] > 0 for r in res if os.path.isdir(r["path"]))
+
+
+def test_disk_numbers_match_live_reading(base_url):
+    """Exact match against an independent live disk reading, not a constant."""
+    status, body = get(base_url, "/api/disk")
+    assert status == 200
+    from clouddog.dashboard.server import _data_root
+
+    usage = shutil.disk_usage(_data_root())
+    assert body["total_bytes"] == usage.total
+    assert 0 < body["use_pct"] < 100
+    assert body["used_bytes"] + body["free_bytes"] <= body["total_bytes"] + 1
+    assert body["free_bytes"] > 0  # a 0 free_bytes sentinel would mean no data
