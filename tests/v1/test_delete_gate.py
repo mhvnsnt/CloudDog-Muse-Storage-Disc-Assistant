@@ -13,6 +13,11 @@ The daemon-level incident test (a no-registry file surviving a full
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+import sqlite3
+import time
+from datetime import datetime, timezone
 
 from clouddog.delete_gate import check_delete_gate
 
@@ -41,14 +46,14 @@ def _boom(_path):
 
 
 def _verdict(**over):
-    kw = dict(
-        registry_entry=_entry(),
-        local_sha256=SHA,
-        local_size=SIZE,
-        live_verify_ok=True,
-        claim_check=_free,
-        policy_action="store_and_clear",
-    )
+    kw = {
+        "registry_entry": _entry(),
+        "local_sha256": SHA,
+        "local_size": SIZE,
+        "live_verify_ok": True,
+        "claim_check": _free,
+        "policy_action": "store_and_clear",
+    }
     kw.update(over)
     return check_delete_gate(PATH, **kw)
 
@@ -171,3 +176,189 @@ def test_multiple_failures_all_reported():
     v = _verdict(registry_entry=None, live_verify_ok=False, claim_check=_claimed, policy_action="sacred")
     assert v.allowed is False
     assert _legs(v) == {"registry", "verify", "claims", "policy"}
+
+
+# ============================================================ daemon level
+# The incident itself, replayed: a daemon --apply run over a directory
+# holding a store_and_clear file that has NO registry entry. Before the
+# gate, the daemon's delete authority came from its own tick state and
+# the file died unregistered. Now it must survive, the block must be
+# journaled, and the daemon's store must land in the registry instead.
+
+from clouddog import registry as registry_mod  # noqa: E402
+from clouddog.daemon import Daemon  # noqa: E402
+from clouddog.stores.base import Health, HealthStatus, StoreBackend, StoredRef  # noqa: E402
+
+BAD_LOCATOR = "other/repo@old-tag/big.bin"
+
+
+class _Backend(StoreBackend):
+    name = "fake"
+
+    def health(self):
+        return HealthStatus(Health.LIVE, "fake")
+
+    def store(self, local_path, remote_ref, dry_run=False):
+        with open(local_path, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()
+        return StoredRef(
+            backend="fake", locator=remote_ref,
+            size=os.path.getsize(local_path), sha256=digest, extra={},
+        )
+
+    def verify(self, local_path, stored):
+        # The copy this run just stored verifies; a registry entry
+        # pointing anywhere else does not (test 4's lever).
+        return stored.locator != BAD_LOCATOR
+
+
+class _Journal:
+    def __init__(self):
+        self.events = []
+
+    def record(self, event):
+        self.events.append(event)
+
+    def read(self, limit=100):
+        return list(self.events[-limit:])
+
+    def notes(self, kind):
+        return [e.note for e in self.events if getattr(e, "kind", "") == kind]
+
+
+def _aged_file(root, name="big.bin", size=11 * 1024 * 1024):
+    p = root / name
+    p.write_bytes(b"x" * size)
+    old = time.time() - 7200  # cold: 2h old, over the 10MB floor
+    os.utime(p, (old, old))
+    return p
+
+
+def _daemon(tmp_path, journal, registry_json):
+    return Daemon(
+        roots=[str(tmp_path)],
+        backends={"github": _Backend()},
+        journal=journal,
+        disk_path=str(tmp_path),
+        dry_run=False,  # --apply, like the incident run
+        registry_path=str(registry_json),
+        registry_db_path=str(tmp_path / "no-registry.db"),
+        claims_db=str(tmp_path / "claims.db"),
+    )
+
+
+def _claims_db_with_live_claim(db_path, claimed_path):
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE claims (path TEXT PRIMARY KEY, owner TEXT NOT NULL,"
+        " action TEXT NOT NULL, claim_id TEXT NOT NULL UNIQUE,"
+        " epoch INTEGER NOT NULL, claimed_at TEXT NOT NULL,"
+        " heartbeat_at TEXT NOT NULL, ttl_s INTEGER NOT NULL DEFAULT 600,"
+        " note TEXT NOT NULL DEFAULT '')"
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO claims VALUES (?,?,?,?,?,?,?,?,?)",
+        (str(claimed_path), "beat-e-lane", "store", "c1", 1, now, now, 3600, ""),
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_incident_no_registry_entry_survives_daemon_apply(tmp_path):
+    target = _aged_file(tmp_path)
+    journal = _Journal()
+    registry_json = tmp_path / "registry.json"  # starts absent: NO entry
+    daemon = _daemon(tmp_path, journal, registry_json)
+
+    report = daemon.tick()
+
+    # The file survives a full --apply tick, untouched.
+    assert target.exists()
+    assert report.cleared == 0
+    # ...and the block is journaled with the registry reason.
+    blocked = journal.notes("delete_blocked")
+    assert blocked and "registry" in blocked[0]
+    # The daemon's verified store was registered instead of deleted on
+    # sight (two-pass rule): the registry now has the entry.
+    entry = registry_mod.lookup_entry(
+        str(target), json_path=str(registry_json), db_path=str(tmp_path / "no.db")
+    )
+    assert entry is not None
+    assert entry["sha256"] == hashlib.sha256(b"x" * target.stat().st_size).hexdigest()
+
+    # A later pass may clear it: entry pre-exists, binds to the bytes,
+    # live verify runs again, no claims, policy still store_and_clear.
+    report2 = daemon.tick()
+    assert report2.cleared == 1
+    assert not target.exists()
+    assert journal.notes("cleared")
+
+
+def test_daemon_claimed_registered_file_survives(tmp_path):
+    target = _aged_file(tmp_path)
+    registry_json = tmp_path / "registry.json"
+    data = target.read_bytes()
+    registry_mod.register_entry(
+        str(target),
+        {"store": "github", "repo": "mhvnsnt/clouddog-storage",
+         "release": "clouddog-20261020", "asset": "big.bin",
+         "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)},
+        json_path=str(registry_json),
+    )
+    _claims_db_with_live_claim(tmp_path / "claims.db", target)
+    journal = _Journal()
+    daemon = _daemon(tmp_path, journal, registry_json)
+
+    report = daemon.tick()
+
+    assert target.exists()
+    assert report.cleared == 0
+    blocked = journal.notes("delete_blocked")
+    assert blocked and "claims" in blocked[0]
+
+
+def test_daemon_entry_sha_mismatch_survives(tmp_path):
+    target = _aged_file(tmp_path)
+    registry_json = tmp_path / "registry.json"
+    registry_mod.register_entry(
+        str(target),
+        {"store": "github", "repo": "mhvnsnt/clouddog-storage",
+         "release": "clouddog-20261020", "asset": "big.bin",
+         "sha256": "0" * 64, "size": target.stat().st_size},
+        json_path=str(registry_json),
+    )
+    journal = _Journal()
+    daemon = _daemon(tmp_path, journal, registry_json)
+
+    report = daemon.tick()
+
+    assert target.exists()
+    assert report.cleared == 0
+    blocked = journal.notes("delete_blocked")
+    assert blocked and "registry" in blocked[0] and "sha256" in blocked[0]
+
+
+def test_daemon_entry_copy_failing_live_verify_survives(tmp_path):
+    target = _aged_file(tmp_path)
+    registry_json = tmp_path / "registry.json"
+    data = target.read_bytes()
+    registry_mod.register_entry(
+        str(target),
+        {"store": "github", "locator": BAD_LOCATOR,
+         "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)},
+        json_path=str(registry_json),
+    )
+    journal = _Journal()
+    daemon = _daemon(tmp_path, journal, registry_json)
+
+    report = daemon.tick()
+
+    assert target.exists()
+    assert report.cleared == 0
+    blocked = journal.notes("delete_blocked")
+    assert blocked and "verify" in blocked[0]
+    # The registry JSON on disk is exactly what was registered (the
+    # daemon did not rewrite the entry to make the gate pass).
+    on_disk = json.loads(registry_json.read_text())
+    assert on_disk["entries"][str(target)]["locator"] == BAD_LOCATOR
