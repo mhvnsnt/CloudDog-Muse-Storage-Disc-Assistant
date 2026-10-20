@@ -44,7 +44,11 @@ _CRITICAL_DISK_PCT = 85.0
 
 @dataclass
 class TickReport:
-    """Outcome of one daemon tick."""
+    """Outcome of one daemon tick.
+
+    Correctness fields lead (scorecard, owner law 2026-10-20);
+    freed_bytes is a footnote and stays last in every surface.
+    """
 
     started_utc: str
     disk_before_pct: float
@@ -60,10 +64,42 @@ class TickReport:
     errors: list[str] = field(default_factory=list)
     critical: bool = False
     critical_msg: str = ""
+    # Scorecard / trust (training layer, 2026-10-20)
+    correct_clears: int = 0
+    correct_blocks: int = 0
+    correct_kept: int = 0
+    near_misses: int = 0
+    violations: int = 0
+    unmirrored_old: int = 0
+    trust_state: str = ""
+    trust_forced_dry_run: bool = False
+
+    @property
+    def correct(self) -> int:
+        return self.correct_clears + self.correct_kept
+
+    @property
+    def clean_cycle(self) -> bool:
+        """A cycle is clean only with zero violations, zero near-misses,
+        and zero unmirrored-old findings (trust promotion input)."""
+        return (
+            self.violations == 0
+            and self.near_misses == 0
+            and self.unmirrored_old == 0
+        )
+
+
+def _state_dir() -> str:
+    """The one configurable state dir ($CLOUDEDOG_STATE_DIR or
+    ~/.clouddog) — trust, heartbeat, journal and stream config all
+    resolve through it, never through a repo checkout."""
+    from clouddog import trust as _trust
+
+    return _trust.state_dir()
 
 
 def _default_journal_path() -> str:
-    return os.path.expanduser("~/.clouddog/audit.jsonl")
+    return os.path.join(_state_dir(), "audit.jsonl")
 
 
 def _default_journal():
@@ -159,6 +195,10 @@ class Daemon:
         registry_path: str | None = None,
         registry_db_path: str | None = None,
         claims_db: str | None = None,
+        trust_path: str | None = None,
+        trust_required_streak: int | None = None,
+        unmirrored_age_s: int | None = None,
+        mirror_detect: bool = True,
     ) -> None:
         self.roots = list(roots)
         self.interval_s = interval_s
@@ -166,15 +206,28 @@ class Daemon:
         self.journal = journal if journal is not None else _default_journal()
         self.disk_path = disk_path
         self.dry_run = dry_run
-        self.pidfile = pidfile or os.path.expanduser("~/.clouddog/daemon.pid")
-        self.heartbeat_path = os.path.expanduser("~/.clouddog/heartbeat.json")
+        self.pidfile = pidfile or os.path.join(_state_dir(), "daemon.pid")
+        self.heartbeat_path = os.path.join(_state_dir(), "heartbeat.json")
         self.stream_backend = stream_backend
-        self.stream_dirs_path = os.path.expanduser("~/.clouddog/stream-dirs.json")
+        self.stream_dirs_path = os.path.join(_state_dir(), "stream-dirs.json")
         # Delete-gate state (incident fix): the canonical registry +
         # claims store the gate consults before ANY unlink.
         self.registry_path = registry_path or _registry_mod.default_registry_json()
         self.registry_db_path = registry_db_path or _registry_mod.default_registry_db()
         self.claims_db = claims_db or default_claims_db()
+        # Training layer (2026-10-20): earned-autonomy trust state +
+        # mirror-coverage detector configuration.
+        self.trust_path = trust_path
+        self.trust_required_streak = trust_required_streak
+        from clouddog.scorecard import DEFAULT_UNMIRRORED_AGE_S
+
+        self.unmirrored_age_s = (
+            unmirrored_age_s if unmirrored_age_s is not None else DEFAULT_UNMIRRORED_AGE_S
+        )
+        self.mirror_detect = mirror_detect
+        # Effective dry-run for the current tick: self.dry_run OR the
+        # trust gate forcing dry-run (set at tick start).
+        self._tick_dry_run = dry_run
 
     # ------------------------------------------------------------ internals
 
@@ -229,6 +282,64 @@ class Daemon:
             self.journal.record(event)
         except Exception:
             pass  # journaling must never break a tick
+
+    # ------------------------------------------------------- scorecard
+
+    def _record_grade(self, report: TickReport, grade: str, path: str,
+                      size: int = 0, locator: str = "", note: str = "",
+                      blocks=(), count: int = 1, cleared: bool = False,
+                      source: str = "daemon") -> None:
+        """Grade one action into the scorecard journal + tick counters.
+
+        VIOLATION / NEAR_MISS grades revoke trust on the spot (inside
+        scorecard.record_grade). Grading must never break a tick.
+        """
+        from clouddog import scorecard as _scorecard
+
+        try:
+            _scorecard.record_grade(
+                self.journal, grade, path=path, source=source, size=size,
+                locator=locator, note=note, blocks=blocks,
+                trust_path=self.trust_path,
+            )
+        except Exception:  # noqa: BLE001 - grading is feedback, not control
+            pass
+        if grade == _scorecard.CORRECT:
+            if cleared:
+                report.correct_clears += count
+            else:
+                report.correct_kept += count
+        elif grade == _scorecard.BLOCKED:
+            report.correct_blocks += count
+        elif grade == _scorecard.NEAR_MISS:
+            report.near_misses += count
+        elif grade == _scorecard.VIOLATION:
+            report.violations += count
+        elif grade == _scorecard.UNMIRRORED_OLD:
+            report.unmirrored_old += count
+
+    def _grade_verdict(self, report: TickReport, verdict, path: str,
+                       size: int, locator: str, source: str = "daemon") -> str:
+        """Grade a delete-gate verdict (journaled; revokes on near-miss)."""
+        from clouddog import scorecard as _scorecard
+
+        grade = _scorecard.classify_gate_verdict(verdict)
+        self._record_grade(
+            report, grade, path, size=size, locator=locator,
+            note=verdict.summary, blocks=tuple(verdict.blocks), source=source,
+        )
+        return grade
+
+    def _trust_state(self) -> str:
+        from clouddog import trust as _trust
+
+        try:
+            state = _trust.load_trust(
+                self.trust_path, required_streak=self.trust_required_streak
+            )
+            return str(state.get("state") or _trust.REVOKED)
+        except Exception:  # noqa: BLE001 - unreadable trust = REVOKED
+            return _trust.REVOKED
 
     def _record_error(self, report: TickReport, flags: dict, path: str,
                       msg: str, size: int = 0, backend_error: bool = False) -> None:
@@ -469,7 +580,7 @@ class Daemon:
 
         try:
             remote_ref = self._remote_ref(tier)
-            stored: StoredRef = backend.store(path, remote_ref, dry_run=self.dry_run)
+            stored: StoredRef = backend.store(path, remote_ref, dry_run=self._tick_dry_run)
         except CloudDogError as exc:
             self._record_error(
                 report, flags, path,
@@ -486,7 +597,7 @@ class Daemon:
             return
         report.stored += 1
         self._journal("stored", path, stored.size, stored.locator,
-                      f"backend={tier} dry_run={self.dry_run}")
+                      f"backend={tier} dry_run={self._tick_dry_run}")
 
         try:
             ok = backend.verify(path, stored)
@@ -510,8 +621,23 @@ class Daemon:
         self._journal("verified", path, stored.size, stored.locator,
                       f"backend={tier}")
 
+        if action == "store":
+            # Correctly stored-and-kept: a CORRECT grade, not a deletion
+            # (the old loop counted only clears; that was the bug).
+            self._record_grade(
+                report, "CORRECT", path, size=stored.size,
+                locator=stored.locator,
+                note="stored and kept local (verified store, no clear requested)",
+            )
+            return
+
         if action == "store_and_clear":
-            if self.dry_run:
+            if self._tick_dry_run:
+                self._record_grade(
+                    report, "CORRECT", path, size=stored.size,
+                    locator=stored.locator,
+                    note="stored and kept local (dry-run tick; pipeline verified, nothing deleted)",
+                )
                 return  # dry-run: verify the pipeline, delete nothing
             if not backend.supports_content_verify:
                 # H2: name+size-only verification is not byte-proof; store
@@ -519,6 +645,11 @@ class Daemon:
                 self._journal("skipped", path, size, stored.locator,
                               f"backend={tier} has no content verification; "
                               f"kept local")
+                self._record_grade(
+                    report, "CORRECT", path, size=stored.size,
+                    locator=stored.locator,
+                    note="stored and kept local (backend has no content verification)",
+                )
                 return
             # M5: re-evaluate policy just before delete — the file may have
             # become sacred/in-flight since the scan. The verdict feeds
@@ -543,6 +674,9 @@ class Daemon:
             if not verdict.allowed:
                 self._journal("delete_blocked", path, size, stored.locator,
                               verdict.summary)
+                # Scorecard: a multi-leg stop is a CORRECT BLOCK; a
+                # single-leg stop is a NEAR-MISS and revokes trust.
+                self._grade_verdict(report, verdict, path, size, stored.locator)
                 return
             try:
                 freed = self._delete_local(path, action)
@@ -564,6 +698,11 @@ class Daemon:
             report.freed_bytes += freed
             self._journal("cleared", path, freed, stored.locator,
                           f"backend={tier} verified then cleared (delete gate passed)")
+            self._record_grade(
+                report, "CORRECT", path, size=freed, locator=stored.locator,
+                note="cleared through delete gate (stored + live-verified + gate passed)",
+                cleared=True,
+            )
 
     def _stream_journal(self):
         """Journal wrapper for stream passes: normal audit journal plus the
@@ -635,7 +774,7 @@ class Daemon:
                 continue
             _chunk_mb = ent.get("chunk_mb")
             _settle = ent.get("settle_secs")
-            live = bool(ent.get("apply", True)) and not self.dry_run
+            live = bool(ent.get("apply", True)) and not self._tick_dry_run
             if live and not backend.supports_content_verify:
                 # H2: name+size-only verification is not byte-proof; store
                 # but never clear the local copy on such tiers.
@@ -655,6 +794,8 @@ class Daemon:
                     settle_secs=int(300 if _settle is None else _settle),
                     apply=live,
                     journal=journal_fn,
+                    trust_path=self.trust_path,
+                    scorecard_journal=self.journal,
                 )
                 rep = st.stream_once()
             except Exception as exc:  # noqa: BLE001 - one dir must not break the tick
@@ -669,6 +810,12 @@ class Daemon:
             report.stream_files += rep.files_streamed
             report.stream_chunks += rep.chunks_uploaded
             report.stream_freed_bytes += rep.freed_bytes
+            # Scorecard aggregation from the stream pass.
+            report.correct_clears += getattr(rep, "correct_clears", 0)
+            report.correct_blocks += getattr(rep, "correct_blocks", 0)
+            report.correct_kept += getattr(rep, "correct_kept", 0)
+            report.near_misses += getattr(rep, "near_misses", 0)
+            report.violations += getattr(rep, "violations", 0)
             for e in rep.errors:
                 self._record_error(report, flags, str(ent.get("watch_dir")),
                                    f"stream: {e}")
@@ -690,6 +837,31 @@ class Daemon:
             skipped_sacred=0,
         )
         flags = {"verify_failed": False, "big_backend_error": False}
+
+        # TRUST GATE (earned autonomy, 2026-10-20): checked before
+        # EVERY tick. Launched with --apply while trust != APPLY ->
+        # this tick is forced to dry-run and the refusal is journaled
+        # (a CORRECT BLOCK: the training layer stopping an unearned
+        # privilege). Initialized state is REVOKED, so a fresh daemon
+        # can never delete on its first tick.
+        trust_state = self._trust_state()
+        report.trust_state = trust_state
+        self._tick_dry_run = self.dry_run
+        if not self.dry_run and trust_state != "APPLY":
+            self._tick_dry_run = True
+            report.trust_forced_dry_run = True
+            self._journal(
+                "trust_refused_apply", "", 0, "",
+                f"daemon launched with --apply while trust_state={trust_state}; "
+                "forced dry-run for this tick (earned autonomy)",
+            )
+            self._record_grade(
+                report, "BLOCKED", "", note=(
+                    f"trust gate refused --apply (trust_state={trust_state}); "
+                    "tick forced to dry-run"
+                ),
+                source="trust",
+            )
 
         for root in self.roots:
             try:
@@ -717,6 +889,65 @@ class Daemon:
                           f"skipped {report.skipped_sacred} protected entr"
                           f"{'y' if report.skipped_sacred == 1 else 'ies'} "
                           f"(sacred/store_and_clear_strict/keep_local)")
+            # Correctly kept-local is CORRECT behavior — grade it.
+            self._record_grade(
+                report, "CORRECT", ",".join(self.roots),
+                note=f"kept local: {report.skipped_sacred} protected "
+                     "entries untouched (sacred/strict/keep_local)",
+                count=report.skipped_sacred,
+            )
+
+        # MIRROR-COVERAGE DETECTOR (2026-10-20 casualty lesson): old
+        # work/scratch/intermediate files with no registry entry and no
+        # store record are a system FAILURE STATE, journaled as
+        # UNMIRRORED_OLD scorecard records and counted at the top of
+        # every summary — never a footnote. A tick containing findings
+        # is not a clean cycle for trust promotion.
+        if self.mirror_detect:
+            try:
+                from clouddog import scorecard as _scorecard
+                from clouddog.claims import check_claimed
+
+                findings = _scorecard.detect_unmirrored_old(
+                    self.roots,
+                    age_s=self.unmirrored_age_s,
+                    registry_lookup=lambda p: _registry_mod.lookup_entry(
+                        p, json_path=self.registry_path,
+                        db_path=self.registry_db_path),
+                    claim_check=lambda p: check_claimed(self.claims_db, p),
+                    max_depth=6,
+                )
+            except Exception as exc:  # noqa: BLE001 - detector must not break a tick
+                findings = []
+                self._journal("error", "", 0, "",
+                              f"mirror-coverage detector failed: {exc}")
+            for f in findings:
+                self._journal("unmirrored_old", f["path"], f["size"], "",
+                              f["reason"])
+                self._record_grade(
+                    report, "UNMIRRORED_OLD", f["path"], size=f["size"],
+                    note=f["reason"], source="daemon-mirror-detector",
+                )
+
+        # TRUST CYCLE UPDATE: feed a clean cycle, or record why this
+        # cycle cannot promote. Violations/near-misses already revoked
+        # at grade time (scorecard.record_grade persists the revocation
+        # immediately); this step only handles the promotion streak.
+        try:
+            from clouddog import trust as _trust_mod
+
+            if report.violations or report.near_misses:
+                pass  # already REVOKED at grade time; streak is zero
+            elif report.unmirrored_old:
+                _trust_mod.record_unclean_cycle(
+                    self.trust_path, source="daemon",
+                    reason="unmirrored_old findings in cycle; streak reset",
+                )
+            else:
+                _trust_mod.record_clean_cycle(self.trust_path, source="daemon")
+            report.trust_state = _trust_mod.current_state(self.trust_path)
+        except Exception:  # noqa: BLE001 - trust bookkeeping never breaks a tick
+            report.trust_state = self._trust_state()
 
         report.disk_after_pct = self._disk_pct()
 
@@ -746,20 +977,29 @@ class Daemon:
                 "pid": os.getpid(),
                 "roots": list(self.roots),
                 "interval_s": self.interval_s,
-                "dry_run": self.dry_run,
+                "dry_run": self._tick_dry_run,
                 "disk_before_pct": report.disk_before_pct,
                 "disk_after_pct": report.disk_after_pct,
+                # Correctness FIRST (scorecard, 2026-10-20); bytes last.
+                "correct_clears": report.correct_clears,
+                "correct_blocks": report.correct_blocks,
+                "correct_kept": report.correct_kept,
+                "near_misses": report.near_misses,
+                "violations": report.violations,
+                "unmirrored_old": report.unmirrored_old,
+                "trust_state": report.trust_state,
+                "trust_forced_dry_run": report.trust_forced_dry_run,
                 "stored": report.stored,
                 "verified": report.verified,
                 "cleared": report.cleared,
-                "freed_bytes": report.freed_bytes,
-                "stream_files": report.stream_files,
-                "stream_chunks": report.stream_chunks,
-                "stream_freed_bytes": report.stream_freed_bytes,
                 "skipped_sacred": report.skipped_sacred,
                 "errors": len(report.errors),
                 "critical": report.critical,
                 "critical_msg": report.critical_msg,
+                "stream_files": report.stream_files,
+                "stream_chunks": report.stream_chunks,
+                "stream_freed_bytes": report.stream_freed_bytes,
+                "freed_bytes": report.freed_bytes,
             }
             tmp = self.heartbeat_path + ".tmp"
             with open(tmp, "w") as fh:
@@ -795,11 +1035,18 @@ class Daemon:
                 if report.critical or report.errors:
                     print(
                         f"[clouddog] tick @ {report.started_utc}: "
+                        f"correct_clears={report.correct_clears} "
+                        f"correct_blocks={report.correct_blocks} "
+                        f"near_misses={report.near_misses} "
+                        f"violations={report.violations} "
+                        f"unmirrored_old={report.unmirrored_old} "
+                        f"trust_state={report.trust_state} "
                         f"disk {report.disk_before_pct:.1f}%->{report.disk_after_pct:.1f}% "
                         f"stored={report.stored} verified={report.verified} "
-                        f"cleared={report.cleared} freed={report.freed_bytes}B "
+                        f"cleared={report.cleared} "
                         f"skipped_sacred={report.skipped_sacred} "
-                        f"errors={len(report.errors)} critical={report.critical}"
+                        f"errors={len(report.errors)} critical={report.critical} "
+                        f"freed={report.freed_bytes}B"
                     )
                     for err in report.errors:
                         print(f"[clouddog]   error: {err}")

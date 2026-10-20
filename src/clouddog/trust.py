@@ -39,6 +39,7 @@ __all__ = [
     "STATES",
     "DEFAULT_REQUIRED_STREAK",
     "INITIAL_REASON",
+    "state_dir",
     "default_trust_path",
     "load_trust",
     "save_trust",
@@ -59,6 +60,17 @@ STATES = (REVOKED, PROBATION, APPLY)
 DEFAULT_REQUIRED_STREAK = 20
 ENV_TRUST_PATH = "CLOUDEDOG_TRUST_PATH"
 ENV_TRUST_STREAK = "CLOUDEDOG_TRUST_REQUIRED_STREAK"
+#: The ONE configurable state dir for all CloudDog runtime state
+#: (trust, heartbeat, journal, stream config). State belongs here —
+#: never in a repo checkout (a dormant second checkout exists on the
+#: box; anything keyed to a checkout path forks the truth). Tests set
+#: CLOUDEDOG_STATE_DIR to a tmp dir and must never touch the real one.
+ENV_STATE_DIR = "CLOUDEDOG_STATE_DIR"
+
+
+def state_dir() -> str:
+    """The CloudDog state dir: $CLOUDEDOG_STATE_DIR or ~/.clouddog."""
+    return os.environ.get(ENV_STATE_DIR) or os.path.expanduser("~/.clouddog")
 
 #: Why a fresh trust file starts REVOKED (owner revocation, 2026-10-20).
 INITIAL_REASON = (
@@ -72,8 +84,13 @@ def _utcnow() -> str:
 
 
 def default_trust_path() -> str:
-    return os.environ.get(ENV_TRUST_PATH) or os.path.expanduser(
-        "~/.clouddog/trust.json"
+    """Resolve the trust file through the one state-dir config:
+    $CLOUDEDOG_STATE_DIR/trust.json, else $CLOUDEDOG_TRUST_PATH, else
+    ~/.clouddog/trust.json."""
+    if os.environ.get(ENV_STATE_DIR):
+        return os.path.join(os.environ[ENV_STATE_DIR], "trust.json")
+    return os.environ.get(ENV_TRUST_PATH) or os.path.join(
+        os.path.expanduser("~/.clouddog"), "trust.json"
     )
 
 

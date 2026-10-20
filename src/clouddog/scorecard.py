@@ -56,12 +56,16 @@ __all__ = [
     "SCORECARD_KIND",
     "DEFAULT_UNMIRRORED_AGE_S",
     "SCRATCH_COMPONENTS",
+    "ROOT_ACTION_GRADES",
     "ScorecardSummary",
     "classify_gate_verdict",
     "classify_delete_outcome",
     "record_grade",
     "grade_gate_verdict",
     "detect_unmirrored_old",
+    "adapt_root_event",
+    "adapt_root_events",
+    "read_root_journal",
     "summarize_events",
     "summarize_journal",
     "format_scorecard",
@@ -281,6 +285,7 @@ def detect_unmirrored_old(
     store_lookup=None,
     claim_check=None,
     max_findings: int = 500,
+    max_depth: int | None = None,
 ) -> list[dict]:
     """Find UNMIRRORED_OLD files: under ``roots``, in work/scratch/
     intermediate locations, older than ``age_s``, with NO registry entry
@@ -299,9 +304,11 @@ def detect_unmirrored_old(
     for root in roots or []:
         root_abs = os.path.abspath(str(root))
         root_name = os.path.basename(root_abs).lower()
-        for dirpath, _dirnames, filenames in os.walk(root_abs, followlinks=False):
+        for dirpath, dirnames, filenames in os.walk(root_abs, followlinks=False):
             rel_dir = os.path.relpath(dirpath, root_abs)
             rel_parts = [] if rel_dir == "." else rel_dir.split(os.sep)
+            if max_depth is not None and len(rel_parts) >= max_depth:
+                dirnames[:] = []  # bounded walk: scratch lives near the top
             components = {p.lower() for p in rel_parts} | {root_name}
             if not (components & SCRATCH_COMPONENTS):
                 continue
@@ -355,6 +362,105 @@ def detect_unmirrored_old(
     return findings
 
 
+# ------------------------------------------------- guardian / root adapter
+#
+# The guardian cron runs the ROOT cloud_dog.py `enforce --apply`, whose
+# actions never pass through clouddog.delete_gate — they are gated by
+# evaluate() + the laws engine (decide_delete) + live verify, and
+# journaled to the root audit log (~/workspace/agent-ops/
+# cloud-dog-audit.jsonl, events keyed by "action", fail-closed all
+# morning of the 2026-10-20 incidents per the deleter audit). Those
+# actions are graded HERE as a first-class source: the mapping below
+# converts root audit events into scorecard records. Root deletes that
+# executed are CORRECT only because reap_v2's own flow live-verifies
+# before unlink; a root "reap" event IS the post-verify record. (If a
+# root event ever showed a delete with no preceding verify, that is
+# graded by classify_delete_outcome as a VIOLATION at the call site
+# that detects it — the adapter does not invent evidence either way.)
+
+#: root audit action -> (grade, is_clear, note)
+ROOT_ACTION_GRADES = {
+    "reap": (CORRECT, True, "cleared via root reap (live-verified before unlink)"),
+    "reap_policy_block": (BLOCKED, False, "root policy/laws gate blocked a delete"),
+    "reap_keep": (BLOCKED, False, "root live verify failed; kept local"),
+    "reap_policy_skip": (CORRECT, False, "kept local: root evaluate() not reap-eligible"),
+    "reap_retrievability_skip": (CORRECT, False, "kept local: strict-bar proof not attempted"),
+    "reap_policy_unavailable": (BLOCKED, False, "root reap refused: policy engine unavailable (fail closed)"),
+    "mirror_part_unverified": (BLOCKED, False, "root mirror part failed verification; kept local"),
+}
+
+
+def adapt_root_event(event: dict) -> dict | None:
+    """Convert one root cloud_dog.py audit event into a scorecard
+    record dict, or None when the action is not gradeable (summaries,
+    cycle bookkeeping, proofs with no verdict yet)."""
+    if not isinstance(event, dict):
+        return None
+    action = str(event.get("action") or "")
+    if action == "verify":
+        ok = bool(event.get("ok"))
+        grade, is_clear, note = (
+            (CORRECT, False, "root verify passed")
+            if ok else
+            (BLOCKED, False, "root verify failed; kept local")
+        )
+    elif action == "reap_retrievability_proof":
+        if event.get("proven"):
+            grade, is_clear, note = CORRECT, False, "root pull-back proof passed"
+        else:
+            grade, is_clear, note = BLOCKED, False, "root pull-back proof failed; strict bar kept local"
+    elif action in ROOT_ACTION_GRADES:
+        grade, is_clear, note = ROOT_ACTION_GRADES[action]
+    else:
+        return None
+    rec = {
+        "kind": SCORECARD_KIND,
+        "grade": grade,
+        "path": str(event.get("path") or ""),
+        "source": "guardian-root",
+        "size": event.get("size"),
+        "locator": None,
+        "note": ("cleared " if is_clear else "") + note,
+        "blocks": [],
+        "regression_test": None,
+        "fix_ref": None,
+        "ts": event.get("ts", ""),
+    }
+    if is_clear and isinstance(event.get("size"), int):
+        rec["_freed"] = int(event["size"])
+    return rec
+
+
+def adapt_root_events(events) -> list[dict]:
+    out = []
+    for e in events or []:
+        rec = adapt_root_event(e)
+        if rec is not None:
+            out.append(rec)
+    return out
+
+
+def read_root_journal(path: str, limit: int = 100000) -> list[dict]:
+    """Read the root script's audit journal (JSONL keyed by 'action')."""
+    import json as _json
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines[-limit:]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(_json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
 # ---------------------------------------------------------------- summary
 
 
@@ -381,15 +487,21 @@ class ScorecardSummary:
         )
 
 
-def summarize_events(events, trust_state: str = "") -> ScorecardSummary:
+def summarize_events(events, trust_state: str = "", root_events=None) -> ScorecardSummary:
     """Aggregate journal event dicts into a ScorecardSummary.
 
     Graded (kind=scorecard) records drive the correctness counts;
     legacy cleared/reaped events contribute only ``freed_bytes`` (the
-    footnote) so a graded clear is never double-counted.
+    footnote) so a graded clear is never double-counted. ``root_events``
+    (raw events from the guardian's root cloud_dog.py audit log) are
+    adapted through :func:`adapt_root_events` and merged as a
+    first-class grading source.
     """
     s = ScorecardSummary(trust_state=trust_state)
-    for e in events or []:
+    all_events = list(events or []) + adapt_root_events(root_events or [])
+    for e in all_events:
+        if isinstance(e, dict) and isinstance(e.get("_freed"), int):
+            s.freed_bytes += e["_freed"]
         if not isinstance(e, dict):
             continue
         kind = str(e.get("kind") or "")
@@ -422,9 +534,12 @@ def summarize_events(events, trust_state: str = "") -> ScorecardSummary:
 
 
 def summarize_journal(journal_path: str, trust_path: str | None = None,
-                      limit: int = 100000) -> ScorecardSummary:
+                      limit: int = 100000,
+                      root_journal_path: str | None = None) -> ScorecardSummary:
     """Read the audit journal at ``journal_path`` and summarize it,
-    attaching the current trust state."""
+    attaching the current trust state. When ``root_journal_path`` is
+    given, the guardian/root script's audit log is graded and merged
+    as a first-class source too."""
     events: list[dict] = []
     try:
         from clouddog.audit import AuditJournal
@@ -432,12 +547,13 @@ def summarize_journal(journal_path: str, trust_path: str | None = None,
         events = AuditJournal(journal_path).read(limit=limit)
     except Exception:  # noqa: BLE001 - a missing journal is an empty card
         events = []
+    root_events = read_root_journal(root_journal_path, limit=limit) if root_journal_path else []
     state = ""
     try:
         state = _trust.current_state(trust_path)
     except Exception:  # noqa: BLE001
         state = _trust.REVOKED
-    return summarize_events(events, trust_state=state)
+    return summarize_events(events, trust_state=state, root_events=root_events)
 
 
 def format_scorecard(summary: ScorecardSummary) -> str:

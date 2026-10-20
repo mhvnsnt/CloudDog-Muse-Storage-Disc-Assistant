@@ -158,9 +158,14 @@ def test_cli_stream_refuses_down_backend(tmp_path, monkeypatch):
 
 
 def _daemon(tmp_path, backend, cfg_entries, dry_run=True):
+    from clouddog import trust as _trust
     from clouddog.daemon import Daemon
 
     journal = _Journal()
+    tp = str(tmp_path / "trust.json")
+    seeded = _trust.load_trust(tp)
+    seeded["state"] = _trust.APPLY  # earned trust, hermetic to tmp
+    _trust.save_trust(seeded, tp)
     d = Daemon(
         roots=[str(tmp_path / "roots")],
         backends={},
@@ -168,6 +173,7 @@ def _daemon(tmp_path, backend, cfg_entries, dry_run=True):
         disk_path=str(tmp_path),
         dry_run=dry_run,
         stream_backend=backend,
+        trust_path=tp,
     )
     (tmp_path / "roots").mkdir(exist_ok=True)
     cfg = tmp_path / "stream-dirs.json"
