@@ -64,7 +64,8 @@ def test_cloud_dog_part_bytes_mirrors_the_shared_constant():
     """cloud_dog.py cannot import the src/ tree (root package shadows
     it), so its PART_BYTES mirrors CHUNK_BYTES — prove they are equal."""
     path = os.path.join(REPO_ROOT, "cloud_dog.py")
-    tree = ast.parse(open(path).read())
+    with open(path) as fh:
+        tree = ast.parse(fh.read())
     value = None
     for node in ast.walk(tree):
         if isinstance(node, ast.Assign):
@@ -90,7 +91,8 @@ def test_no_hardcoded_oversized_split_values_in_chunking_code():
         "src/clouddog/stores/base.py",
         "cloud_dog.py",
     ):
-        src = open(os.path.join(REPO_ROOT, rel)).read()
+        with open(os.path.join(REPO_ROOT, rel)) as fh:
+            src = fh.read()
         for pat in (r"split[^\n]*2_000_000_000", r"split[^\n]*500\s*\*\s*1024"):
             for m in re.finditer(pat, src):
                 offenders.append(f"{rel}: {m.group(0)[:60]}")
