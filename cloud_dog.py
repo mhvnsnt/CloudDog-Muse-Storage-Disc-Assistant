@@ -2591,6 +2591,329 @@ def cmd_mirror_search(args):
 
 
 # ============================================================ v2: daemon command
+# ============================================================ fetch: self-hosted torrent fetch (TorBox replacement)
+def _fetchmod():
+    """Lazy import of clouddog_fetch (keeps cloud_dog importable without
+    libtorrent; the fetch verbs fail with a clear message instead)."""
+    try:
+        import clouddog_fetch as cf
+    except ImportError:
+        _here = os.path.dirname(os.path.abspath(__file__))
+        if _here not in sys.path:
+            sys.path.insert(0, _here)
+        import clouddog_fetch as cf
+    return cf
+
+
+def cmd_fetch(args):
+    """Self-hosted selective torrent fetch -> store -> mirror registry.
+
+    Zip mode (--zip): the torrent is a single-file zip archive. Only the
+    pieces covering the zip tail/central directory and the wanted entries'
+    data ranges are downloaded (never the whole archive). Each extracted
+    entry is verified (size + CRC32 vs the central directory), SHA256'd,
+    uploaded to the store, registered with its mirror record, and the
+    local copy is deleted (delete-as-you-go). A MANIFEST-fetch-<run>.txt
+    asset (sha256<TAB>size<TAB>./entry/path, the gym-partner v1 format) is
+    kept current on the release after every file, so a crash loses nothing.
+    """
+    cf = _fetchmod()
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    if args.store != "github":
+        print(f"FETCH FAIL: v1 stores to github only (got {args.store})",
+              file=sys.stderr)
+        return 1
+    if not args.repo or not args.release:
+        print("FETCH FAIL: github fetch needs --repo and --release",
+              file=sys.stderr)
+        return 1
+    if not args.zip:
+        print("FETCH FAIL: v1 supports --zip (single-file zip torrents) only",
+              file=sys.stderr)
+        return 1
+    wants = cf.read_want_manifest(args.want_manifest)
+    if args.limit:
+        wants = wants[:args.limit]
+    if not wants:
+        print("FETCH FAIL: want manifest is empty", file=sys.stderr)
+        return 1
+    staging = args.staging or os.path.join(AGENT_OPS, "fetch-staging", run_id)
+    payload_dir = os.path.join(staging, "payload")
+    out_dir = os.path.join(staging, "out")
+    os.makedirs(payload_dir, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
+    manifest_name = f"MANIFEST-fetch-{run_id}.txt"
+    manifest_local = os.path.join(staging, manifest_name)
+    summary = {"run_id": run_id, "wanted": len(wants), "stored": 0,
+               "unmatched": 0, "failed": 0, "bytes_stored": 0}
+    reg = load_registry()
+    torr_kwargs = {}
+    if args.tracker:
+        torr_kwargs["trackers"] = args.tracker
+    torr = cf.SelectiveTorrent(payload_dir, **torr_kwargs)
+    peers = []
+    for spec in args.add_peer or []:
+        host, _, port = spec.rpartition(":")
+        if host and port.isdigit():
+            peers.append((host, int(port)))
+    try:
+        if args.magnet:
+            info = torr.add_magnet(args.magnet,
+                                   timeout=args.metadata_timeout,
+                                   connect_peers=peers)
+        elif args.torrent:
+            info = torr.add_torrent_file(args.torrent)
+        else:
+            print("FETCH FAIL: need --magnet or --torrent", file=sys.stderr)
+            return 1
+        total, pl, npieces = info.total_size(), info.piece_length(), \
+            info.num_pieces()
+        print(f"fetch: '{info.name()}' {human(total)} "
+              f"pieces={npieces}x{human(pl)}")
+        # ---- stage 1: tail + (zip64) + central directory
+        tail_s, tail_e = cf.find_eocd_range(total)
+        torr.download_pieces(
+            cf.ranges_to_pieces([(tail_s, tail_e)], pl, npieces),
+            timeout=args.piece_timeout)
+        tail = torr.read_range(tail_s, tail_e)
+        cd_off, cd_size, cd_count, z64_off = cf.parse_eocd(tail, total)
+        if z64_off is not None:
+            torr.download_pieces(
+                cf.ranges_to_pieces([(z64_off, z64_off + 55)], pl, npieces),
+                timeout=args.piece_timeout)
+            cd_count, cd_size, cd_off = cf.parse_z64_eocd(
+                torr.read_range(z64_off, z64_off + 55))
+        torr.download_pieces(
+            cf.ranges_to_pieces([(cd_off, cd_off + cd_size - 1)], pl,
+                                npieces),
+            timeout=args.piece_timeout)
+        entries = cf.parse_central_directory(
+            torr.read_range(cd_off, cd_off + cd_size - 1))
+        print(f"fetch: central directory parsed: {len(entries)} entries")
+        if args.dry_run:
+            plan = cf.plan_zip_fetch(total, entries,
+                                     [w["path"] for w in wants])
+            planned = sum(e - s + 1 for s, e in plan["stage2_ranges"])
+            print(f"DRY-RUN: {len(plan['resolved'])}/{len(wants)} wants "
+                  f"resolve; stage-2 download would be {human(planned)} "
+                  f"across {len(plan['stage2_ranges'])} ranges")
+            audit_log("fetch_dry_run", run_id=run_id,
+                      resolved=len(plan["resolved"]), wanted=len(wants))
+            return 0
+        # ---- stage 2: per-entry selective fetch -> verify -> store
+        used_assets = set()
+        for wi, want in enumerate(wants):
+            plan = cf.plan_zip_fetch(total, entries, [want["path"]])
+            ent = plan["resolved"].get(want["path"])
+            if ent is None:
+                print(f"  [{wi + 1}/{len(wants)}] UNMATCHED {want['path']}")
+                summary["unmatched"] += 1
+                continue
+            if want["size"] and ent["uncomp_size"] != want["size"]:
+                print(f"  [{wi + 1}/{len(wants)}] SIZE-SKIP {want['path']}: "
+                      f"manifest {want['size']} != CD {ent['uncomp_size']}")
+                summary["unmatched"] += 1
+                continue
+            pieces = cf.ranges_to_pieces(plan["stage2_ranges"], pl, npieces)
+            print(f"  [{wi + 1}/{len(wants)}] {ent['name']} "
+                  f"({human(ent['uncomp_size'])}, {len(pieces)} pieces)")
+            try:
+                torr.download_pieces(pieces, timeout=args.piece_timeout)
+                data, sha = cf.extract_entry(torr.read_range, ent)
+            except Exception as e:
+                print(f"    FETCH/EXTRACT FAIL: {e}")
+                summary["failed"] += 1
+                audit_log("fetch_file_fail", run_id=run_id,
+                          file=ent["name"], detail=str(e)[:200])
+                continue
+            base = os.path.basename(ent["name"]) or "entry"
+            asset = base
+            if asset in used_assets:
+                stem, ext = os.path.splitext(base)
+                asset = f"{stem}-{sha[:8]}{ext}"
+            used_assets.add(asset)
+            local = os.path.join(out_dir, asset)
+            with open(local, "wb") as f:
+                f.write(data)
+            del data
+            ok, detail = upload_to_store(
+                "github", local, {"repo": args.repo,
+                                  "release": args.release})
+            ok_v, detail_v = (False, "upload failed: " + detail)
+            if ok:
+                ok_v, detail_v = verify_github_asset(
+                    args.repo, args.release, asset,
+                    ent["uncomp_size"], sha)
+            key = f"fetch:{run_id}:{ent['name']}"
+            mirror = cf.make_mirror("github", repo=args.repo,
+                                    release=args.release, asset=asset)
+            if not ok_v:
+                print(f"    STORE VERIFY FAILED: {detail_v}; "
+                      f"local kept at {local}")
+                summary["failed"] += 1
+                reg["entries"][key] = {
+                    "local_path": local, "store": "github",
+                    "repo": args.repo, "release": args.release,
+                    "asset": asset, "sha256": sha,
+                    "size": ent["uncomp_size"],
+                    "note": f"fetch {run_id} UNVERIFIED {ent['name']}",
+                    "registered_at": now_stamp(), "status": "unverified",
+                    "zip_entry": ent["name"], "mirrors": [mirror],
+                }
+                save_registry(reg)
+                continue
+            mirror["verified_at"] = now_stamp()
+            entry_rec = {
+                "local_path": key, "store": "github", "repo": args.repo,
+                "release": args.release, "asset": asset, "sha256": sha,
+                "size": ent["uncomp_size"],
+                "note": f"fetch {run_id} {ent['name']}",
+                "registered_at": now_stamp(), "status": "reaped",
+                "zip_entry": ent["name"], "mirrors": [mirror],
+            }
+            reg["entries"][key] = entry_rec
+            save_registry(reg)
+            with open(manifest_local, "a", encoding="utf-8") as f:
+                f.write(f"{sha}\t{ent['uncomp_size']}\t./{ent['name']}\n")
+            upload_to_store("github", manifest_local,
+                            {"repo": args.repo, "release": args.release})
+            if not args.keep_local:
+                try:
+                    os.unlink(local)
+                except OSError:
+                    pass
+            summary["stored"] += 1
+            summary["bytes_stored"] += ent["uncomp_size"]
+            audit_log("fetch_file", run_id=run_id, file=ent["name"],
+                      asset=asset, sha256=sha[:16],
+                      size=ent["uncomp_size"])
+            print(f"    stored+verified: {asset} sha256={sha[:16]}...")
+    finally:
+        torr.close()
+        save_registry(reg)
+        mpath = os.path.join(AGENT_OPS, f"fetch-manifest-{run_id}.json")
+        try:
+            with open(mpath, "w") as f:
+                json.dump({"summary": summary, "staging": staging,
+                           "release_manifest": manifest_name}, f, indent=2)
+        except OSError:
+            mpath = "(manifest write failed)"
+    msg = (f"fetch complete: {summary['stored']}/{summary['wanted']} stored "
+           f"({human(summary['bytes_stored'])}), "
+           f"unmatched={summary['unmatched']} failed={summary['failed']}, "
+           f"run manifest {mpath}")
+    print(msg)
+    log_action(f"cloud_dog fetch {run_id}: {msg}")
+    audit_log("fetch_complete", run_id=run_id, **summary)
+    return 0 if summary["failed"] == 0 and summary["unmatched"] == 0 else 3
+
+
+def cmd_register_mirror(args):
+    """Attach a mirror location to an existing registry entry.
+
+    The entry's record becomes: hashes + size + EVERY mirror location +
+    pull-back command (see clouddog_fetch.make_mirror). Use --verified only
+    when the mirror was actually checked just now.
+    """
+    cf = _fetchmod()
+    reg = load_registry()
+    key = os.path.abspath(args.file) if os.path.exists(args.file) \
+        else args.file
+    entry = reg["entries"].get(key) or reg["entries"].get(args.file)
+    if entry is None:
+        print(f"No registry entry for {args.file} "
+              f"(register it first)", file=sys.stderr)
+        return 1
+    mirror = cf.make_mirror(
+        args.store, repo=args.repo, release=args.release, asset=args.asset,
+        remote_dir=args.remote_dir, dataset=args.dataset, url=args.url,
+        b2_bucket=args.b2_bucket, b2_path=args.b2_path)
+    if args.verified:
+        mirror["verified_at"] = now_stamp()
+    added = cf.add_mirror(entry, mirror)
+    save_registry(reg)
+    print(f"{'Added mirror' if added else 'Mirror already recorded'}: "
+          f"{key} -> {mirror['store']}:{mirror['url'] or mirror['asset']}")
+    audit_log("register_mirror", path=key, store=args.store,
+              asset=args.asset, url=mirror["url"][:120], added=added)
+    return 0
+
+
+def cmd_pull_back(args):
+    """Download a registered file back from one of its mirrors and verify
+    SHA256 + size against the registry record. Proof of retrievability."""
+    import urllib.request
+    reg = load_registry()
+    key = os.path.abspath(args.file) if os.path.exists(args.file) \
+        else args.file
+    entry = reg["entries"].get(key) or reg["entries"].get(args.file)
+    if entry is None:
+        print(f"No registry entry for {args.file}", file=sys.stderr)
+        return 1
+    mirrors = entry.get("mirrors") or []
+    if not mirrors:
+        # legacy single-store entry: synthesize its one mirror
+        mirrors = [_fetchmod().make_mirror(
+            entry.get("store", ""), repo=entry.get("repo", ""),
+            release=entry.get("release", ""), asset=entry.get("asset", ""),
+            remote_dir=entry.get("remote_dir", ""),
+            dataset=entry.get("dataset", ""))]
+    if args.mirror_index >= len(mirrors):
+        print(f"mirror index {args.mirror_index} out of range "
+              f"({len(mirrors)} mirrors)", file=sys.stderr)
+        return 1
+    m = mirrors[args.mirror_index]
+    out = args.out or os.path.basename(
+        m.get("asset") or entry.get("zip_entry") or "pull-back.bin")
+    ok = False
+    detail = ""
+    if m.get("url"):
+        try:
+            req = urllib.request.Request(
+                m["url"], headers={"User-Agent": UA_BROWSER})
+            with urllib.request.urlopen(req, timeout=3600) as r, \
+                    open(out, "wb") as f:
+                shutil.copyfileobj(r, f, 8 << 20)
+            ok = True
+        except Exception as e:
+            detail = f"url download failed: {e}"
+    if not ok and m.get("store") == "github" and m.get("repo"):
+        tmpd = out + ".ghdl"
+        os.makedirs(tmpd, exist_ok=True)
+        rc, _o, err = run(
+            ["gh", "release", "download", m["release"], "--repo", m["repo"],
+             "--pattern", m["asset"], "--dir", tmpd], timeout=3600)
+        got = os.path.join(tmpd, m["asset"])
+        if rc == 0 and os.path.exists(got):
+            os.replace(got, out)
+            try:
+                os.rmdir(tmpd)
+            except OSError:
+                pass
+            ok = True
+        else:
+            detail = f"gh download failed: {err.strip()[:200]}"
+    if not ok:
+        print(f"PULL-BACK FAIL: {args.file}: {detail}", file=sys.stderr)
+        return 1
+    size = os.path.getsize(out)
+    sha = sha256_file(out)
+    want_size = entry.get("size", 0)
+    want_sha = (entry.get("sha256") or "").lower()
+    if want_size and size != want_size:
+        print(f"PULL-BACK FAIL: size {size} != registry {want_size}",
+              file=sys.stderr)
+        return 1
+    if want_sha and sha.lower() != want_sha:
+        print(f"PULL-BACK FAIL: sha256 {sha[:16]}... != registry "
+              f"{want_sha[:16]}...", file=sys.stderr)
+        return 1
+    print(f"PULL-BACK OK: {out} ({human(size)}, sha256={sha[:16]}...) "
+          f"from {m.get('store')} mirror #{args.mirror_index}")
+    audit_log("pull_back", path=key, out=out, size=size, sha256=sha[:16])
+    return 0
+
+
 def cmd_daemon(args):
     """Run the enforce loop continuously (guardian cadence without cron).
 
@@ -3288,6 +3611,69 @@ def main(argv=None):
     p.add_argument("--json", action="store_true",
                    help="machine-readable output")
 
+    p = sub.add_parser("fetch",
+                       help="self-hosted selective torrent fetch "
+                            "(TorBox replacement): zip entries -> store "
+                            "-> mirror registry")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--magnet", default="", help="magnet URI")
+    src.add_argument("--torrent", default="", help="local .torrent file")
+    p.add_argument("--zip", action="store_true",
+                   help="torrent content is a single-file zip; fetch only "
+                        "the wanted entries' byte ranges")
+    p.add_argument("--want-manifest", required=True,
+                   help="TSV manifest of wanted entries: size<TAB>path")
+    p.add_argument("--store", default="github", choices=STORES,
+                   help="destination store (v1: github)")
+    p.add_argument("--repo", default="", help="github: OWNER/REPO")
+    p.add_argument("--release", default="", help="github: release tag")
+    p.add_argument("--staging", default="",
+                   help="staging dir (default agent-ops/fetch-staging/RUN)")
+    p.add_argument("--limit", type=int, default=0,
+                   help="only fetch the first N wants (proof runs)")
+    p.add_argument("--metadata-timeout", type=int, default=900,
+                   help="seconds to wait for torrent metadata")
+    p.add_argument("--tracker", action="append", default=[],
+                   help="extra tracker URL (repeatable); replaces the "
+                        "built-in defaults when given")
+    p.add_argument("--add-peer", action="append", default=[],
+                   help="connect directly to HOST:PORT (repeatable); "
+                        "seedbox/internal swarms and local proofs")
+    p.add_argument("--piece-timeout", type=int, default=7200,
+                   help="seconds to wait per piece batch")
+    p.add_argument("--dry-run", action="store_true",
+                   help="fetch metadata + central directory, print the "
+                        "download plan, download no entry data")
+    p.add_argument("--keep-local", action="store_true",
+                   help="keep extracted files after verified upload")
+
+    p = sub.add_parser("register-mirror",
+                       help="record a mirror location on a registry entry")
+    p.add_argument("--file", required=True,
+                   help="registry key or local path of the entry")
+    p.add_argument("--store", required=True, choices=STORES,
+                   help="mirror store kind")
+    p.add_argument("--repo", default="", help="github: OWNER/REPO")
+    p.add_argument("--release", default="", help="github: release tag")
+    p.add_argument("--asset", default="", help="asset/object name")
+    p.add_argument("--remote-dir", default="", help="terabox: remote dir")
+    p.add_argument("--dataset", default="", help="kaggle: owner/slug")
+    p.add_argument("--b2-bucket", default="", help="b2: bucket name")
+    p.add_argument("--b2-path", default="", help="b2: object path")
+    p.add_argument("--url", default="", help="direct mirror URL")
+    p.add_argument("--verified", action="store_true",
+                   help="stamp verified_at=now (only if checked just now)")
+
+    p = sub.add_parser("pull-back",
+                       help="download a registered file from a mirror "
+                            "and verify sha256+size")
+    p.add_argument("--file", required=True,
+                   help="registry key or local path of the entry")
+    p.add_argument("--mirror-index", type=int, default=0,
+                   help="which mirror to pull from (default 0)")
+    p.add_argument("--out", default="",
+                   help="output path (default: asset basename)")
+
     p = sub.add_parser("daemon",
                        help="run the enforce loop continuously")
     p.add_argument("--interval", type=int, default=600,
@@ -3322,6 +3708,12 @@ def main(argv=None):
             return cmd_mirror(args)
         elif args.cmd == "mirror-search":
             return cmd_mirror_search(args)
+        elif args.cmd == "fetch":
+            return cmd_fetch(args)
+        elif args.cmd == "register-mirror":
+            return cmd_register_mirror(args)
+        elif args.cmd == "pull-back":
+            return cmd_pull_back(args)
         elif args.cmd == "daemon":
             return cmd_daemon(args)
         elif args.cmd == "enforce":
