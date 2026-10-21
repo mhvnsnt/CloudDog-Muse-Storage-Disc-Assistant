@@ -85,6 +85,16 @@ python3 cloud_dog.py registry
 python3 cloud_dog.py mirror --magnet 'magnet:?xt=...' --store github \
     --repo mhvnsnt/some-repo --release some-tag --part-mb 100
 
+# SELF-HOSTED torrent fetch (TorBox replacement, 2026-10-21): selective
+# piece-level download of wanted entries from a single-file zip torrent,
+# CRC/size-verified, stored, and registered with mirror URLs.
+# See docs/FETCH.md (design + proof) and docs/RESEARCH-FETCH-2026-10-21.md.
+python3 cloud_dog.py fetch --magnet 'magnet:?xt=...' --zip \
+    --want-manifest wants.tsv --repo mhvnsnt/some-repo --release some-tag
+python3 cloud_dog.py register-mirror --file KEY --store github \
+    --repo mhvnsnt/some-repo --release some-tag --asset file.psd --verified
+python3 cloud_dog.py pull-back --file KEY [--mirror-index 1]
+
 # continuous enforce loop (pidfile, SIGTERM-clean, journals every cycle)
 python3 cloud_dog.py daemon --interval 600
 python3 cloud_dog.py daemon --interval 600 --apply   # real deletes
