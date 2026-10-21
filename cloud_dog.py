@@ -2533,7 +2533,9 @@ def cmd_fetch(args):
            f"run manifest {mpath}")
     print(msg)
     log_action(f"cloud_dog fetch {run_id}: {msg}")
-    audit_log("fetch_complete", run_id=run_id, **summary)
+    audit_log("fetch_complete",
+              **{k: v for k, v in summary.items() if k != "run_id"},
+              run_id=run_id)
     return 0 if summary["failed"] == 0 and summary["unmatched"] == 0 else 3
 
 
