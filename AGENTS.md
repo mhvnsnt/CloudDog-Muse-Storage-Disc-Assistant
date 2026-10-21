@@ -101,6 +101,26 @@ cron (every 10 min).
 - dust `1.0Mi`-style sizes now parse (bundled dust 1.2.6 emits IEC
   suffixes; previously every dust size parsed to 0).
 
+## New commands (2026-10-21, CloudDog Fetch lane)
+- `fetch --magnet URI|--torrent PATH --zip --want-manifest TSV --store github --repo O/R --release TAG [--dry-run] [--limit N] [--tracker URL]... [--add-peer HOST:PORT]...`
+  Self-hosted TorBox replacement (owner directive 2026-10-20). libtorrent
+  piece-selective download: only the pieces covering the zip tail/central
+  directory and the wanted entries are fetched — NEVER the whole archive.
+  Entries verified (size + CRC32 vs CD, SHA256 on land), uploaded,
+  registered with mirror records, local copies deleted as they verify.
+  Design + measured network constraints (UDP blocked; tracker announces
+  via the egress proxy; peer TCP blocked inside the agent sandbox):
+  `docs/FETCH.md`. Research: `docs/RESEARCH-FETCH-2026-10-21.md`.
+  Engine is a managed dependency (`pip install libtorrent`), imported
+  lazily by `clouddog_fetch.py` so the rest of the CLI stays stdlib.
+- `register-mirror --file KEY --store ... [--verified]`
+  Records an additional mirror location on a registry entry. A file's
+  record = hashes + size + every mirror (locator + URL + pull-back
+  command). `--verified` only when the mirror was actually checked.
+- `pull-back --file KEY [--mirror-index N]`
+  Downloads a registered file back from a mirror and verifies SHA256 +
+  size against the registry. The retrievability proof for mirrors.
+
 ## Registry contract
 `~/workspace/agent-ops/cloud-dog-registry.json`:
 ```json

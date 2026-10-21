@@ -27,6 +27,15 @@ Usage:
     # Global: --registry sqlite|json (or $CLOUDEDOG_REGISTRY); default json.
     cloud_dog.py mirror --magnet URI --store github --repo O/R --release T
         [--part-mb 100]                   # torrent -> store, bounded disk
+    cloud_dog.py fetch --magnet URI --zip --want-manifest TSV \
+        --store github --repo O/R --release T [--dry-run] [--limit N]
+        # self-hosted selective torrent fetch (TorBox replacement):
+        # piece-level download of wanted zip entries only -> verify ->
+        # store -> mirror registry (docs/FETCH.md)
+    cloud_dog.py register-mirror --file KEY --store github --repo O/R \
+        --release T --asset NAME [--verified]  # record a mirror location
+    cloud_dog.py pull-back --file KEY [--mirror-index N]
+        # download a registered file back from a mirror, verify sha256
     cloud_dog.py daemon [--interval 600] [--apply]
         # continuous enforce loop (pidfile, SIGTERM-clean)
     cloud_dog.py hash --file PATH [--json]
