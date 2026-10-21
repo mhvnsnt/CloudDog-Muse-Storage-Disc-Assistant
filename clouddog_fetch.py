@@ -410,6 +410,14 @@ class SelectiveTorrent:
                                           if t not in params.trackers]
         params.trackers = merged
         params.storage_mode = lt.storage_mode_t.storage_mode_sparse
+        # default_dont_download: nothing downloads until download_pieces
+        # sets explicit priorities — no race between metadata arrival and
+        # the selective plan (metadata itself is extension traffic and
+        # still flows).
+        try:
+            params.flags |= lt.torrent_flags.default_dont_download
+        except Exception:
+            pass
         resume = os.path.join(self.save_path, ".resume.fastresume")
         if os.path.exists(resume):
             try:
@@ -445,6 +453,10 @@ class SelectiveTorrent:
         params.save_path = self.save_path
         params.trackers = list(self.trackers)
         params.storage_mode = lt.storage_mode_t.storage_mode_sparse
+        try:
+            params.flags |= lt.torrent_flags.default_dont_download
+        except Exception:
+            pass
         self.handle = self.session.add_torrent(params)
         self.info = ti
         return ti
@@ -471,11 +483,20 @@ class SelectiveTorrent:
         """
         lt = self.lt
         ti = self.info
-        prios = [lt.download_priority_t.dont_download] * ti.num_pieces()
-        top = lt.download_priority_t.top_priority
+        # The payload file(s) themselves must be wanted, or libtorrent
+        # parks downloaded pieces in a .<infohash>.parts sidecar instead
+        # of the real file (seen with default_dont_download).
+        try:
+            self.handle.prioritize_files([7] * ti.num_files())
+        except Exception:
+            pass
+        # libtorrent priority levels are plain ints: 0 = dont_download,
+        # 7 = top priority (the download_priority_t enum is not exposed
+        # in the 2.x Python bindings).
+        prios = [0] * ti.num_pieces()
         for p in pieces:
             if 0 <= p < ti.num_pieces():
-                prios[p] = top
+                prios[p] = 7
         self.handle.prioritize_pieces(prios)
         self.handle.resume()
         t0 = time.time()
