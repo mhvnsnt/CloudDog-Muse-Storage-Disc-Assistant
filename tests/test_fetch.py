@@ -4,6 +4,7 @@ Pure-logic tests: a synthetic zip is served through a read_range callback,
 exactly like the selective torrent layer serves sparse-file ranges.
 No network, no libtorrent needed.
 """
+
 import hashlib
 import io
 import os
@@ -26,14 +27,21 @@ def build_zip():
     }
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as z:
-        z.writestr("Documents/Gym Partner/big.psd",
-                   payload["Documents/Gym Partner/big.psd"],
-                   compress_type=zipfile.ZIP_STORED)
-        z.writestr("Documents/Gym Partner/small.jpg",
-                   payload["Documents/Gym Partner/small.jpg"],
-                   compress_type=zipfile.ZIP_DEFLATED)
-        z.writestr("Documents/other.txt", payload["Documents/other.txt"],
-                   compress_type=zipfile.ZIP_DEFLATED)
+        z.writestr(
+            "Documents/Gym Partner/big.psd",
+            payload["Documents/Gym Partner/big.psd"],
+            compress_type=zipfile.ZIP_STORED,
+        )
+        z.writestr(
+            "Documents/Gym Partner/small.jpg",
+            payload["Documents/Gym Partner/small.jpg"],
+            compress_type=zipfile.ZIP_DEFLATED,
+        )
+        z.writestr(
+            "Documents/other.txt",
+            payload["Documents/other.txt"],
+            compress_type=zipfile.ZIP_DEFLATED,
+        )
     return buf.getvalue(), payload
 
 
@@ -42,7 +50,7 @@ class RangeSource:
         self.data = data
 
     def __call__(self, start, end):
-        return self.data[start:end + 1]
+        return self.data[start : end + 1]
 
 
 def test_eocd_and_cd_roundtrip():
@@ -89,26 +97,22 @@ def test_extract_detects_corruption():
 
 
 def test_suffix_resolution_and_plan():
-    blob, payload = build_zip()
+    blob, _payload = build_zip()
     src = RangeSource(blob)
     s, e = cf.find_eocd_range(len(blob))
     cd_off, cd_size, _, _ = cf.parse_eocd(src(s, e), len(blob))
     entries = cf.parse_central_directory(src(cd_off, cd_off + cd_size - 1))
-    plan = cf.plan_zip_fetch(
-        len(blob), entries,
-        ["Gym Partner/big.psd", "Gym Partner/small.jpg"])
-    assert set(plan["resolved"]) == {"Gym Partner/big.psd",
-                                     "Gym Partner/small.jpg"}
+    plan = cf.plan_zip_fetch(len(blob), entries, ["Gym Partner/big.psd", "Gym Partner/small.jpg"])
+    assert set(plan["resolved"]) == {"Gym Partner/big.psd", "Gym Partner/small.jpg"}
     # every resolved entry's data range is inside the planned ranges
-    for want, ent in plan["resolved"].items():
+    for ent in plan["resolved"].values():
         lh = src(ent["local_header_offset"], ent["local_header_offset"] + 29)
         ds, de = cf.entry_data_range(lh, ent)
         assert any(rs <= ds and de <= re for rs, re in plan["stage2_ranges"])
 
 
 def test_range_math():
-    assert cf.merge_ranges([(10, 20), (0, 5), (6, 9), (30, 30)]) == \
-        [(0, 20), (30, 30)]
+    assert cf.merge_ranges([(10, 20), (0, 5), (6, 9), (30, 30)]) == [(0, 20), (30, 30)]
     assert cf.ranges_to_pieces([(0, 99), (250, 260)], 100, 10) == {0, 2}
     assert cf.ranges_to_pieces([], 100, 10) == set()
 
@@ -117,11 +121,30 @@ def test_zip64_cd_extra_field():
     # hand-built CD record whose sizes/lho live in the zip64 extra field
     name = b"a/b.bin"
     extra = struct.pack("<HHQQQ", 0x0001, 24, 123456789, 987654321, 555)
-    rec = struct.pack(
-        "<IHHHHHHIIIHHHHHII",
-        0x02014B50, 45, 45, 0, 0, 0, 0, 0xDEADBEEF,
-        0xFFFFFFFF, 0xFFFFFFFF, len(name), len(extra), 0, 0, 0, 0,
-        0xFFFFFFFF) + name + extra
+    rec = (
+        struct.pack(
+            "<IHHHHHHIIIHHHHHII",
+            0x02014B50,
+            45,
+            45,
+            0,
+            0,
+            0,
+            0,
+            0xDEADBEEF,
+            0xFFFFFFFF,
+            0xFFFFFFFF,
+            len(name),
+            len(extra),
+            0,
+            0,
+            0,
+            0,
+            0xFFFFFFFF,
+        )
+        + name
+        + extra
+    )
     entries = cf.parse_central_directory(rec)
     ent = entries["a/b.bin"]
     assert ent["uncomp_size"] == 123456789
@@ -132,14 +155,27 @@ def test_zip64_cd_extra_field():
 
 def test_want_manifest(tmp_path):
     p = tmp_path / "want.tsv"
-    p.write_text("150434\tGym Partner/Gym Partner/small.jpg\n"
-                 "# comment\n"
-                 "\n"
-                 "1227118\tGym Partner/Gym Partner/big.psd\n")
+    p.write_text(
+        "150434\tGym Partner/Gym Partner/small.jpg\n"
+        "# comment\n"
+        "\n"
+        "1227118\tGym Partner/Gym Partner/big.psd\n"
+    )
     wants = cf.read_want_manifest(str(p))
     assert wants == [
         {"size": 150434, "path": "Gym Partner/Gym Partner/small.jpg"},
-        {"size": 1227118, "path": "Gym Partner/Gym Partner/big.psd"}]
+        {"size": 1227118, "path": "Gym Partner/Gym Partner/big.psd"},
+    ]
+
+
+def test_proxy_settings_from_env():
+    env = {"http_proxy": "http://user:p%40ss@proxy.local:3128"}
+    s = cf.proxy_settings_from_env(env)
+    assert s["proxy_hostname"] == "proxy.local" and s["proxy_port"] == 3128
+    assert s["proxy_username"] == "user" and s["proxy_password"] == "p@ss"
+    assert s["proxy_tracker_connections"] is True
+    assert s["proxy_peer_connections"] is False
+    assert cf.proxy_settings_from_env({}) == {}
 
 
 def test_mirrors():
