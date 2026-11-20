@@ -20,6 +20,10 @@ On 2026-10-17, commit cd3bf38 ("DXMMII limb system", PR mhvnsnt/western-heart#22
 Operating manual for this repo. The main workspace AGENTS.md holds the full
 law library; this file holds what is specific to Cloud Dog.
 
+## PRE-MADE PARTS FIRST
+
+PRE-MADE PARTS FIRST (Mars, 2026-11-20): Don't hand-build what already exists and works well. Before decoding, decrypting, reverse-engineering, or building anything from scratch, go get the pre-made part from wherever it already exists and work FROM it. Sources: commercial games, open source, closed-source teardowns (study from public sources, rebuild equivalents), the fan translation / ROM hacking scene, the modding community, fan-made tools and docs, decompilations (decomps) and recompilations (recomps), community knowledge (Xentax/ZenHAX, TCRF, wikis, FAQs, archive.org). Like building a machine: you don't build a battery or a cog from scratch, you order the pre-made part and keep building. Spend the work on the innovative parts, not on re-doing what's already well-built. Only build from scratch what nobody has already built.
+
 ## NO-LOCAL-CLUTTER LAW (owner 2026-10-17)
 Disk is a cache, not storage. Everything goes to TeraBox, Drive, Kaggle, or
 GitHub — then clears local. All agents, all chats, every lane. Disk stays
